@@ -23,7 +23,7 @@ from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBl
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from reference import RefGeometry, gated_attention_block_reference, make_inputs  # noqa: E402
+from gated_block_reference import RefGeometry, gated_attention_block_reference, make_inputs  # noqa: E402
 
 _SM107 = (10, 7)
 
