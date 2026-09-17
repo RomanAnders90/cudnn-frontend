@@ -792,6 +792,19 @@ class ProjGemmPlan:
     sfb: Any = None
     sf_dtype: Any = None  # cudnn.data_type of the scale factors (FP8_E8M0)
     route: Optional[str] = None
+    # Strided / batched declaration (append-only; `build_proj_gemm(a_row_stride=,
+    # c_row_stride=, batch=, *_batch_stride=)`).  `batch` is the GEMM batch (1 = the
+    # plain plan); the three tuples are the rank-3 ELEMENT strides the graph
+    # declared, in the CALLER's axis order -- A `[batch, m, k]`, W `[b_batch, n, k]`,
+    # C `[batch, m, n]` -- or None for a plan built without the stride knobs
+    # (packed, unchecked, byte-identical behaviour to before).  `run_proj_gemm`
+    # compares the bound tensors against them BEFORE any route: the JIT reads the
+    # runtime strides and would silently run on whatever it was handed.
+    batch: int = 1
+    a_strides: Optional[tuple] = None
+    b_strides: Optional[tuple] = None
+    c_strides: Optional[tuple] = None
+    b_batch: int = 1  # the weight's declared batch extent: 1 = shared (broadcast) weight, else == batch
 
     @property
     def has_alpha(self) -> bool:
@@ -805,8 +818,8 @@ class ProjGemmPlan:
         return max(int(self.graph.get_workspace_size()), 1)
 
     def flops(self) -> int:
-        """``2*M*N*K`` — the denominator for an MMA SOL number."""
-        return 2 * self.m * self.n * self.k
+        """``2*M*N*K`` (times ``batch``) — the denominator for an MMA SOL number."""
+        return 2 * self.m * self.n * self.k * max(int(self.batch or 1), 1)
 
 
 # The shipped tile scorer has a REAL BUG, and this is the workaround for it.
@@ -855,8 +868,35 @@ def build_proj_gemm(
     block_scale: bool = False,
     sf_dtype: Any = None,
     mma_tile_k_bytes: Optional[int] = None,
+    a_row_stride: Optional[int] = None,
+    c_row_stride: Optional[int] = None,
+    batch: int = 1,
+    a_batch_stride: Optional[int] = None,
+    b_batch_stride: Optional[int] = None,
+    c_batch_stride: Optional[int] = None,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
+
+    **Strided / batched operands (appended knobs; every default reproduces the
+    packed ``[1, M, K] x [1, K, N] -> [1, M, N]`` plan byte for byte).**  All
+    strides are in ELEMENTS.  ``a_row_stride`` / ``c_row_stride`` declare A's and
+    C's row pitch (>= K / >= N): a column slice of a wider slab -- the grouped
+    ``wo_a`` of the MQA block reads ``[M, 4096]`` out of a ``[M, 32768]`` O and
+    writes ``[M, 1024]`` into a ``[M, 8192]`` slab -- binds as the strided view,
+    with no repack.  ``batch > 1`` declares a batched GEMM: A ``[batch, M, K]`` at
+    ``a_batch_stride`` (default ``M * a_row_stride``, packed), C ``[batch, M, N]`` at
+    ``c_batch_stride`` (default ``M * c_row_stride``) -- so a ``[B, S, 512]`` C may be
+    the ``[:, :S]`` PREFIX of a ``[B, S + N_c, 512]`` buffer (``c_batch_stride =
+    (S + N_c) * 512``).  The weight is SHARED across the batch by default (declared
+    ``[1, K, N]``, the analyzer's batch-broadcast); ``b_batch_stride`` declares a
+    per-batch weight ``[batch, N, K]`` (caller order) at that batch stride instead.
+    A batch stride SMALLER than the row stride (an interleaved batch, the one-launch
+    ``wo_a``) is accepted by this declaration but is NOT validated by any shipped
+    test -- the MQA block gates it behind an ``xfail`` (M6).  The block-scale path
+    keeps the packed declaration (the F8_128x4 blobs are sized off a packed M).
+    ``run_proj_gemm`` refuses a bound tensor whose strides disagree with the
+    declaration (typed ``ValueError``) -- on the JIT route the kernel reads the
+    RUNTIME strides, so a mismatch would otherwise run silently on the wrong layout.
 
     Plan-time only: shapes and dtypes come from the block's declaration, never
     from a runtime value (AGENTS.md Rule 4), and nothing here allocates a data
@@ -936,15 +976,48 @@ def build_proj_gemm(
         out_dtype = torch.bfloat16 if fp8 else dtype
     out_dt = _cudnn_dtype(out_dtype)
 
+    # Strided / batched declaration (the appended knobs).  Resolved once, validated
+    # on the host, recorded on the plan for `run_proj_gemm`'s bind check.
+    batch = int(batch)
+    if batch < 1:
+        raise ValueError(f"{label}: batch must be >= 1, got {batch}")
+    a_rs = k if a_row_stride is None else int(a_row_stride)
+    c_rs = n if c_row_stride is None else int(c_row_stride)
+    a_bs = m * a_rs if a_batch_stride is None else int(a_batch_stride)
+    c_bs = m * c_rs if c_batch_stride is None else int(c_batch_stride)
+    b_batch = 1 if b_batch_stride is None else batch
+    b_bs = k * n if b_batch_stride is None else int(b_batch_stride)
+    strided = (a_rs, c_rs, a_bs, c_bs, b_batch, b_bs) != (k, n, m * k, m * n, 1, k * n) or batch != 1
+    if strided and block_scale:
+        raise ValueError(f"{label}: the block-scale (MXFP8) projection takes packed operands only; the stride / batch knobs are for the dense path")
+    if a_rs < k or c_rs < n:
+        raise ValueError(f"{label}: a_row_stride ({a_rs}) must be >= K ({k}) and c_row_stride ({c_rs}) must be >= N ({n}) -- rows may not overlap")
+    if a_bs < 1 or c_bs < 1 or b_bs < 1:
+        raise ValueError(f"{label}: batch strides must be >= 1, got a={a_bs} b={b_bs} c={c_bs}")
+    # TMA encodes every non-contiguous stride in 16-byte units.
+    _elem = torch.empty((), dtype=dtype).element_size()
+    _elem_out = torch.empty((), dtype=out_dtype).element_size()
+    for _nm, _st, _sz in (
+        ("a_row_stride", a_rs, _elem),
+        ("a_batch_stride", a_bs, _elem),
+        ("b_batch_stride", b_bs, _elem),
+        ("c_row_stride", c_rs, _elem_out),
+        ("c_batch_stride", c_bs, _elem_out),
+    ):
+        if (_st * _sz) % 16:
+            raise ValueError(f"{label}: {_nm}={_st} elements ({_st * _sz} bytes) must be a multiple of 16 bytes (TMA stride rule)")
+
     g = cudnn.pygraph(
         io_data_type=io_dt,
         intermediate_data_type=cudnn.data_type.FLOAT,
         compute_data_type=cudnn.data_type.FLOAT,
     )
-    a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    a = g.tensor(name="A", dim=[batch, m, k], stride=[a_bs, a_rs, 1])
     # B is the weight as a checkpoint stores it -- [N, K] row-major -- declared
     # transposed. stride[1] == 1 is what makes it the K-contiguous operand.
-    b = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+    # `b_batch == 1` under `batch > 1` is the analyzer's batch-broadcast (one weight
+    # for every batch entry); a per-batch weight declares `[batch, K, N]`.
+    b = g.tensor(name="B", dim=[b_batch, k, n], stride=[b_bs, 1, k])
     sfa_t = sfb_t = None
     if block_scale:
         # One E8M0 scale per 32-element K block, in cuDNN's F8_128x4 (128 rows x 4 blocks
@@ -981,12 +1054,22 @@ def build_proj_gemm(
         c = g.mul(a=mm, b=alpha_t, name=f"{_ident}_scale")
     else:
         c = mm
+    if strided:
+        # The output's layout is inferred packed unless said otherwise; a strided /
+        # prefix C must be DECLARED so the graph carries the layout the caller binds
+        # (two statements, as `_pygraph.py` spells it on an output tensor).
+        c.set_dim([batch, m, n])
+        c.set_stride([c_bs, c_rs, 1])
     c.set_output(True).set_data_type(out_dt)
 
     plan = ProjGemmPlan(
         graph=g, a=a, b=b, c=c, m=m, k=k, n=n, label=label, dtype=dtype, out_dtype=out_dtype, alpha=alpha_t, block_scale=block_scale, sfa=sfa_t, sfb=sfb_t
     )
     plan.sf_dtype = sf_dtype if block_scale else None
+    plan.batch, plan.b_batch = batch, b_batch
+    if strided:
+        # Caller-order rank-3 strides (A [batch, m, k]; W [b_batch, n, k]; C [batch, m, n]).
+        plan.a_strides, plan.b_strides, plan.c_strides = (a_bs, a_rs, 1), (b_bs, k, 1), (c_bs, c_rs, 1)
     plan.tile_config_name = "heuristic (graph engine)"
     plan.route = "graph"
 
@@ -1157,6 +1240,11 @@ def run_proj_gemm(
     # keeping the tensor objects -- so keying by `binding.a_operands[0]` would hand A's
     # buffer to B under any `_swapAB` config a caller passes as `tile_config=`.
     vp = {plan.a: _rank3(a, "a"), plan.b: _rank3(w, "w"), plan.c: _rank3(out, "out")}
+    if plan.a_strides is not None:
+        # A strided / batched plan: the bound layouts must BE the declaration, on
+        # EVERY route (the JIT reads the runtime strides and would run silently on
+        # whatever it is handed; the graph route validates nothing at bind).
+        _check_declared_layout(plan, vp[plan.a], vp[plan.b], vp[plan.c])
     if plan.block_scale:
         vp[plan.sfa] = sf_a3
         vp[plan.sfb] = sf_w3
@@ -1225,6 +1313,28 @@ def _sf_view_of(sf: torch.Tensor, name: str, rows: int, k: int, label: str) -> t
     rows_pad, sf_k_pad = sf_padded_dims(rows, k)
     v = sf.view(_E8M0) if (sf.dtype == torch.uint8 and _E8M0 is not None) else sf  # a re-view, no copy
     return v.view(1, rows_pad, sf_k_pad)  # == the graph's declared SFA / SFB dims
+
+
+def _check_declared_layout(plan: ProjGemmPlan, a3: torch.Tensor, w3: torch.Tensor, o3: torch.Tensor) -> None:
+    """Each bound rank-3 tensor must carry the shape AND strides the plan declared.
+
+    Strides of extent-1 axes are unobservable (torch reports whatever the view
+    happened to inherit), so only axes with extent > 1 are compared.  A typed
+    ``ValueError`` naming the tensor, the declaration and the bound layout.
+    """
+    want = (
+        ("a", a3, (plan.batch, plan.m, plan.k), plan.a_strides),
+        ("w", w3, (plan.b_batch, plan.n, plan.k), plan.b_strides),
+        ("out", o3, (plan.batch, plan.m, plan.n), plan.c_strides),
+    )
+    for name, t, shape, strides in want:
+        got_shape, got_stride = tuple(int(x) for x in t.shape), tuple(int(x) for x in t.stride())
+        ok = got_shape == shape and all(gs == ds for ext, gs, ds in zip(shape, got_stride, strides) if ext > 1)
+        if not ok:
+            raise ValueError(
+                f"{plan.label}: {name} is bound with shape {got_shape} strides {got_stride}, but the plan declared shape {shape} "
+                f"strides {strides} (elements); pass the view the plan was built for, or build the plan for this layout"
+            )
 
 
 def _rank3(t: torch.Tensor, name: str) -> torch.Tensor:

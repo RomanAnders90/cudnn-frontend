@@ -400,12 +400,21 @@ def test_rope_tables_reject_bad_arguments():
 
 
 def test_package_import_does_not_import_torch():
+    """``import cudnn.mqa_sparse_attention_block`` stays torch-free; the forward API
+    (``api.py`` imports torch and cuda.bindings) is resolved LAZILY on first
+    attribute access, and only then does torch load."""
     code = (
         "import sys\n"
         "assert 'torch' not in sys.modules, 'torch already loaded before the import'\n"
         "import cudnn.mqa_sparse_attention_block as m\n"
         "print('torch' in sys.modules, m.MqaSparseAttentionBlockGeometry().group_width)\n"
+        "assert 'MqaSparseAttentionBlockFwd' in m.__all__ and 'MqaSparseAttentionBlockFwd' in dir(m)\n"
+        "assert 'cudnn.mqa_sparse_attention_block.api' not in sys.modules, 'api.py was imported eagerly'\n"
+        "F = m.MqaSparseAttentionBlockFwd\n"
+        "print('torch' in sys.modules, F.__name__, m.ATTENTION_IMPLS, m.POINTWISE_IMPLS)\n"
     )
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600)
     assert out.returncode == 0, out.stderr
-    assert out.stdout.strip() == "False 4096", out.stdout
+    lines = out.stdout.strip().splitlines()
+    assert lines[0] == "False 4096", out.stdout
+    assert lines[1] == "True MqaSparseAttentionBlockFwd ('torch', 'dsa', 'd512') ('torch', 'frost')", out.stdout

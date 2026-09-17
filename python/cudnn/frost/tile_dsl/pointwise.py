@@ -167,6 +167,25 @@ def fp32_to_fp8x2(lo: cutlass.Float32, hi: cutlass.Float32, *, dtype: cutlass.Co
 
 
 @cute.jit
+def fp8x2_to_f32(word: cutlass.Uint16, *, dtype: cutlass.Constexpr[Type[cutlass.Numeric]] = cutlass.Float8E4M3FN):
+    """Unpack two fp8 bytes into ``(lo_f32, hi_f32)`` -- the inverse of :func:`fp32_to_fp8x2` (low byte = ``lo``).
+
+    ``cvt.rn.f16x2.e4m3x2`` / ``.e5m2x2`` widens BOTH bytes to f16 exactly (every e4m3 / e5m2 value, subnormals
+    included, is an f16 value), then two ``cvt.f32.f16``; no rounding anywhere, so ``fp8x2_to_f32(fp32_to_fp8x2(a, b))``
+    is the e4m3-rounded ``(a, b)`` bit for bit.  This is the DEQUANT direction of a fake-quant epilogue
+    (``y = fp8x2_to_f32(q) * 2**k``); the quantizers above only ever store the codes.  sm_89+."""
+    if cutlass.const_expr(dtype != cutlass.Float8E4M3FN and dtype != cutlass.Float8E5M2):
+        raise TypeError(f"fp8x2_to_f32: dtype must be Float8E4M3FN or Float8E5M2, got {dtype}")
+    cvt_tag = "e4m3x2" if cutlass.const_expr(dtype == cutlass.Float8E4M3FN) else "e5m2x2"
+    lo, hi = inline_ptx(
+        "{ .reg .b32 p; .reg .b16 l, h; " + f"cvt.rn.f16x2.{cvt_tag} p, $2; " + "mov.b32 {l, h}, p; cvt.f32.f16 $0, l; cvt.f32.f16 $1, h; }",
+        write_only_types=[cutlass.Float32, cutlass.Float32],
+        read_only_args=[word],
+    )
+    return lo, hi
+
+
+@cute.jit
 def pack_fp8x2_pairs(pair0: cutlass.Uint16, pair1: cutlass.Uint16) -> cutlass.Int32:
     """Two fp8x2 halves into one 32-bit MMA A/B operand (pair0 = low half)."""
     return cute.arch.inline_ptx(

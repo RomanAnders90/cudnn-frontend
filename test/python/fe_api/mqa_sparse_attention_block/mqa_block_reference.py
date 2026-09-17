@@ -455,6 +455,60 @@ def compressed_idxs_synthetic(
     return torch.where(idxs < compress_lens, idxs + offset, -1).int()
 
 
+def compressed_idxs_overlap(
+    batch: int,
+    seq_len: int,
+    ratio: int,
+    topk: int,
+    generator: torch.Generator,
+    u: float,
+    *,
+    quad: int = 4,
+    relative: bool = False,
+    device: torch.device | str = "cpu",
+) -> torch.Tensor:
+    """``compressed_idxs_synthetic`` with a CONTROLLED adjacent-token top-k overlap ``u`` (appended; perf-driver knob).
+
+    Per quad of ``quad`` consecutive query rows ``[quad*j, quad*j + quad)`` one shared score vector
+    ``s_quad ~ U(0,1)^{n_c}`` is drawn, per row an independent ``e_t ~ U(0,1)^{n_c}``, and the row scores
+    ``score = u * s_quad + (1 - u) * e_t``; the tail is IDENTICAL to ``compressed_idxs_synthetic`` (reachability
+    mask, ``topk(sorted=False).indices.sort()``, ``where(idxs < compress_lens, idxs + offset, -1)``). ``u = 0``
+    reproduces ``compressed_idxs_synthetic`` bit for bit from the same generator state (no extra draw); ``u = 1``
+    gives every row of a quad the same ranking, so the lists differ only where a row's reachable prefix grew
+    inside the quad -- at most ``ceil(quad / ratio)`` groups per quad, so the ACHIEVED overlap
+    ``u_hat = (quad*k - |union|) / ((quad-1)*k)`` cannot reach 1 exactly (the driver prints ``u_hat``). The knob is
+    SYNTHETIC: it does not model the Indexer's two-level candidate filter; a real-prompt ``u`` is PLAN M5.
+    """
+    if not (0.0 <= float(u) <= 1.0):
+        raise ValueError(f"u must lie in [0, 1], got {u}")
+    if quad < 1:
+        raise ValueError(f"quad must be >= 1, got {quad}")
+    if ratio < 1:
+        raise ValueError(f"ratio must be >= 1 for a compressed list, got {ratio}")
+    if topk < 0 or seq_len < 0 or batch < 1:
+        raise ValueError(f"need topk >= 0, seq_len >= 0, batch >= 1; got {topk}, {seq_len}, {batch}")
+    n_c = seq_len // ratio
+    topk = min(topk, n_c)
+    if topk == 0:
+        return torch.empty(batch, seq_len, 0, dtype=torch.int32, device=device)
+    offset = 0 if relative else seq_len
+    u = float(u)
+    score = torch.rand(batch, seq_len, n_c, generator=generator, device=generator.device).to(device)
+    if u > 0.0:
+        n_quads = -(-seq_len // quad)
+        s_quad = torch.rand(batch, n_quads, n_c, generator=generator, device=generator.device).to(device)
+        score.mul_(1.0 - u)
+        n_full = (seq_len // quad) * quad
+        if n_full:
+            score[:, :n_full].view(batch, n_full // quad, quad, n_c).add_(s_quad[:, : n_full // quad].unsqueeze(2), alpha=u)
+        if n_full < seq_len:  # the partial last quad shares the last s_quad
+            score[:, n_full:].add_(s_quad[:, -1:], alpha=u)
+    compress_lens = (torch.arange(1, seq_len + 1, device=device) // ratio).unsqueeze(-1)
+    score.masked_fill_(torch.arange(n_c, device=device) >= compress_lens, -torch.inf)
+    idxs = score.topk(topk, dim=-1, sorted=False).indices.sort(dim=-1).values
+    return torch.where(idxs < compress_lens, idxs + offset, -1).int()
+
+
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
@@ -468,6 +522,7 @@ def make_inputs(
     seed: int = 0,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.bfloat16,
+    topk_overlap: Optional[float] = None,
 ) -> dict:
     """Seeded inputs in the block's declared layouts.
 
@@ -487,9 +542,16 @@ def make_inputs(
     ``None`` when ``ratio == 0`` or ``S < ratio``. ``topk_idxs`` ``[B, S, K]``
     int32 is the window list ++ the compressed list (``K = min(S, window) +
     min(index_topk, S // ratio)``), compressed ids offset by ``S`` (M:580).
+
+    ``topk_overlap`` (appended): ``None`` keeps the independent-score lists above
+    (byte-identical to before); a float ``u`` in ``[0, 1]`` draws them with
+    ``compressed_idxs_overlap`` instead (controlled adjacent-row overlap; ``0.0``
+    reproduces the default lists exactly).
     """
     if ratio < 0:
         raise ValueError(f"ratio must be >= 0, got {ratio}")
+    if topk_overlap is not None and not (0.0 <= float(topk_overlap) <= 1.0):
+        raise ValueError(f"topk_overlap must be None or in [0, 1], got {topk_overlap}")
     if ratio > 0 and not geom.has_compressed_kv:
         raise ValueError("ratio > 0 needs geom.has_compressed_kv=True")
     if batch < 1 or seq_len < 1:
@@ -534,7 +596,10 @@ def make_inputs(
         sin_c = sin[: seq_len - seq_len % ratio : ratio]
         latent = apply_rope_interleaved(latent, cos_c, sin_c)
         inputs["compress_kv"] = fp4_e4m3_block16_mirror(latent, 16)
-        comp = compressed_idxs_synthetic(batch, seq_len, ratio, geom.index_topk, g, device=device)
+        if topk_overlap is None:
+            comp = compressed_idxs_synthetic(batch, seq_len, ratio, geom.index_topk, g, device=device)
+        else:
+            comp = compressed_idxs_overlap(batch, seq_len, ratio, geom.index_topk, g, float(topk_overlap), device=device)
         inputs["topk_idxs"] = torch.cat([win, comp], dim=-1)
     else:
         inputs["topk_idxs"] = win

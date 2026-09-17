@@ -243,3 +243,38 @@ def compute_q_loop_bounds(
         hi = cute.math.min(_div_up(q_hi_abs, tile_q), n_q_tiles)
 
     return QLoopBounds(lo=lo, hi=hi)
+
+
+# ---------------------------------------------------------------------------
+# Membership mask: a list-gathered KV tile has no band; each cell is either one
+# of THIS row's keys or not, and the decision is a bit the block pre-computed.
+# ---------------------------------------------------------------------------
+
+
+def apply_membership_chunk(reg_S, word_lo, word_hi, *, n: int = 64, mask_value: float = float("-inf")):
+    """Per-CELL membership mask for a ``n``-wide chunk of scores: cell ``i`` KEEPS ``reg_S[i]``
+    iff bit ``i`` of the 64-bit pair ``(word_lo, word_hi)`` is set, else becomes ``mask_value``.
+
+    Bit ``i`` lives in ``word_lo`` for ``i < 32`` and in ``word_hi`` (bit ``i - 32``) above;
+    ``word_hi`` is unused at ``n <= 32``.  A ZERO bit says "this union column is none of this
+    row's keys" (a duplicate-free row sees every copy but its own as zero bits; a ``-1`` /
+    sanitised id is a zero-filled row AND a zero bit, so no real logit of 0 survives).
+
+    Same select-not-multiply shape as :func:`apply_mask_chunk` (``arith.select`` per cell); the
+    default ``mask_value`` is a true ``-inf`` so a fully-masked chunk's max is ``-inf`` under any
+    scale and the consumer's ``max == -inf -> substitute`` guard applies (sdpa-invariants.md
+    section 2 -- the finite ``_NEG_INF_BITS`` sentinel is NOT written here).  Words are plain
+    ``Int32``: ``(word >> i) & 1`` is sign-safe because of the ``& 1``.
+    """
+    if cutlass.const_expr(not 1 <= n <= 64):
+        raise ValueError(f"apply_membership_chunk: n must be in 1..64 (two 32-bit words), got {n}")
+    neg_inf = cutlass.Float32(mask_value)
+    one = cutlass.Int32(1)
+    zero = cutlass.Int32(0)
+    elems = []
+    for i in range(n):
+        word = word_lo if i < 32 else word_hi
+        bit = (word >> cutlass.Int32(i % 32)) & one
+        masked = bit == zero
+        elems.append(cutlass.Float32(arith.select(masked.ir_value(), neg_inf.ir_value(), reg_S[i].ir_value())))
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
