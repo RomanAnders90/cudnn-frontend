@@ -43,6 +43,9 @@ import math
 
 TOKENS_PER_CLUSTER = 4
 TILE_ROWS = 128
+# The d512 fork indexes union columns with a 15-bit quantity (its `_validate_sparse_cfg` re-checks `u_max_tiles * TILE_ROWS <
+# U_MAX_COLS_LIMIT`); the adapter's K bound and the pre-pass bound below import THIS constant rather than re-spelling 2**15.
+U_MAX_COLS_LIMIT = 2**15
 WORDS_PER_SLOT = TILE_ROWS // 32  # 4 x int32 = 128 membership bits per (tile, slot)
 _INT32_MAX = 2**31 - 1
 
@@ -79,8 +82,8 @@ def validate_union_lists_shapes(topk_idxs, *, seq_len: int, n_kv_rows: int, u_ma
     need = u_max_tiles_for(k)
     if u_max_tiles < need:
         raise ValueError(f"u_max_tiles ({u_max_tiles}) cannot hold 4 x K = {4 * k} rows; need >= {need}")
-    if u_max_tiles * TILE_ROWS >= 2**15:
-        raise ValueError(f"u_max_tiles * 128 = {u_max_tiles * TILE_ROWS} must stay below 2**15 (the kernel's column index)")
+    if u_max_tiles * TILE_ROWS >= U_MAX_COLS_LIMIT:
+        raise ValueError(f"u_max_tiles * 128 = {u_max_tiles * TILE_ROWS} must stay below 2**15 = {U_MAX_COLS_LIMIT} (the kernel's column index)")
     nc = n_clusters_for(seq_len)
     exp = {
         "union_ids": (out_ids, (b, nc, u_max_tiles * TILE_ROWS)),

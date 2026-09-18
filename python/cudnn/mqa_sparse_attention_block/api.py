@@ -14,7 +14,8 @@ defaults) as ELEVEN stream-ordered stages over ONE caller workspace::
     5  kv_proj     x [B, S, d_model]      @ W_kv^T         -> kv_all[:, :S, :]  (D4)    FROST GEMM, batched, prefix-strided C
     6  kv_chain    RMSNorm -> RoPE -> block-32 ue8m0 fake-quant, in place on kv_all[:, :S]   pointwise
     6b (dsa) index staging when B > 1 or K % 64 != 0 (D5)                               torch out= ops into the workspace
-    7  attention   q, kv_all, attn_sink, topk_idxs        -> o [T, H, D] (+ lse_th)     torch | dsa (in-tree H64) | d512 (fork, wave B)
+    6b (d512) union_lists: topk_idxs -> union_ids / union_bits / union_ntiles (plan 1(b))  torch pre-pass into the workspace (FLAGGED)
+    7  attention   q, kv_all, attn_sink, topk_idxs        -> o [T, H, D] (+ lse_th | lse)  torch | dsa (in-tree H64) | d512 (gathered-list fork)
     8  o_unrope    inverse RoPE in place on o; LSE fold (D1, dsa only)                  pointwise
     9  o_a_proj    8 x  o[:, g*4096:(g+1)*4096] @ W_o_a[g]^T -> o_lora[:, g*1024:(g+1)*1024]   FROST GEMM, declared row strides (D3)
     10 o_b_proj    o_lora [T, 8192]       @ W_o_b^T        -> out [T, d_model]          FROST GEMM
@@ -29,7 +30,13 @@ per execute**, as does the ``torch`` attention adapter.  ``pointwise_impl="frost
 selects the single-tensor norm/RoPE/fake-quant kernel (``kernels/norm_rope.py``,
 wave W2) by the agreed interface, imported lazily inside the stage; until it
 lands that arm is a typed decline.  The ``dsa`` adapter is contract-clean (no
-allocation, no sync on its execute path); ``d512`` declines until wave B.
+allocation, no sync on its execute path).  The ``d512`` adapter is ONE kernel launch
+over zero-copy views (``kernels/sparse_attention_d512.py`` via the FROST template
+loader) fed by the block-owned ``union_lists`` pre-pass -- **FLAGGED: that pre-pass is
+torch v1 and allocates per execute** (the CuTe warp-per-cluster version is W4); it is
+reported as its own ``prep`` runner so the kernel-only row stays honest.  The fork
+writes the FROST-convention ``lse`` itself (no fold).  ``d512`` requires the
+``(64, 512)`` head geometry and cc (10, 7); the fork module absent is a typed decline.
 
 Conventions (``geometry.py``): K == V, one ``[B, S + N_c, D]`` tensor; the sink
 enters the denominator once; ``-1`` = no key, duplicates count twice; compressed
@@ -49,6 +56,7 @@ frontend-only API in the ``gated_attention_block`` mould.
 
 from __future__ import annotations
 
+import math
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -162,7 +170,8 @@ class _StageRunner:
         return f"_StageRunner({self.name!r}, kind={self.kind!r}, prepare={'yes' if self.prepare else 'no'})"
 
 
-# name -> kind of every runner the block can emit, in pipeline order (idx_staging only under dsa staging).
+# name -> kind of every runner the block can emit, in pipeline order (idx_staging only under dsa staging,
+# union_lists only under d512).
 RUNNER_NAMES = (
     ("q_a_proj", "mma"),
     ("q_norm", "bw"),
@@ -170,6 +179,7 @@ RUNNER_NAMES = (
     ("q_rope", "bw"),
     ("kv_proj", "mma"),
     ("kv_chain", "bw"),
+    ("union_lists", "prep"),
     ("idx_staging", "prep"),
     ("sparse_attention", "mma"),
     ("o_unrope", "bw"),
@@ -515,6 +525,16 @@ class _SparseAttention(_Stage):
 
         return dsa_topk_padded(self.topk) if self.impl == "dsa" else self.topk
 
+    @property
+    def needs_union_lists(self) -> bool:
+        """d512: the block-owned ``union_lists`` pre-pass runs before every launch (plan 1(b))."""
+        return self.impl == "d512"
+
+    @property
+    def union_shapes(self) -> dict:
+        """``{union_ids, union_bits, union_ntiles} -> shape`` (int32) the d512 adapter carves; ``{}`` otherwise."""
+        return dict(self._adapter.union_shapes) if (self.impl == "d512" and self._adapter is not None) else {}
+
     def check_support(self) -> None:
         from .kernels import sparse_attention as sa
 
@@ -554,6 +574,14 @@ class _SparseAttention(_Stage):
         with _torch_stream(stream, self.device):
             self._adapter.stage_indices(topk_idxs, idx_tmp, idx_ws)
 
+    def stage_union_lists(self, topk_idxs: torch.Tensor, union_ids: torch.Tensor, union_bits: torch.Tensor, union_ntiles: torch.Tensor, *, stream: int) -> None:
+        """6b (d512): the block-owned union-list pre-pass into the three workspace views
+        (``kernels/union_lists.py``), torch on the block's stream.  **FLAGGED v1: allocates temporaries.**"""
+        if not self.needs_union_lists:
+            raise RuntimeError(f"{self.name}: stage_union_lists applies only to the d512 adapter")
+        with _torch_stream(stream, self.device):
+            self._adapter.build_union_lists(topk_idxs, union_ids, union_bits, union_ntiles)
+
     def launch(
         self,
         q: torch.Tensor,  # [B, S, H, D] (workspace view)
@@ -567,8 +595,14 @@ class _SparseAttention(_Stage):
         max_logits: Optional[torch.Tensor],  # dsa: [T, H] dead output
         idx_ws: Optional[torch.Tensor],  # dsa staging target [B, S, K_pad], already staged when the path needs it
         stream: int,
+        union_ids: Optional[torch.Tensor] = None,  # d512: the pre-pass outputs (union_shapes), already built
+        union_bits: Optional[torch.Tensor] = None,
+        union_ntiles: Optional[torch.Tensor] = None,
     ) -> None:
-        """7: the attention kernel ALONE (the ``8a kernel-only`` unit of the perf table)."""
+        """7: the attention kernel ALONE (the ``8a kernel-only`` unit of the perf table).
+
+        ``lse`` (``[B, H, S]`` fp32, FROST convention) is written DIRECTLY by the ``torch`` and
+        ``d512`` adapters; ``dsa`` writes ``lse_th`` for stage 8's fold instead."""
         from .kernels import sparse_attention as sa
 
         b, s, h, d = (int(v) for v in q.shape)
@@ -577,8 +611,11 @@ class _SparseAttention(_Stage):
             with _torch_stream(stream, self.device):
                 sa.torch_sparse_attention(q, kv_all, sink, topk_idxs, self.geom.scale, out=o, lse=lse)
             return
-        if self.impl != "dsa":
-            raise NotImplementedError("attention='d512' has not landed")
+        if self.impl == "d512":
+            if union_ids is None or union_bits is None or union_ntiles is None:
+                raise RuntimeError(f"{self.name}: the d512 launch needs the union_ids / union_bits / union_ntiles views (run stage_union_lists first)")
+            self._adapter.execute(q, kv_all, sink, o, lse, union_ids, union_bits, union_ntiles, stream=stream)
+            return
         ad = self._adapter
         if ad.needs_idx_staging:
             idx2d = idx_ws.view(t, ad.k_pad)
@@ -601,11 +638,32 @@ class _SparseAttention(_Stage):
         idx_tmp: Optional[torch.Tensor],  # dsa staging scratch [B, S, K] (B > 1)
         idx_ws: Optional[torch.Tensor],  # dsa staging target [B, S, K_pad]
         stream: int,
+        union_ids: Optional[torch.Tensor] = None,  # d512: workspace views of union_shapes (written here by the pre-pass)
+        union_bits: Optional[torch.Tensor] = None,
+        union_ntiles: Optional[torch.Tensor] = None,
     ) -> None:
-        """6b + 7: stage the indices when the path needs it, then launch."""
+        """6b + 7: stage the indices (dsa) / build the union lists (d512) when the path needs it, then launch."""
         if self.needs_idx_staging:
             self.stage_indices(topk_idxs, idx_tmp, idx_ws, stream=stream)
-        self.launch(q, kv_all, sink, topk_idxs, o, lse=lse, lse_th=lse_th, max_logits=max_logits, idx_ws=idx_ws, stream=stream)
+        if self.needs_union_lists:
+            if union_ids is None or union_bits is None or union_ntiles is None:
+                raise RuntimeError(f"{self.name}: the d512 adapter needs the union_ids / union_bits / union_ntiles views (shapes: union_shapes)")
+            self.stage_union_lists(topk_idxs, union_ids, union_bits, union_ntiles, stream=stream)
+        self.launch(
+            q,
+            kv_all,
+            sink,
+            topk_idxs,
+            o,
+            lse=lse,
+            lse_th=lse_th,
+            max_logits=max_logits,
+            idx_ws=idx_ws,
+            stream=stream,
+            union_ids=union_ids,
+            union_bits=union_bits,
+            union_ntiles=union_ntiles,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -627,6 +685,9 @@ class _Slots:
     idx_ws: Optional[int]  # dsa, staging
     engine_scratch: int
     total_bytes: int
+    union_ids: Optional[int] = None  # d512: [B, NC, U_MAX] int32 (plan 1(b))
+    union_bits: Optional[int] = None  # d512: [B, NC, U_MAX_TILES, 4, 4] int32
+    union_ntiles: Optional[int] = None  # d512: [B, NC] int32, never 0
 
 
 # ---------------------------------------------------------------------------
@@ -644,9 +705,12 @@ class MqaSparseAttentionBlockFwd(APIBase):
 
     Knobs: ``attention`` (``"dsa"`` default = the in-tree H64 kernel with the sink
     passed in and the LSE folded, ``"torch"`` = the oracle-shaped baseline,
-    ``"d512"`` = the Rubin fork -- declines until it lands); ``wo_a_batched``
-    (one batched ``o_a_proj`` launch instead of eight -- gated on M6, off by
-    default); ``pointwise_impl`` (``"torch"`` default in v0 -- FLAGGED, allocates
+    ``"d512"`` = the gathered-list fork of the Rubin d512 SDPA behind the block-owned
+    ``union_lists`` pre-pass -- ``(64, 512)`` heads only, cc (10, 7) only, a typed
+    decline while the fork module is absent); ``wo_a_batched``
+    (one batched ``o_a_proj`` launch instead of eight -- ON by default: M6 passed and the
+    single launch measured 6.6x / 2.4x / 1.3x faster at S = 2K / 8K / 32K on Rubin,
+    2026-09-17; ``False`` keeps the eight launches); ``pointwise_impl`` (``"torch"`` default in v0 -- FLAGGED, allocates
     per execute; ``"frost"`` = ``kernels/norm_rope.py`` once it lands);
     ``three_roundings`` (the model's bf16 rounding points; ``False`` exists only
     on the kernel arm); ``return_lse`` (then ``execute(lse=)`` is a required
@@ -673,7 +737,7 @@ class MqaSparseAttentionBlockFwd(APIBase):
         *,
         return_lse: bool = False,
         attention: str = "dsa",
-        wo_a_batched: bool = False,
+        wo_a_batched: bool = True,
         pointwise_impl: str = "torch",
         three_roundings: bool = True,
     ):
@@ -817,6 +881,14 @@ class MqaSparseAttentionBlockFwd(APIBase):
                 raise NotImplementedError(
                     f"attention='d512': the gathered-list d512 sparse-attention fork ({D512_FORK_MODULE}) has not landed; use attention='dsa' or 'torch'"
                 )
+            from .kernels.sparse_attention import D512_HEAD_DIM, D512_N_HEADS
+
+            g = self.geom
+            if (g.n_heads, g.head_dim) != (D512_N_HEADS, D512_HEAD_DIM):
+                raise NotImplementedError(
+                    f"attention='d512': the fork's work item is {D512_N_HEADS} heads x head_dim {D512_HEAD_DIM} (4 tokens x 64 heads per 256-row "
+                    f"cluster); got n_heads={g.n_heads}, head_dim={g.head_dim}"
+                )
         if self.pointwise_impl == "frost":
             try:
                 from .kernels import norm_rope  # noqa: F401
@@ -914,11 +986,83 @@ class MqaSparseAttentionBlockFwd(APIBase):
                 if b > 1:
                     idx_tmp = lay.add(t * self.topk * 4)
                 idx_ws = lay.add(t * self._attention.k_pad * 4)
+        union = {}
+        if self.attention == "d512":
+            # Plan 1(b) / 2.3: the three int32 pre-pass tensors, U_MAX_TILES = ceil(4K / 128) (the adapter's params pin the
+            # same value into the kernel, so the workspace pitch and the kernel's agree by construction).
+            for name, shape in self._attention.union_shapes.items():
+                union[name] = lay.add(math.prod(shape) * 4)
         engine = max([st.workspace_bytes() for st in self._stages if isinstance(st, _Projection)] + [1])
         scratch = lay.add(align_up(engine, _WS_ALIGN))
         return _Slots(
-            qa=qa, q=q, o=o, o_lora=o_lora, lse_th=lse_th, max_logits=max_logits, idx_tmp=idx_tmp, idx_ws=idx_ws, engine_scratch=scratch, total_bytes=lay.size
+            qa=qa,
+            q=q,
+            o=o,
+            o_lora=o_lora,
+            lse_th=lse_th,
+            max_logits=max_logits,
+            idx_tmp=idx_tmp,
+            idx_ws=idx_ws,
+            engine_scratch=scratch,
+            total_bytes=lay.size,
+            union_ids=union.get("union_ids"),
+            union_bits=union.get("union_bits"),
+            union_ntiles=union.get("union_ntiles"),
         )
+
+    def _slot_shapes(self) -> dict:
+        """``name -> (shape, dtype)`` of every carved intermediate (the views ``_bind`` / :meth:`workspace_view` hand out)."""
+        g, b, s, t = self.geom, self.batch, self.seq_len, self.tokens
+        h, dh = g.n_heads, g.head_dim
+        shapes = {
+            "qa": ((t, g.q_lora_rank), self.dtype),
+            "q": ((t, h, dh), self.dtype),
+            "o": ((t, h, dh), self.dtype),
+            "o_lora": ((t, g.n_o_lora), self.dtype),
+            "lse_th": ((t, h), torch.float32),
+            "max_logits": ((t, h), torch.float32),
+            "idx_tmp": ((b, s, self.topk), torch.int32),
+            "idx_ws": ((b, s, self._attention.k_pad), torch.int32),
+        }
+        for name, shape in self._attention.union_shapes.items():
+            shapes[name] = (tuple(shape), torch.int32)
+        return shapes
+
+    def workspace_view(self, workspace: torch.Tensor, name: str) -> torch.Tensor:
+        """The typed, shaped VIEW of a carved intermediate (``qa``, ``q``, ``o``, ``o_lora``, ``lse_th``, ``max_logits``,
+        ``idx_tmp``, ``idx_ws``, ``union_ids``, ``union_bits``, ``union_ntiles``) in the caller's workspace -- never a copy.
+        For tests reading intermediates back and for the perf table's ``n_tiles`` columns (read from ``union_ntiles``).
+        ``ValueError`` when the slot does not exist under this declaration (e.g. ``union_*`` off ``attention='d512'``)."""
+        if self._slots is None:
+            raise RuntimeError("call compile() first")
+        offset = getattr(self._slots, name, None)
+        shapes = self._slot_shapes()
+        if name not in shapes or offset is None:
+            raise ValueError(
+                f"no workspace slot {name!r} under attention={self.attention!r} (have {sorted(n for n in shapes if getattr(self._slots, n, None) is not None)})"
+            )
+        shape, dtype = shapes[name]
+        return _view(workspace, offset, shape, dtype)
+
+    def attention_info(self) -> dict:
+        """Plan-time facts of the attention stage for tables / headers: ``adapter``, ``k_pad``, ``needs_idx_staging`` and,
+        under ``d512``, ``n_clusters``, ``u_max_tiles``, ``u_max``, ``union_shapes``, ``union_bytes``, ``scale_log2``, ``params``."""
+        self._ensure_support_checked()
+        st = self._attention
+        info = dict(adapter=self.attention, k_pad=st.k_pad, needs_idx_staging=st.needs_idx_staging, needs_union_lists=st.needs_union_lists)
+        if self.attention == "d512" and st._adapter is not None:
+            ad = st._adapter
+            shapes = st.union_shapes
+            info.update(
+                n_clusters=ad.n_clusters,
+                u_max_tiles=ad.u_max_tiles,
+                u_max=ad.u_max,
+                union_shapes=shapes,
+                union_bytes=sum(math.prod(v) * 4 for v in shapes.values()),
+                scale_log2=ad.scale_log2,
+                params=repr(ad.params),
+            )
+        return info
 
     def get_workspace_size(self) -> int:
         """Bytes the caller must provide: every intermediate plus the GEMM engines'
@@ -1002,7 +1146,9 @@ class MqaSparseAttentionBlockFwd(APIBase):
         max_logits = _view(ws, sl.max_logits, (t, h), torch.float32) if sl.max_logits is not None else None
         idx_tmp = _view(ws, sl.idx_tmp, (b, s, self.topk), torch.int32) if sl.idx_tmp is not None else None
         idx_ws = _view(ws, sl.idx_ws, (b, s, self._attention.k_pad), torch.int32) if sl.idx_ws is not None else None
+        union = {name: _view(ws, getattr(sl, name), shape, torch.int32) for name, shape in self._attention.union_shapes.items()}
         fold = self.attention == "dsa" and self.return_lse
+        lse_direct = self.return_lse and self.attention in ("torch", "d512")  # these adapters write the FROST-convention LSE themselves
 
         # 1 + 2: q_a_proj -> RMSNorm in place
         def q_a_proj():
@@ -1025,9 +1171,13 @@ class MqaSparseAttentionBlockFwd(APIBase):
         def kv_chain():
             self._kv_chain.execute(kv_prefix, w_kv_norm, cos2, sin2, stream=stream)
 
-        # 6b + 7: the attention adapter (dsa: index staging into the workspace, then the H64 kernel)
+        # 6b + 7: the attention adapter (dsa: index staging into the workspace, then the H64 kernel;
+        # d512: the union-list pre-pass into the workspace, then ONE fork launch over zero-copy views)
         def idx_staging():
             self._attention.stage_indices(topk_idxs, idx_tmp, idx_ws, stream=stream)
+
+        def union_lists():
+            self._attention.stage_union_lists(topk_idxs, union["union_ids"], union["union_bits"], union["union_ntiles"], stream=stream)
 
         def sparse_attention():
             self._attention.launch(
@@ -1036,11 +1186,14 @@ class MqaSparseAttentionBlockFwd(APIBase):
                 attn_sink,
                 topk_idxs,
                 o.view(b, s, h, dh),
-                lse=lse if (self.return_lse and self.attention == "torch") else None,
+                lse=lse if lse_direct else None,
                 lse_th=lse_th,
                 max_logits=max_logits,
                 idx_ws=idx_ws,
                 stream=stream,
+                union_ids=union.get("union_ids"),
+                union_bits=union.get("union_bits"),
+                union_ntiles=union.get("union_ntiles"),
             )
 
         # 8: inverse RoPE in place on o (+ the D1 LSE fold for dsa)
@@ -1081,6 +1234,8 @@ class MqaSparseAttentionBlockFwd(APIBase):
         ]
         if self._attention.needs_idx_staging:
             runners.append(_StageRunner("idx_staging", kind["idx_staging"], idx_staging))
+        if self._attention.needs_union_lists:
+            runners.append(_StageRunner("union_lists", kind["union_lists"], union_lists))
         runners += [
             _StageRunner("sparse_attention", kind["sparse_attention"], sparse_attention),
             _StageRunner("o_unrope", kind["o_unrope"], o_unrope, prepare=sparse_attention),
@@ -1120,9 +1275,10 @@ class MqaSparseAttentionBlockFwd(APIBase):
         ``torch.cuda.Stream`` is refused: pass its ``.cuda_stream``); ``None`` means
         torch's current stream on the DECLARED device.  The GEMMs take it through
         ``run_proj_gemm(stream=)`` (both routes), the DSA kernel as
-        ``current_stream``, the torch stages under ``torch.cuda.stream``.  No
-        stage derives its own stream.  The FLAGGED torch stages allocate; the
-        GEMM and ``dsa`` stages do not, and nothing here syncs.
+        ``current_stream``, the d512 fork as its raw-int ``stream`` argument, the
+        torch stages under ``torch.cuda.stream``.  No stage derives its own stream.
+        The FLAGGED torch stages allocate (incl. the d512 ``union_lists`` pre-pass);
+        the GEMM, ``dsa`` and d512 kernel launches do not, and nothing here syncs.
         """
         tensors = dict(zip(TENSOR_NAMES, (x, w_q_a, w_q_norm, w_q_b, w_kv, w_kv_norm, w_o_a, w_o_b, attn_sink, cos, sin, kv_all, topk_idxs, out)))
         for runner in self._bind(tensors, workspace, lse, self._resolve_stream(current_stream)):
@@ -1153,12 +1309,13 @@ class MqaSparseAttentionBlockFwd(APIBase):
         ``execute``).  For per-op attribution (the perf table's comparison mode):
 
         each ``_StageRunner`` has ``.name`` (``RUNNER_NAMES``: ``q_a_proj`` .. ``o_b_proj``;
-        ``idx_staging`` only under ``dsa`` when ``B > 1`` or ``K % 64 != 0``), ``.kind``
+        ``idx_staging`` only under ``dsa`` when ``B > 1`` or ``K % 64 != 0``; ``union_lists``
+        only under ``d512``), ``.kind``
         (``'mma'`` / ``'bw'`` / ``'prep'``), ``.run()`` and, on the in-place stages
         (``q_norm``, ``q_rope``, ``kv_chain``, ``o_unrope``), ``.prepare()`` -- the
         producing stage's run, restoring the input bit-exactly with no snapshot and no
-        allocation.  ``sparse_attention.run()`` is the kernel alone (the staging is its
-        own ``prep`` runner), so it is the ``kernel-only`` row.  The runners hold VIEWS of
+        allocation.  ``sparse_attention.run()`` is the kernel alone (the staging / union
+        pre-pass is its own ``prep`` runner), so it is the ``kernel-only`` row.  The runners hold VIEWS of
         ``workspace`` / the tensors: keep them alive while the runners are in use, and run
         the whole list once before timing a stage in isolation (its inputs are workspace
         state).  ``lse`` is required exactly when ``return_lse=True`` (as for ``execute``).

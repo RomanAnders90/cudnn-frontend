@@ -28,13 +28,26 @@ module pins the four primitives it is built from, each against an independent re
   ``UTMALDG.2D.GATHER4`` count, the ``.2CTA`` form under ``cta_group=2``, ``STL/LDL == 0``.
 
 Accept tests that launch gather4 are ``requires_rubin``; the CPU / any-GPU tests run everywhere.
+
+W3b (below the micro tests): the FORK itself, ``kernels/sparse_attention_d512.py``, driven through its stated interface
+(``compile(b, s, n_kv_rows, n_clusters, has_lse)`` -> ``fn(q, kv2d, o, lse|None, sinks, union_ids, union_bits,
+union_ntiles, scale_log2, stream)``) with the block-owned ``build_union_lists`` pre-pass in front -- every accept asserts
+against ``mqa_block_reference.sparse_attention_reference`` under the bf16 budget (rtol ``2**-7``, atol ``2**-8 max|kv|``:
+NEVER bitwise, never widened) and the LSE within ``1e-4`` of the fp64 arm, with sentinel-filled O, keyless rows exact,
+``set_sync_debug_mode("error")`` around the launch, and two launches bitwise.  Those tests skip typed until the fork module
+exists and are ``requires_rubin``; the DESC_VERSION twins, the validator rejects and the sm_107a trace-compile run on any box
+with the DSL.  The block-side wiring (adapter, workspace slots, runners) is covered under ``attention="d512"`` in
+``test_mqa_block_sparse_attention_stage.py`` and ``test_mqa_block_end_to_end.py``.
 """
 
 from __future__ import annotations
 
+import functools
 import glob
 import importlib.util
+import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -47,6 +60,7 @@ import torch
 from fe_api.mqa_sparse_attention_block import mqa_block_reference as R
 
 from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.mqa_sparse_attention_block.kernels import sparse_attention as SA
 from cudnn.mqa_sparse_attention_block.kernels.union_lists import (
     TILE_ROWS,
     TOKENS_PER_CLUSTER,
@@ -701,3 +715,636 @@ def test_sm107a_trace_compile_gather4_sass(tmp_path):
     assert stats[("ROUNDTRIP2", "GATHER4_2CTA")] == 128, "cta_group=2 emits the .2CTA form"
     assert stats[("TIMING", "SPILL")] == 0 and stats[("ROUNDTRIP2", "SPILL")] == 0
     assert stats[("TIMING", "R2UR")] > 0, "row coordinates reach the uniform datapath (R2UR) -- the elected-lane issue model"
+
+
+# ============================================================================ W3b: the fork -- kernels/sparse_attention_d512.py
+# Everything below drives the FORK MODULE directly through its stated interface (plan 1(h)):
+#   compile(b, s, n_kv_rows, n_clusters, has_lse) -> fn(q, kv2d, o, lse|None, sinks, union_ids, union_bits, union_ntiles, scale_log2, stream)
+# fed by the block-owned pre-pass ``build_union_lists`` (the SAME three int32 views the block carves).  ``sinks`` are the
+# block's natural-log ``attn_sink`` (the fork folds them as ``max(final_max_nat, sink_logit)``, plan 1(e)); ``scale_log2`` is
+# ``scale * log2(e)`` (``SA.d512_scale_log2``).  The module is loaded through the FROST template loader with the SAME
+# ``(path, SparseAttentionD512Params)`` key the block's adapter uses, so a mixed run shares one module instance per
+# specialization; ``u_max_tiles = ceil(4K / 128)`` (the adapter's choice) is the union-column pitch of every view.
+requires_fork = pytest.mark.skipif(not SA.d512_fork_available(), reason=f"the d512 fork module {SA.D512_FORK_MODULE} has not landed (wave W3b, F1)")
+
+H = 64  # heads per token = the fork's work item (4 tokens x 64 heads per 256-row cluster); TP=2 (32 heads) is refused
+_SENTINEL = 1.5e30  # a bf16-representable magnitude no attention output reaches: a surviving cell was never stored
+_EXACT = dict(p_dtype=torch.float32, out_dtype=torch.float32)  # the oracle's fp64 arm (LSE bar 1e-4)
+_FRESH_PROCESS_ENV = "MQA_D512_FRESH_PROCESS_LAUNCHES"  # the Validate agent sets it to the launch count (12); unset = skip typed
+# Per child: import + one JIT + one launch + the two oracle arms (the fp64 exact arm dominates at 32K: 256 chunks x 2 fp64
+# einsums over 640 gathered rows); a kill here reads as 124 = HANG.  Keyed by S so the 32K arm is not mis-classified as a hang.
+_FRESH_PROCESS_TIMEOUT_S = {2048: 600, 32768: 900}
+_FRESH_PROCESS_S = [2048, 32768]  # plan 4 row 4: "12 fresh-process launches classified 0/124/other at S = 2048 AND 32768"
+_S_32K = 32768  # the released prompt length: 8192 clusters over 53 resident clusters (212 SMs) = ~155 tiles per CTA (risk 11)
+
+
+def _assert_bf16_budget(o_a, o_b, kv, label=""):
+    """The oracle's documented bar (``test_mqa_block_reference_selfcheck.py:63-67``, plan 3.4): a CORRECT kernel rounds bf16 P
+    against its RUNNING max and rescales by alpha per tile, so its O differs from the batch oracle on 10-27 % of the elements
+    by one bf16 ulp.  rtol ``2**-7``, atol ``2**-8 * max|kv|`` -- NEVER bitwise, never widened."""
+    torch.testing.assert_close(o_a.float(), o_b.float(), rtol=2**-7, atol=2**-8 * float(kv.float().abs().max()), msg=lambda m: f"{label}: {m}")
+
+
+def _fork_path() -> str:
+    return importlib.util.find_spec(SA.D512_FORK_MODULE).origin
+
+
+def _code_lines(src: str) -> str:
+    """The source without comment lines (a pin on a substring must not be satisfiable by prose)."""
+    return "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+
+
+@functools.lru_cache(maxsize=None)
+def _fork_module(u_max_tiles: int, has_sink: bool = True):
+    """The fork specialized by ``SparseAttentionD512Params`` through ``cudnn.frost.template_loader`` (plan 1(h)).  The params
+    class lives in the fork, so the plain import (``SA.d512_fork_module``, the default specialization) supplies it; the
+    specialized instance is a separate module object, cached by ``(path, params)`` like the block's adapter."""
+    from cudnn.frost.template_loader import load_template
+
+    fork = SA.d512_fork_module()
+    params = fork.SparseAttentionD512Params(has_sink=bool(has_sink), heads_per_tile=H, u_max_tiles=int(u_max_tiles))
+    return load_template(_fork_path(), params, tag=getattr(SA, "D512_TEMPLATE_TAG", "mqa_sparse_attention_d512"))
+
+
+@functools.lru_cache(maxsize=None)
+def _fork_compiled(u_max_tiles: int, has_sink: bool, b: int, s: int, n_kv: int, nc: int, has_lse: bool):
+    """One artifact per ``(specialization, B, S, N, NC, has_lse)`` -- every distinct shape is a JIT (~20-40 s), so the tests
+    below share shapes where the contract allows (the forced-``n_tiles`` cases all compile ONE kernel)."""
+    return _fork_module(u_max_tiles, has_sink).compile(int(b), int(s), int(n_kv), int(nc), bool(has_lse))
+
+
+def _case_fork(*, batch, seq_len, ratio, window=16, topk=8, seed=0, sink=None, device="cuda"):
+    """``q [B,S,64,512]`` / ``kv_all [B, S + N_c, 512]`` bf16, ``sink [64]`` fp32, ``topk_idxs [B,S,K]`` int32 in the block's layouts:
+    the window list ++ the synthetic compressed list (ids offset by ``S``).  ``ratio 0`` = a window-only layer (``N = S``);
+    ``N_c = S // ratio`` -- ZERO when ``S < ratio`` (the legal degenerate: the list is the window alone).  Small lists by default
+    (``K <= 24`` -> one union tile) so the degenerate sweep's cost is the per-shape JIT, not the oracle."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn(batch, seq_len, H, D, generator=g, device=device).to(torch.bfloat16)
+    kv = torch.randn(batch, seq_len, D, generator=g, device=device).to(torch.bfloat16)
+    idxs = R.window_idxs(batch, seq_len, window, device=device)
+    n_c = seq_len // ratio if ratio > 0 else 0
+    if n_c > 0:
+        kv = torch.cat([kv, torch.randn(batch, n_c, D, generator=g, device=device).to(torch.bfloat16)], dim=1)
+        idxs = torch.cat([idxs, R.compressed_idxs_synthetic(batch, seq_len, ratio, topk, g, device=device)], dim=-1)
+    if sink is None:
+        sink = torch.randn(H, generator=g, device=device, dtype=torch.float32)
+    else:
+        sink = torch.full((H,), float(sink), device=device, dtype=torch.float32)
+    return q, kv.contiguous(), sink, idxs.contiguous(), float(D) ** -0.5
+
+
+def _launch_fork(q, kv, sink, idxs, scale, *, has_sink=True, want_lse=True, u_max_tiles=None):
+    """ONE launch of the fork over zero-copy views, exactly as the adapter binds them: the pre-pass into fresh union views,
+    sentinel-filled O, NaN-filled LSE, the kernel call under ``set_sync_debug_mode("error")`` (no D2H on the execute path)
+    with ``torch.cuda.memory_allocated`` pinned across it (one call, no copy).  Returns ``(o, lse | None, union_ntiles)``."""
+    b, s, h, d = (int(v) for v in q.shape)
+    assert (h, d) == (H, D) and q.is_contiguous() and kv.is_contiguous(), "the fork's work item is 64 heads x 512, BSHD compact"
+    n_kv, nc = int(kv.shape[1]), n_clusters_for(s)
+    ut = u_max_tiles_for(int(idxs.shape[2])) if u_max_tiles is None else int(u_max_tiles)
+    fn = _fork_compiled(ut, has_sink, b, s, n_kv, nc, want_lse)
+    kv2d = kv.view(b * n_kv, d)
+    assert kv2d.data_ptr() == kv.data_ptr(), "the [B*N, 512] KV view must be zero-copy (one buffer, one descriptor)"
+    sinks = sink if has_sink else torch.zeros(h, dtype=torch.float32, device=q.device)
+    o = torch.full_like(q, _SENTINEL)
+    lse = torch.full((b, h, s), math.nan, dtype=torch.float32, device=q.device) if want_lse else None
+    stream = int(torch.cuda.current_stream(q.device).cuda_stream)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        ids, bits, nt = _run_union_lists(idxs, seq_len=s, n_kv_rows=n_kv, u_max_tiles=ut)  # FLAGGED pre-pass: allocates, must not sync
+        before = torch.cuda.memory_allocated()
+        fn(q, kv2d, o, lse, sinks, ids, bits, nt, SA.d512_scale_log2(scale), stream)
+        after = torch.cuda.memory_allocated()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert after == before, f"the fork launch allocated {after - before} bytes (it must be one call over zero-copy views)"
+    return o, lse, nt
+
+
+def _dead_tokens(idxs, n_kv):
+    """``[B, S]`` bool: tokens whose list names NO in-range row (``-1`` everywhere, or only sanitised ids)."""
+    return ~((idxs >= 0) & (idxs < n_kv)).any(dim=-1)
+
+
+def _check_fork(o, lse, q, kv, sink, idxs, scale, *, label, has_sink=True):
+    """Every accept bar at once (plan 4 row 4, sdpa-invariants sections 1-2):
+    * no sentinel survivor on any row ``< S`` (dead rows are STORED as zeros, never skipped);
+    * O within the bf16 budget of the gathered oracle;
+    * LSE within ``1e-4`` of the fp64 arm on finite cells, the non-finite cells EXACT, no NaN anywhere;
+    * every keyless token: ``O == 0`` exactly (a SELECT, never ``residue * 0``) and ``LSE == sink`` exactly with a sink /
+      ``-inf`` without one.
+    ``idxs`` must already be the oracle's vocabulary (``-1`` = no key, everything else in ``[0, N)``)."""
+    n_kv = int(kv.shape[1])
+    sent = torch.full((), _SENTINEL, dtype=o.dtype, device=o.device)
+    survivors = int((o == sent).sum())
+    assert survivors == 0, f"{label}: {survivors} sentinel cells survived (rows never stored) at {(o == sent).any(-1).nonzero()[:8].tolist()}"
+    assert torch.isfinite(o.float()).all(), f"{label}: non-finite O"
+    ref_sink = sink if has_sink else torch.full_like(sink, -math.inf)
+    ref_o, _ = R.sparse_attention_reference(q, kv, ref_sink, idxs, scale)
+    _assert_bf16_budget(o, ref_o, kv, f"{label} O")
+    dead = _dead_tokens(idxs, n_kv).nonzero().tolist()
+    for b_, tok in dead:
+        assert torch.equal(
+            o[b_, tok], torch.zeros_like(o[b_, tok])
+        ), f"{label}: keyless token ({b_}, {tok}) has O != 0 (max |O| {o[b_, tok].float().abs().max().item()})"
+    if lse is not None:
+        _, ref_lse = R.sparse_attention_reference(q, kv, ref_sink, idxs, scale, **_EXACT)
+        assert not torch.isnan(lse).any(), f"{label}: NaN / unwritten LSE cells at {torch.isnan(lse).nonzero()[:8].tolist()}"
+        fin = torch.isfinite(ref_lse)
+        assert torch.equal(torch.isfinite(lse), fin), f"{label}: the finite / non-finite LSE pattern differs from the oracle"
+        torch.testing.assert_close(lse[fin], ref_lse[fin], rtol=0, atol=1e-4, msg=lambda m: f"{label} LSE: {m}")
+        assert torch.equal(lse[~fin], ref_lse[~fin]), f"{label}: non-finite LSE cells differ from the oracle"
+        for b_, tok in dead:
+            assert torch.equal(
+                lse[b_, :, tok], ref_sink
+            ), f"{label}: keyless token ({b_}, {tok}) LSE != {'sink' if has_sink else '-inf'}: {lse[b_, :4, tok].tolist()}"
+    return ref_o
+
+
+# ---------------------------------------------------------------------------- any box with the DSL: module-level pins (no launch)
+@requires_dsl
+@requires_fork
+def test_fork_desc_version_is_one_and_wired_into_every_smem_tile():
+    """The two DESC_VERSION pins of ``test_sdpa_fwd_dsl_sm107.py``, ported because the fork lives outside ``sm107/``: the
+    d512 slabs put ``sP_xfer`` at exactly 262144, past the 14-bit version-0 descriptor window (the accumulator comes out
+    EXACTLY zero, no crash -- mma-tma-matrix.md section 6), so the module constant must be 1 -- and it is only meaningful if
+    EVERY ``SmemTile(`` takes ``desc_version=DESC_VERSION`` (the MXFP8 sibling shipped NaN from one re-literalled tile)."""
+    mod = _fork_module(1)
+    assert mod.DESC_VERSION == 1, f"DESC_VERSION={mod.DESC_VERSION}: the fork inherits the P-xfer ring at 262144 and needs the 15-bit descriptor root"
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    n_tiles = len(re.findall(r"\bSmemTile\($", code, re.M))
+    assert n_tiles > 0
+    n_wired = code.count("desc_version=DESC_VERSION")
+    assert n_wired == n_tiles, f"{n_tiles} SmemTile(s) but {n_wired} wired to DESC_VERSION"
+    assert not re.search(r"desc_version=[01]\b", code), "a re-literalled desc_version bypasses DESC_VERSION"
+
+
+@requires_dsl
+@requires_fork
+def test_fork_validator_pins_read_tile_arrivers_to_the_issuing_warp_ledger():
+    """Every warp that consumes the tile id to issue gathers MUST ``read_tile_id_arrive`` (the scheduler ring re-arms a slot
+    after its credits; a non-crediting reader lags a wrap and gathers the wrong rows, silent).  The M3 verdict -- THREE
+    dedicated gather-issuing warps per CTA (warps 8-10; warp 11 is the spare that completes their warpgroup) -- turns the dense
+    d512 ledger of 25 (config_sm107 :1141-1156, validated against the 8-warp parent) into ``25 + 3 x 4 CTAs = 37``.  The fork
+    exposes the ledger (``READ_TILE_ARRIVERS`` / ``N_GATHER_WARPS`` / ``_BASE_CFG``) and its validator re-derives it from the
+    body; this pins the stamped ``CFG`` value to the module constant, to the derivation AND to the literal 37, so a silent
+    change to EITHER input (the parent's ledger, the issuer count) is a finding rather than a pass."""
+    mod = _fork_module(1)
+    with open(mod.__file__, encoding="utf-8") as fh:
+        code = _code_lines(fh.read())
+    assert "_validate_sparse_cfg" in code and re.search(
+        r"READ_TILE_ARRIVERS\s*[=!]=", code
+    ), "the validator must compare READ_TILE_ARRIVERS against the derived ledger"
+    cga = int(mod.CFG.CGA_M) * int(mod.CFG.CGA_N)
+    assert (
+        cga == 4 and int(mod._BASE_CFG.READ_TILE_ARRIVERS) == 25
+    ), f"the parent is the cga4x1 body with a validated ledger of 25 (got cga={cga}, {mod._BASE_CFG.READ_TILE_ARRIVERS})"
+    assert int(mod.N_GATHER_WARPS) == 3, f"N_GATHER_WARPS={mod.N_GATHER_WARPS}: M3 sized the gather issue at THREE warps per CTA (2.3x -> 3)"
+    ledger = int(mod._BASE_CFG.READ_TILE_ARRIVERS) + int(mod.N_GATHER_WARPS) * cga
+    assert (
+        int(mod.CFG.READ_TILE_ARRIVERS) == int(mod.READ_TILE_ARRIVERS) == ledger == 37
+    ), f"READ_TILE_ARRIVERS: CFG={mod.CFG.READ_TILE_ARRIVERS} module={mod.READ_TILE_ARRIVERS} derived={ledger} (the landed ledger is 37)"
+    assert mod.CFG.SCHEDULER_POLICY == 0 and mod.CFG.MASK_FLAGS == 0 and mod.CFG.STAGES_KV == 2, "the fork's config invariants (plan 1(h))"
+    assert mod.CFG.PACK_GQA == 1 and mod.CFG.QH_PER_KH == H and mod.CFG.HAS_SINK == 1, "PackGQA rows: 64 heads per token, sink per head"
+
+
+@requires_dsl
+@requires_fork
+@pytest.mark.parametrize(
+    "kw, match",
+    [
+        pytest.param(dict(heads_per_tile=32), r"64|heads_per_tile|QH_PER_KH|TP", id="tp2-32-heads-refused"),
+        # The validator's PREFIX, not a predicate's wording: predicate order is the fork's, and for fp8 the shared make_cfg_d512
+        # picks the FP8 ring depths first (STAGES_KV 3 / XFER_STAGES 4), so that predicate fires before the dtype one.
+        pytest.param(dict(dtype_qkv=0), r"^sparse_attention_d512: ", id="fp8-not-a-f16-d512-body"),
+        pytest.param(dict(u_max_tiles=256), r"2\*\*15|32768|u_max_tiles|column", id="union-column-index-past-15-bits"),
+    ],
+)
+def test_fork_validator_rejects_bad_params(kw, match):
+    """``_validate_sparse_cfg`` raises ``ValueError`` at module load (plan time, never at execute) for a specialization the
+    body cannot serve -- surfaced through ``load_template`` exactly as the adapter would see it.  The contract under test is
+    "the fork's validator declines, typed, at load"; which predicate names the refusal first is the validator's business."""
+    from cudnn.frost.template_loader import load_template
+
+    fork = SA.d512_fork_module()
+    params = fork.SparseAttentionD512Params(**kw)
+    with pytest.raises(ValueError, match=match):
+        load_template(_fork_path(), params, tag="mqa_sparse_attention_d512_reject")
+
+
+_FORK_SASS_PROBE = textwrap.dedent("""
+    import glob, importlib.util, os, subprocess, sys
+    dump, cands = sys.argv[1], sys.argv[2:]
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump          # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "cubin"            # the wheel nvdisasm cannot decode sm_107a: keep the cubin, disassemble it ourselves
+    os.environ.setdefault("CUTE_DSL_ARCH", "sm_107a")  # trace + ptxas for Rubin on ANY box (no launch)
+    from cudnn.mqa_sparse_attention_block.kernels import sparse_attention as SA
+    from cudnn.frost.template_loader import load_template
+    fork = SA.d512_fork_module()
+    path = importlib.util.find_spec(SA.D512_FORK_MODULE).origin
+    mod = load_template(path, fork.SparseAttentionD512Params(u_max_tiles=1), tag="mqa_sparse_attention_d512_sass")
+    mod.compile(1, 16, 32, 4, True)  # (b, s, n_kv_rows, n_clusters, has_lse)
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")))
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    nvd = None
+    for c in cands:
+        try:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print("REJECT", c, "->", repr(exc)); continue
+        if proc.returncode == 0 and proc.stdout.strip():
+            nvd = c; print("NVDISASM", c); break
+        print("REJECT", c, "->", (proc.stderr.strip().splitlines() or [str(proc.returncode)])[-1])
+    if nvd is None:
+        print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
+    sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
+    print("FORK CUBIN", os.path.basename(cubins[-1]))
+    print("FORK GATHER4", sum(1 for ln in sass if "UTMALDG" in ln and "GATHER4" in ln))
+    print("FORK GATHER4_2CTA", sum(1 for ln in sass if "UTMALDG" in ln and "GATHER4.2CTA" in ln))
+    print("FORK UTMALDG", sum(1 for ln in sass if "UTMALDG" in ln))
+    print("FORK SPILL", sum(1 for ln in sass if "STL" in ln or "LDL" in ln))
+    print("FORK USETMAXREG", sum(1 for ln in sass if "USETMAXREG" in ln))
+    print("FORK LINES", len(sass))
+    """)
+
+
+@requires_dsl
+@requires_fork
+def test_fork_sm107a_trace_compile_sass(tmp_path):
+    """Trace + compile the FORK for Rubin on THIS box (no device match needed: ``CUTE_DSL_ARCH=sm_107a``) and read the SASS:
+    the gather4 producer is present (``UTMALDG.2D.GATHER4``), the register split is real (``USETMAXREG``), and the spill count
+    is PRINTED (the ``STL/LDL == 0`` gate on the 40-register TMA-LDG / TMA-STG warps is the fork author's, per warp -- a flat
+    count cannot attribute it).  SKIPS when the DSL predates sm_107a or no candidate nvdisasm decodes it; a compile failure
+    is a FAIL (the fork must build for sm_107a here -- that is the A100's job in this workflow)."""
+    if not _sm107a_known_to_the_dsl():
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0.dev0, --pre)")
+    cands = _nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try (CUDA_PATH unset and none on PATH)")
+    dump = tmp_path / "fork_sm107a"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _FORK_SASS_PROBE, str(dump), *cands], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"fork trace-compile for sm_107a failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith(("SKIP", "REJECT"))]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("FORK ") and len(ln.split()) == 3 and ln.split()[2].isdigit()}
+    print(f"\nfork sm_107a SASS: {stats}")
+    assert stats["GATHER4"] > 0, "the fork's K/V producer is gather4 (UTMALDG.2D.GATHER4)"
+    assert stats["USETMAXREG"] > 0, "the per-role register split must reach SASS (USETMAXREG.*), not just PTX"
+
+
+# ---------------------------------------------------------------------------- Rubin: PackGQA-port sites
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_packgqa_rows_sink_per_head_and_head_permutation():
+    """The nine row-space -> (token, head) sites (plan 1(i) risk 8) pinned from the outside: (1) the sink enters the LSE per
+    HEAD -- ``lse[b, h, tok] == logaddexp(lse_keys[b, tok], sink[h])`` with a wide per-head spread (a per-tile sink would
+    give one value per token); (2) rows are (token, head): permuting the heads of ``q`` and ``sink`` permutes O and LSE rows
+    BITWISE, because every row's arithmetic (its dot products, its softmax lane, its TMEM columns) is its own."""
+    q, kv, _, idxs, scale = _case_fork(batch=2, seq_len=12, ratio=1, seed=7)
+    g = torch.Generator(device="cuda").manual_seed(70)
+    sink = (torch.randn(H, generator=g, device="cuda") * 3.0).float().contiguous()
+    o, lse, _ = _launch_fork(q, kv, sink, idxs, scale)
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label="per-head sink")
+    _, lse_keys = R.sparse_attention_reference(q, kv, torch.full_like(sink, -math.inf), idxs, scale, **_EXACT)
+    want = torch.logaddexp(lse_keys, sink.view(1, H, 1))
+    torch.testing.assert_close(lse, want, rtol=0, atol=1e-4, msg=lambda m: f"LSE is not logaddexp(keys, sink[h]) per head: {m}")
+    assert float(lse[0, :, 0].max() - lse[0, :, 0].min()) > 1.0, "the per-head sink must spread the LSE across the 64 heads of one token"
+    perm = torch.randperm(H, generator=g, device="cuda")
+    o_p, lse_p, _ = _launch_fork(q[:, :, perm].contiguous(), kv, sink[perm].contiguous(), idxs, scale)
+    assert torch.equal(o_p, o[:, :, perm]), "permuting the heads must permute the O rows bitwise (row = token_local * 64 + head)"
+    assert torch.equal(lse_p, lse[:, perm]), "permuting the heads must permute the LSE rows bitwise (lse[b, row_head, tok])"
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_membership_isolates_each_token_slot_from_its_cluster_neighbours():
+    """Four adjacent tokens with DISJOINT lists share one union tile: token ``4c + j`` must attend ONLY its own 8 rows.  The
+    oracle comparison proves the positive; the negative control -- the same rows attended over the whole cluster union, what a
+    missing / all-ones membership mask would compute -- must NOT match on any token."""
+    S, B, K, N = 8, 1, 8, 64
+    g = torch.Generator(device="cuda").manual_seed(8)
+    q = torch.randn(B, S, H, D, generator=g, device="cuda").to(torch.bfloat16)
+    kv = torch.randn(B, N, D, generator=g, device="cuda").to(torch.bfloat16)
+    sink = torch.randn(H, generator=g, device="cuda", dtype=torch.float32)
+    tok = torch.arange(S, device="cuda")
+    idxs = ((tok // 4) * 32 + (tok % 4) * K).view(B, S, 1) + torch.arange(K, device="cuda").view(1, 1, K)  # disjoint 8-row lists per token
+    idxs = idxs.int().contiguous()
+    scale = float(D) ** -0.5
+    o, lse, nt = _launch_fork(q, kv, sink, idxs, scale)
+    assert bool((nt == 1).all()), nt.tolist()
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label="disjoint neighbour lists")
+    union_idx = idxs.view(B, S // 4, 4 * K).repeat_interleave(4, dim=1).contiguous()  # every token lists the cluster's 32 rows
+    o_union, lse_union = R.sparse_attention_reference(q, kv, sink, union_idx, scale)
+    per_tok = (o.float() - o_union.float()).abs().amax(dim=(2, 3))  # [B, S]
+    assert bool((per_tok > 2**-5).all()), f"a token that saw its neighbours' keys would match the union oracle: {per_tok.tolist()}"
+    assert bool(((lse - lse_union).abs().amax(dim=1) > 1e-2).all()), "the LSE must see only the token's own keys"
+
+
+# ---------------------------------------------------------------------------- Rubin: the degenerate sweep (sdpa-invariants sections 1 / 9)
+_SWEEP_S = [1, 2, 3, 4, 5, 127, 128, 129, 300, 1000, 2048]
+_SWEEP_KINDS = [("win", 0), ("r1", 1), ("r2", 2)]  # window-only (the has_compressed_kv=False shape), ratio 1, ratio 2 (= S < ratio at S=1)
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+@pytest.mark.parametrize("kind, ratio", _SWEEP_KINDS, ids=[k for k, _ in _SWEEP_KINDS])
+@pytest.mark.parametrize("batch", [1, 2], ids=["B1", "B2"])
+@pytest.mark.parametrize("seq_len", _SWEEP_S, ids=[f"S{s}_" for s in _SWEEP_S])
+def test_fork_degenerate_sweep(seq_len, batch, kind, ratio):
+    """``S in {1,2,3,4,5,127,128,129,300,1000,2048} x B in {1,2} x {window-only, ratio 1, ratio 2}``: one cluster, ``S % 4 != 0``
+    (padded tokens in the tail cluster get no rows and no keys), ``S < ratio`` (``N_c == 0``, the window list alone), ``B > 1``
+    with a single cluster, the scheduler ring wrapping (S = 2048 -> 512 clusters), tail tiles with ``-1`` padding.  Every case is
+    one JIT (``compile`` pins the shape), so run it in ``--k-any`` groups by ``S<n>_``."""
+    q, kv, sink, idxs, scale = _case_fork(batch=batch, seq_len=seq_len, ratio=ratio, seed=seq_len * 7 + batch)
+    if ratio > seq_len:  # S < ratio: no compressed rows -- the list is the window alone
+        assert int(kv.shape[1]) == seq_len and int(idxs.shape[2]) == min(seq_len, 16)
+    o, lse, nt = _launch_fork(q, kv, sink, idxs, scale)
+    assert nt.shape == (batch, n_clusters_for(seq_len)) and int(nt.min()) >= 1
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label=f"S={seq_len} B={batch} {kind}")
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_keyless_token_and_all_minus_one_quad():
+    """One token with no key inside a live cluster (its 64 rows: ``O == 0`` by SELECT, ``LSE == sink`` exactly, its neighbours
+    within budget) and two hand-built all-``-1`` quads (one mid-sequence, one the LAST cluster): ``n_tiles == 1`` (never 0),
+    one zero-MMA tile, every row dead, no NaN anywhere."""
+    q, kv, sink, idxs, scale = _case_fork(batch=2, seq_len=40, ratio=1, seed=3)
+    idxs[0, 5] = -1
+    idxs[1, 8:12] = -1
+    idxs[0, 36:40] = -1
+    o, lse, nt = _launch_fork(q, kv, sink, idxs, scale)
+    assert int(nt[1, 2]) == 1 and int(nt[0, 9]) == 1, nt.tolist()
+    dead = _dead_tokens(idxs, int(kv.shape[1]))
+    assert bool(dead[0, 5]) and bool(dead[1, 8:12].all()) and bool(dead[0, 36:40].all()) and int(dead.sum()) == 9
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label="keyless token + all -1 quads")
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_duplicates_within_and_across_lists():
+    """Duplicates are distinct slots and count TWICE (the multiset union carries copies): within one list (a slot repeated
+    2x and 3x), across the lists of one cluster (token 10 names token 9's id: ONE union copy carrying both bits), a 4x
+    repeat in another cluster.  Within budget of the oracle; the duplicated rows CHANGE vs the plain list; clusters whose
+    lists are untouched reproduce the plain run bitwise (identical gathers, identical arithmetic)."""
+    q, kv, sink, idxs, scale = _case_fork(batch=1, seq_len=16, ratio=1, seed=5)
+    dup = idxs.clone()
+    dup[0, 9, 1] = dup[0, 9, 0]
+    dup[0, 9, 2] = dup[0, 9, 0]
+    dup[0, 10, 0] = dup[0, 9, 0]
+    dup[0, 12, :4] = dup[0, 12, 0]
+    o_dup, lse_dup, nt_dup = _launch_fork(q, kv, sink, dup, scale)
+    _check_fork(o_dup, lse_dup, q, kv, sink, dup, scale, label="duplicates")
+    o_one, lse_one, _ = _launch_fork(q, kv, sink, idxs, scale)
+    assert not torch.equal(o_dup[0, 9], o_one[0, 9]) and not torch.equal(o_dup[0, 12], o_one[0, 12]), "a duplicated slot must change its row"
+    assert torch.equal(o_dup[0, :8], o_one[0, :8]) and torch.equal(lse_dup[0, :, :8], lse_one[0, :, :8]), "clusters 0-1 are untouched: bitwise"
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_ids_outside_the_kv_range_are_sanitised_to_no_key():
+    """Ids ``>= N`` (incl. exactly ``N`` and ``2**30``) and ``< -1`` are "no key": dropped by the pre-pass with their bits
+    cleared (a zero-filled row with a set bit would be a real logit of 0).  At ``B = 2`` the flat row space is ``b * N + id``,
+    so an unmasked ``id >= N`` of batch 0 would gather batch 1's rows -- the oracle on the SANITISED list is the truth."""
+    q, kv, sink, idxs, scale = _case_fork(batch=2, seq_len=12, ratio=2, seed=6)
+    n = int(kv.shape[1])
+    bad = idxs.clone()
+    bad[0, 3, :4] = torch.tensor([n, n + 7, -5, n - 1], device="cuda", dtype=torch.int32)  # n - 1 is the largest VALID id
+    bad[1, 10, 0] = 2**30
+    o, lse, _ = _launch_fork(q, kv, sink, bad, scale)
+    clean = torch.where((bad >= 0) & (bad < n), bad, torch.full_like(bad, -1))
+    _check_fork(o, lse, q, kv, sink, clean, scale, label="sanitised ids")
+    o_plain, _, _ = _launch_fork(q, kv, sink, idxs, scale)
+    assert not torch.equal(o[0, 3], o_plain[0, 3]), "the planted slots replaced live ids, so row (0, 3) must have changed"
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+@pytest.mark.parametrize("n_rows", [128, 200, 256, 384, 700, 768, 1152, 2304], ids=lambda n: f"rows{n}")
+def test_fork_forced_n_tiles(n_rows):
+    """Lists built to realise ``n_tiles = ceil(n_rows / 128) in {1, 2, 3, 6, 9, 18}`` per cluster (``n_rows`` distinct KV rows
+    spread round-robin over the four tokens, ``K = 640`` slots each, ``-1``-padded; 200 and 700 leave the last tile partial):
+    the K/V ring (``STAGES_KV = 2``) wraps from 3 tiles on, the eight ``n_tiles`` bounds sites (P14) see every count, and a
+    partial last tile mixes live columns with ``-1`` = OOB zero rows.  ONE shape, so one JIT for all eight cases."""
+    S, B, K, N = 16, 1, 640, 2560
+    want = -(-n_rows // TILE_ROWS)
+    assert 4 * K >= n_rows and u_max_tiles_for(K) >= want
+    g = torch.Generator(device="cuda").manual_seed(n_rows)
+    q = torch.randn(B, S, H, D, generator=g, device="cuda").to(torch.bfloat16)
+    kv = torch.randn(B, N, D, generator=g, device="cuda").to(torch.bfloat16)
+    sink = torch.randn(H, generator=g, device="cuda", dtype=torch.float32)
+    idxs = torch.full((B, S, K), -1, dtype=torch.int32, device="cuda")
+    for c in range(n_clusters_for(S)):
+        rows = torch.randperm(N, generator=g, device="cuda")[:n_rows].sort().values
+        for j in range(TOKENS_PER_CLUSTER):
+            mine = rows[j::TOKENS_PER_CLUSTER]
+            idxs[0, TOKENS_PER_CLUSTER * c + j, : mine.numel()] = mine.int()
+    scale = float(D) ** -0.5
+    o, lse, nt = _launch_fork(q, kv, sink, idxs, scale)
+    assert bool((nt == want).all()), f"n_tiles {nt.tolist()} != {want}"
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label=f"n_tiles={want} (rows {n_rows})")
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_sink_corners_on_live_and_keyless_rows():
+    """``sink = -inf``: live rows == the no-sink math, a keyless row gives ``new_sum = 0 -> beta = +inf`` inside the fold and
+    is correct ONLY through the ``_row_empty`` selects (``O == 0``, ``LSE == -inf``; plan 1(e)) -- and it must agree with the
+    ``has_sink=False`` specialization within the budget.  ``sink = +inf``: ``O == 0`` and ``LSE == +inf`` on EVERY row, no NaN
+    (the ``sink_term`` select keeps ``exp(inf - inf)`` from forming)."""
+    q, kv, _, idxs, scale = _case_fork(batch=1, seq_len=16, ratio=1, seed=9)
+    idxs[0, 6] = -1  # a keyless token among live ones
+    ninf = torch.full((H,), -math.inf, device="cuda", dtype=torch.float32)
+    o, lse, _ = _launch_fork(q, kv, ninf, idxs, scale)
+    _check_fork(o, lse, q, kv, ninf, idxs, scale, label="sink=-inf")
+    assert torch.equal(o[0, 6], torch.zeros_like(o[0, 6])) and bool(torch.isneginf(lse[0, :, 6]).all())
+    o_ns, lse_ns, _ = _launch_fork(q, kv, ninf, idxs, scale, has_sink=False)  # the has_sink=False specialization (zeros handed as sinks)
+    _check_fork(o_ns, lse_ns, q, kv, ninf, idxs, scale, label="has_sink=False", has_sink=False)
+    _assert_bf16_budget(o, o_ns, kv, "sink=-inf vs has_sink=False")
+    torch.testing.assert_close(lse, lse_ns, rtol=0, atol=1e-4)
+    pinf = torch.full((H,), math.inf, device="cuda", dtype=torch.float32)
+    o, lse, _ = _launch_fork(q, kv, pinf, idxs, scale)
+    _check_fork(o, lse, q, kv, pinf, idxs, scale, label="sink=+inf")
+    assert torch.equal(o, torch.zeros_like(o)), "sink=+inf must give O == 0 on every row"
+    assert bool((lse == math.inf).all()), "sink=+inf must give LSE == +inf on every row, never NaN"
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_nan_in_never_referenced_kv_rows_does_not_leak():
+    """The block's contract: ``kv_all`` must be finite on every row ANY token of a cluster names (a member-for-A-not-B row is
+    multiplied into B's O with ``P = 0`` and ``0 * NaN = NaN``); rows NO list names are never gathered (``-1`` pads are
+    TMA-OOB zeros, not reads), so NaN there must not reach O or LSE.  Oracle + budget on the CLEAN kv."""
+    q, kv, sink, idxs, scale = _case_fork(batch=1, seq_len=32, ratio=1, seed=11)
+    n = int(kv.shape[1])
+    referenced = torch.zeros(n, dtype=torch.bool, device="cuda")
+    referenced[idxs[(idxs >= 0) & (idxs < n)].long()] = True
+    assert not bool(referenced.all()), "the case must leave some rows unreferenced"
+    kv_nan = kv.clone()
+    kv_nan[0, ~referenced] = math.nan
+    o, lse, _ = _launch_fork(q, kv_nan, sink, idxs, scale)
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label="NaN in never-referenced rows")
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_released_list_geometry_two_launches_bitwise_and_zero_copy(capsys):
+    """The released list geometry (window 128 ++ top-k 512 at ratio 2: ``K = 640``, ``u_max_tiles = 20``) at ``S = 1024``
+    (``S % 4 == 0``, 256 clusters -> every CTA runs a 2nd work item on a 204-SM part, realistic ``n_tiles`` ~ 8-12): two
+    launches bitwise; the handover is zero-copy (``kv2d`` shares ``kv_all``'s pointer, O lands in the caller's sentinel-filled
+    buffer, no allocation across the call -- all asserted inside ``_launch_fork``); the union tile statistics are PRINTED for
+    the perf table's ``n_tiles`` column.  ``S`` must be >= 1024: the synthetic Indexer tail caps the compressed list at
+    ``S // ratio`` ids (``compressed_idxs_synthetic``), so ``S = 1000`` yields ``K = 628`` and never reaches the released pitch."""
+    q, kv, sink, idxs, scale = _case_fork(batch=1, seq_len=1024, ratio=2, window=128, topk=512, seed=13)
+    assert int(idxs.shape[2]) == 640 and u_max_tiles_for(640) == 20
+    o1, lse1, nt = _launch_fork(q, kv, sink, idxs, scale)
+    o2, lse2, _ = _launch_fork(q, kv, sink, idxs, scale)
+    assert torch.equal(o1, o2) and torch.equal(lse1, lse2), "two launches on identical inputs must be bitwise identical"
+    _check_fork(o1, lse1, q, kv, sink, idxs, scale, label="S=1024 K=640")
+    with capsys.disabled():
+        print(f"\nfork S=1024 K=640: n_tiles mean {nt.float().mean().item():.2f} min {int(nt.min())} max {int(nt.max())} over {nt.numel()} clusters")
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+def test_fork_s32768_released_geometry_wraps_the_scheduler_ring(capsys):
+    """The released prompt length (plan risk 11): ``S = 32768``, ``K = 640`` (``u_max_tiles = 20``), ``B = 1`` -> 8192 clusters
+    over ~53 resident clusters on 212 SMs = ~155 tiles per CTA.  A scheduler-ring over- / under-arrival compounds PER WRAP
+    (mbarrier-patterns P3: a silent one-tile-early advance below ~7 wraps, a wedge past ~12+), so every case at S <= 2048 (512
+    clusters, ~2.4 wraps) is blind to it; this is the one in-process shape that is not.  Same bars as every accept case
+    (sentinel survivors 0, the bf16 O budget, LSE 1e-4 / non-finite exact, no allocation across the launch, no sync); the
+    union tile statistics are printed.  ~4 GiB of q + O plus a 2 GiB [S, S/2] score matrix in the list generator: run it alone
+    on its own GPU (``--k-any=test_fork_s32768``), under the runner's timeout (exit 124 = HANG -> the ring, not the limit)."""
+    q, kv, sink, idxs, scale = _case_fork(batch=1, seq_len=_S_32K, ratio=2, window=128, topk=512, seed=17)
+    assert int(idxs.shape[2]) == 640 and u_max_tiles_for(640) == 20 and n_clusters_for(_S_32K) == 8192
+    o, lse, nt = _launch_fork(q, kv, sink, idxs, scale)
+    _check_fork(o, lse, q, kv, sink, idxs, scale, label=f"S={_S_32K} K=640")
+    with capsys.disabled():
+        print(f"\nfork S={_S_32K} K=640: n_tiles mean {nt.float().mean().item():.2f} min {int(nt.min())} max {int(nt.max())} over {nt.numel()} clusters")
+
+
+# ---------------------------------------------------------------------------- Rubin: fresh-process launch loop (opt-in, slow)
+_FRESH_PROCESS_CHILD = textwrap.dedent("""
+    import math, sys, torch
+    test_python, S, seed = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    sys.path.insert(0, test_python)  # the oracle, rootdir-qualified as the suite imports it
+    from fe_api.mqa_sparse_attention_block import mqa_block_reference as R
+    from cudnn.mqa_sparse_attention_block.kernels import sparse_attention as SA
+    from cudnn.mqa_sparse_attention_block.kernels.union_lists import TILE_ROWS, TOKENS_PER_CLUSTER, WORDS_PER_SLOT, build_union_lists, n_clusters_for, u_max_tiles_for
+    from cudnn.frost.template_loader import load_template
+    import importlib.util
+    B, H, D, WINDOW, TOPK, RATIO = 1, 64, 512, 128, 512, 2
+    dev = torch.device("cuda")
+    g = torch.Generator(device=dev).manual_seed(seed)
+    q = torch.randn(B, S, H, D, generator=g, device=dev).to(torch.bfloat16)
+    n_c = S // RATIO
+    kv = torch.randn(B, S + n_c, D, generator=g, device=dev).to(torch.bfloat16)
+    idxs = torch.cat([R.window_idxs(B, S, WINDOW, device=dev), R.compressed_idxs_synthetic(B, S, RATIO, TOPK, g, device=dev)], dim=-1).contiguous()
+    sink = torch.randn(H, generator=g, device=dev, dtype=torch.float32)
+    scale = float(D) ** -0.5
+    K = int(idxs.shape[2]); n_kv = S + n_c; nc = n_clusters_for(S); ut = u_max_tiles_for(K)
+    ids = torch.empty(B, nc, TILE_ROWS * ut, dtype=torch.int32, device=dev)
+    bits = torch.empty(B, nc, ut, TOKENS_PER_CLUSTER, WORDS_PER_SLOT, dtype=torch.int32, device=dev)
+    nt = torch.empty(B, nc, dtype=torch.int32, device=dev)
+    build_union_lists(idxs, seq_len=S, n_kv_rows=n_kv, u_max_tiles=ut, out_ids=ids, out_bits=bits, out_ntiles=nt)
+    fork = SA.d512_fork_module()
+    mod = load_template(importlib.util.find_spec(SA.D512_FORK_MODULE).origin, fork.SparseAttentionD512Params(u_max_tiles=ut), tag="mqa_sparse_attention_d512_fresh")
+    fn = mod.compile(B, S, n_kv, nc, True)
+    o = torch.full_like(q, 1.5e30)
+    lse = torch.full((B, H, S), math.nan, dtype=torch.float32, device=dev)
+    fn(q, kv.view(B * n_kv, D), o, lse, sink, ids, bits, nt, SA.d512_scale_log2(scale), int(torch.cuda.current_stream(dev).cuda_stream))
+    torch.cuda.synchronize()  # ONE launch per process: a hang parks here and the parent's timeout classifies it as 124
+    ref_o, _ = R.sparse_attention_reference(q, kv, sink, idxs, scale)
+    _, ref_lse = R.sparse_attention_reference(q, kv, sink, idxs, scale, p_dtype=torch.float32, out_dtype=torch.float32)
+    ok_o = bool(((o.float() - ref_o.float()).abs() <= 2**-7 * ref_o.float().abs() + 2**-8 * kv.float().abs().max()).all())
+    ok_lse = bool(((lse - ref_lse).abs() <= 1e-4).all())
+    survivors = int((o == torch.full((), 1.5e30, dtype=o.dtype, device=dev)).sum())
+    print(f"CHILD S={S} seed={seed} ok_o={ok_o} ok_lse={ok_lse} sentinel_survivors={survivors} n_tiles_mean={nt.float().mean().item():.2f}", flush=True)
+    sys.exit(0 if (ok_o and ok_lse and survivors == 0) else 5)
+    """)
+
+
+@requires_dsl
+@requires_rubin
+@requires_fork
+@pytest.mark.parametrize("seq_len", _FRESH_PROCESS_S, ids=[f"fresh_S{s}" for s in _FRESH_PROCESS_S])  # bracket-free ids: `-k fresh_S32768`
+def test_fork_fresh_process_launches(seq_len, capsys):
+    """``N`` fresh processes (``MQA_D512_FRESH_PROCESS_LAUNCHES=N``, the Validate agent's marker; unset = skip typed), each ONE
+    JIT + ONE launch of the released list geometry at ``S`` -- 2048 (512 clusters -> the scheduler ring wraps ~2.4x on 212 SMs)
+    AND 32768 (8192 clusters -> ~155 tiles per CTA: the P3 ring-drift class advances a tile early below ~7 wraps and wedges past
+    ~12+, so nothing under 32K can show it) -- classified by exit code: ``0`` ok / ``124`` hang (killed at the per-S child
+    timeout) / other (a numerics miss exits 5, a launch failure raises).  The undefined-behaviour hazards -- an un-elected init,
+    an over-arrival, an undrained ring -- fail at a per-LAUNCH rate with correct numerics whenever they complete, so a single
+    passing run proves nothing and a second launch in one process reuses a warm artifact (frost-gotchas.md, "count over >= 12
+    FRESH PROCESSES").  The three counts are printed; the assertion is ``hang == other == 0``.  Run each S arm in its own runner
+    call (``--k-any=fresh_S2048`` / ``--k-any=fresh_S32768``): 12 x ~60 s at 2K, 12 x ~3 min at 32K."""
+    marker = os.environ.get(_FRESH_PROCESS_ENV, "")
+    if not marker.strip():
+        pytest.skip(f"set {_FRESH_PROCESS_ENV}=<launch count> (the Validate agent's marker) to run the per-process launch loop")
+    n = int(marker)
+    child_timeout = _FRESH_PROCESS_TIMEOUT_S[seq_len]
+    test_python = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    counts = {"ok": 0, "hang": 0, "other": 0}
+    lines = []
+    for i in range(n):
+        cmd = [sys.executable, "-c", _FRESH_PROCESS_CHILD, test_python, str(seq_len), str(i)]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=child_timeout, env=dict(os.environ))
+            rc, tail = proc.returncode, (proc.stdout.strip().splitlines()[-1:] + proc.stderr.strip().splitlines()[-3:])
+        except subprocess.TimeoutExpired as exc:
+            rc, tail = 124, [f"killed after {child_timeout} s", str(exc.stdout or "")[-300:]]
+        cls = "ok" if rc == 0 else ("hang" if rc == 124 else "other")
+        counts[cls] += 1
+        lines.append(f"  launch {i:2d}: exit {rc:3d} {cls:5s} {' | '.join(t for t in tail if t)}")
+    with capsys.disabled():
+        print(f"\nfresh-process launches S={seq_len} x {n}: ok={counts['ok']} hang(124)={counts['hang']} other={counts['other']}")
+        print("\n".join(lines))
+    assert counts["hang"] == 0 and counts["other"] == 0, f"fresh-process launches: {counts} (see the per-launch lines above)"
+
+
+# ---------------------------------------------------------------------------- the block-side declines that belong to the fork (any device)
+@requires_cuda
+@pytest.mark.skipif(_cc() == _SM107, reason="this IS the target arch")
+def test_d512_adapter_declines_a_non_rubin_device_typed():
+    """Off Rubin the adapter's decline is typed either way: the fork absent -> "has not landed"; present -> the arch."""
+    ad = SA.D512SparseAttention(batch=1, seq_len=8, n_kv_rows=8, n_heads=H, head_dim=D, topk=8, scale=float(D) ** -0.5, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(NotImplementedError) as ei:
+        ad.check_support()
+    msg = str(ei.value)
+    assert ("Rubin" in msg or "SM107" in msg) if SA.d512_fork_available() else ("has not landed" in msg), msg
+
+
+def test_d512_adapter_declines_a_head_geometry_other_than_64x512_before_touching_a_device():
+    """``(n_heads, head_dim) != (64, 512)`` is a device-independent typed decline (TP=2's 32 heads included), ahead of the
+    fork-present and arch checks -- so it reads the same on the A100 and on Rubin, with or without the fork."""
+    for h, d in ((32, 512), (128, 512), (64, 256)):
+        ad = SA.D512SparseAttention(batch=1, seq_len=8, n_kv_rows=8, n_heads=h, head_dim=d, topk=8, scale=float(d) ** -0.5, dtype=torch.bfloat16, device="cpu")
+        with pytest.raises(NotImplementedError, match="64"):
+            ad.check_support()
+
+
+def test_d512_adapter_declines_a_union_column_index_past_15_bits_and_a_non_half_dtype():
+    """``K`` whose worst-case union (``4K`` rows) needs a column index of 15+ bits is a ``ValueError`` at plan time; a non-bf16/f16
+    dtype is a ``NotImplementedError`` -- both device-independent, both ahead of the fork-present check."""
+    kw = dict(batch=1, seq_len=8, n_kv_rows=8, n_heads=H, head_dim=D, scale=float(D) ** -0.5, device="cpu")
+    with pytest.raises(NotImplementedError, match="bf16"):
+        SA.D512SparseAttention(topk=8, dtype=torch.float32, **kw).check_support()
+    if SA.d512_fork_available():  # the fork-present check precedes the K check; the K check is reachable only once it exists
+        with pytest.raises(ValueError, match="column"):
+            SA.D512SparseAttention(topk=8192, dtype=torch.bfloat16, **kw).check_support()

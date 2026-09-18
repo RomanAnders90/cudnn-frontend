@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage 7 of the MQA block -- the ``torch`` and ``dsa`` attention adapters against the oracles.
+"""Stage 7 of the MQA block -- the ``torch``, ``dsa`` and ``d512`` attention adapters against the oracles.
 
 Each adapter is driven through the block's ``_SparseAttention`` stage exactly as
 ``execute`` drives it (workspace-shaped buffers, the D5 index staging, the D1
@@ -12,7 +12,9 @@ correct kernel), and with the exact fp64 arm for the LSE (``1e-4``).  The
 degenerate rows the plan singles out -- keyless rows, ``sink = +-inf``,
 duplicate slots, ``K % 64 != 0``, ``B = 2``, ``S = 1`` -- each have their own
 test.  Accept tests need Rubin; the rejects and the pure-torch adapter's CPU
-check run anywhere.
+check run anywhere.  The ``d512`` rows (the gathered-list fork behind the
+block-owned ``union_lists`` pre-pass) skip typed until the fork module exists;
+its kernel-level sweep lives in ``test_mqa_block_sparse_attention_d512.py``.
 """
 
 import math
@@ -45,10 +47,12 @@ def _cc():
 
 requires_rubin = pytest.mark.skipif(_cc() != _SM107, reason=f"the block targets SM107 only; found {_cc()}")
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+requires_d512_fork = pytest.mark.skipif(not SA.d512_fork_available(), reason=f"the d512 fork module {SA.D512_FORK_MODULE} has not landed (wave W3b)")
 
 _H, _D, _WINDOW, _TOPK = 64, 512, 128, 512  # the DSA (64, 512) variant at the released list geometry
 _SHAPES = [(1, 300, 0), (1, 300, 1), (2, 1024, 2), (1, 256, 1), (1, 1, 2)]
-_ADAPTERS = ["torch", "dsa"]
+_ADAPTERS = ["torch", "dsa", pytest.param("d512", marks=requires_d512_fork)]
+_D512_UNION = ("union_ids", "union_bits", "union_ntiles")  # the pre-pass views the d512 stage carves (``_SparseAttention.union_shapes``)
 _EXACT = dict(p_dtype=torch.float32, out_dtype=torch.float32)
 
 
@@ -96,6 +100,11 @@ def _buffers(st, q, idxs, *, want_lse=True):
             bufs["idx_ws"] = torch.empty(b, s, st.k_pad, device=q.device, dtype=torch.int32)
             if b > 1:
                 bufs["idx_tmp"] = torch.empty(b, s, int(idxs.shape[2]), device=q.device, dtype=torch.int32)
+    if st.impl == "d512":
+        # The three int32 pre-pass views, shaped by the adapter (u_max_tiles = ceil(4K / 128) is the kernel's column pitch).
+        assert set(st.union_shapes) == set(_D512_UNION), st.union_shapes
+        for name in _D512_UNION:
+            bufs[name] = torch.full(st.union_shapes[name], -7, device=q.device, dtype=torch.int32)  # poison: the pre-pass must overwrite all of it
     return bufs
 
 
@@ -109,11 +118,14 @@ def _run(st, q, kv, sink, idxs, bufs, *, stream=None):
         sink,
         idxs,
         bufs["o"],
-        lse=bufs["lse"] if (want_lse and st.impl == "torch") else None,
+        lse=bufs["lse"] if (want_lse and st.impl in ("torch", "d512")) else None,  # these adapters write the FROST-convention LSE themselves
         lse_th=bufs.get("lse_th"),
         max_logits=bufs.get("max_logits"),
         idx_tmp=bufs.get("idx_tmp"),
         idx_ws=bufs.get("idx_ws"),
+        union_ids=bufs.get("union_ids"),
+        union_bits=bufs.get("union_bits"),
+        union_ntiles=bufs.get("union_ntiles"),
         stream=stream,
     )
     if st.impl == "dsa" and want_lse:
@@ -205,31 +217,91 @@ def test_duplicate_slots_count_twice(impl):
     ref_o, _ = R.sparse_attention_reference(q, kv, sink, dup, scale)
     _assert_bf16_budget(o_dup, ref_o, kv, f"{impl} O with a duplicate slot")
     assert not torch.equal(o_dup[0, 129], o_one[0, 129]), f"{impl}: a duplicated slot must change the row (duplicates are distinct slots)"
-    assert torch.equal(o_dup[0, :129], o_one[0, :129]), f"{impl}: rows without the duplicate must be untouched"
+    # Rows without the duplicate are untouched.  d512 gathers per 4-token CLUSTER: row 128 shares cluster 32 with row 129,
+    # whose extra union copy shifts the cluster's tile columns (a different MMA K-order for row 128 -> within budget, not
+    # bitwise); every other cluster's gather is identical, so those rows ARE bitwise.  torch / dsa are per row: all bitwise.
+    untouched = 128 if impl == "d512" else 129
+    assert torch.equal(o_dup[0, :untouched], o_one[0, :untouched]), f"{impl}: rows without the duplicate must be untouched"
+    _assert_bf16_budget(o_dup[0, 128], o_one[0, 128], kv, f"{impl} row 128 (cluster neighbour of the duplicate)")
 
 
 @requires_rubin
-def test_dsa_ids_outside_the_kv_range_are_no_key_at_batch_two():
+@pytest.mark.parametrize("impl", [a for a in _ADAPTERS if a != "torch"])
+def test_ids_outside_the_kv_range_are_no_key_at_batch_two(impl):
     """The block's contract says ids outside ``[0, N)`` are "no key" on every adapter.  At
-    ``B = 2`` the dsa staging offsets ids by ``b * N`` into the flat ``[B*N, D]`` row space,
-    so an unmasked ``id >= N`` (or ``< -1``) of batch 0 would read batch 1's rows and the
-    two adapters would disagree on identical inputs.  Planted ids: ``N``, ``N + 7``, ``-5``."""
-    q, kv, sink, idxs, scale = _case("cuda", batch=2, seq_len=128, ratio=2)  # K = 128 + 64 = 192 -> staging (B = 2)
+    ``B = 2`` both kernel adapters work in the flat ``[B*N, D]`` row space (the dsa staging
+    offsets ids by ``b * N``; the d512 pre-pass emits flat union rows), so an unmasked
+    ``id >= N`` (or ``< -1``) of batch 0 would read batch 1's rows and the adapters would
+    disagree with the torch one on identical inputs.  Planted ids: ``N``, ``N + 7``, ``-5``."""
+    q, kv, sink, idxs, scale = _case("cuda", batch=2, seq_len=128, ratio=2)  # K = 128 + 64 = 192 -> dsa staging (B = 2)
     n = int(kv.shape[1])
     bad = idxs.clone()
     bad[0, 3, :4] = torch.tensor([n, n + 7, -5, n - 1], device="cuda", dtype=torch.int32)  # the last one is the largest VALID id
     bad[1, 100, 0] = n
-    o_dsa, lse_dsa = _run_adapter("dsa", q, kv, sink, bad)
+    o_k, lse_k = _run_adapter(impl, q, kv, sink, bad)
     o_torch, lse_torch = _run_adapter("torch", q, kv, sink, bad)
-    _assert_bf16_budget(o_dsa, o_torch, kv, "dsa vs torch adapter with out-of-range ids")
-    torch.testing.assert_close(lse_dsa, lse_torch, rtol=0, atol=1e-4)
+    _assert_bf16_budget(o_k, o_torch, kv, f"{impl} vs torch adapter with out-of-range ids")
+    torch.testing.assert_close(lse_k, lse_torch, rtol=0, atol=1e-4)
     # ... and both equal the oracle on the SANITISED list (the oracle knows only -1 as "no key").
     clean = torch.where((bad >= 0) & (bad < n), bad, torch.full_like(bad, -1))
     ref_o, _ = R.sparse_attention_reference(q, kv, sink, clean, scale)
-    _assert_bf16_budget(o_dsa, ref_o, kv, "dsa O vs oracle on the sanitised list")
-    assert not torch.equal(
-        o_dsa[0, 3], _run_adapter("dsa", q, kv, sink, idxs)[0][0, 3]
-    ), "the planted slots must have changed row (0, 3) (they replaced live ids)"
+    _assert_bf16_budget(o_k, ref_o, kv, f"{impl} O vs oracle on the sanitised list")
+    assert not torch.equal(o_k[0, 3], _run_adapter(impl, q, kv, sink, idxs)[0][0, 3]), "the planted slots must have changed row (0, 3) (they replaced live ids)"
+
+
+@requires_rubin
+@requires_d512_fork
+def test_d512_launch_allocates_nothing_is_bitwise_repeatable_and_never_syncs():
+    """The d512 stage is the FLAGGED torch ``union_lists`` pre-pass (allocates -- measured and reported, not asserted) followed
+    by ONE kernel launch over zero-copy views: ``launch`` alone allocates nothing (no copy of q / kv_all / o, the ``[B*N, D]``
+    KV view shares ``kv_all``'s pointer), writes into the caller's sentinel-filled ``o``, syncs nowhere
+    (``set_sync_debug_mode("error")`` around the whole execute, pre-pass included), and a second execute is bitwise identical."""
+    q, kv, sink, idxs, scale = _case("cuda", batch=2, seq_len=256, ratio=2)  # K = 128 + 128 = 256 -> u_max_tiles 8
+    st = _stage("d512", q, kv, idxs)
+    assert st.needs_union_lists and not st.needs_idx_staging
+    bufs = _buffers(st, q, idxs)
+    bufs["o"].fill_(1.5e30)
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        o1, lse1 = _run(st, q, kv, sink, idxs, bufs)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert not bool((bufs["o"] == torch.full((), 1.5e30, dtype=q.dtype, device="cuda")).any()), "sentinel cells survived: O was not written in place"
+    assert int(bufs["union_ntiles"].min()) >= 1 and not bool((bufs["union_ntiles"] == -7).any()), "the pre-pass must overwrite every union view"
+    o1, lse1 = o1.clone(), lse1.clone()
+    ref_o, _ = R.sparse_attention_reference(q, kv, sink, idxs, scale)
+    _assert_bf16_budget(o1, ref_o, kv, "d512 O")
+    # the kernel launch ALONE (the union views already built) allocates nothing
+    stream = torch.cuda.current_stream(q.device).cuda_stream
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    st.launch(q, kv, sink, idxs, bufs["o"], lse=bufs["lse"], lse_th=None, max_logits=None, idx_ws=None, stream=stream, **{k: bufs[k] for k in _D512_UNION})
+    torch.cuda.synchronize()
+    assert torch.cuda.memory_allocated() == before, f"the d512 launch allocated {torch.cuda.memory_allocated() - before} bytes"
+    assert torch.equal(bufs["o"], o1) and torch.equal(bufs["lse"], lse1), "a second launch must be bitwise identical"
+    # the whole execute (pre-pass + launch) is bitwise repeatable too; the pre-pass's allocation is the FLAGGED v1 cost
+    before = torch.cuda.memory_allocated()
+    _run(st, q, kv, sink, idxs, bufs)
+    print(f"\nd512 execute (pre-pass + launch) allocated {torch.cuda.memory_allocated() - before} bytes transiently (FLAGGED torch pre-pass)")
+    assert torch.equal(bufs["o"], o1) and torch.equal(bufs["lse"], lse1), "a second execute must be bitwise identical"
+
+
+@requires_rubin
+@requires_d512_fork
+def test_d512_union_views_agree_with_the_stage_geometry():
+    """The stage's ``union_shapes`` are the pre-pass contract (``[B, NC, 128 * u_max_tiles]``, ``[B, NC, u_max_tiles, 4, 4]``,
+    ``[B, NC]``) at ``NC = ceil(S / 4)`` and ``u_max_tiles = ceil(4K / 128)``; after an execute every ``n_tiles >= 1`` and the
+    tail cluster of an ``S % 4 != 0`` sequence exists."""
+    from cudnn.mqa_sparse_attention_block.kernels.union_lists import n_clusters_for, u_max_tiles_for
+
+    q, kv, sink, idxs, scale = _case("cuda", batch=1, seq_len=301, ratio=1)  # S % 4 == 1 -> a partial tail cluster; K = 128 + 301 -> 14 tiles
+    st = _stage("d512", q, kv, idxs)
+    k, nc, ut = int(idxs.shape[2]), n_clusters_for(301), u_max_tiles_for(int(idxs.shape[2]))
+    assert st.union_shapes == dict(union_ids=(1, nc, 128 * ut), union_bits=(1, nc, ut, 4, 4), union_ntiles=(1, nc)), st.union_shapes
+    bufs = _buffers(st, q, idxs)
+    o, lse = _run(st, q, kv, sink, idxs, bufs)
+    assert int(bufs["union_ntiles"].min()) >= 1 and int(bufs["union_ntiles"].max()) <= ut
+    _assert_bf16_budget(o, R.sparse_attention_reference(q, kv, sink, idxs, scale)[0], kv, "d512 O at S=301")
 
 
 @requires_rubin
@@ -356,11 +428,20 @@ def test_dsa_index_alignment_helper():
         SA.check_dsa_index_alignment(torch.zeros(4, 65, dtype=torch.int32)[:, :64])
 
 
-@pytest.mark.skipif(SA.d512_fork_available(), reason="the d512 fork module exists in this checkout; the decline flips to the block-side wiring")
-def test_d512_adapter_declines_until_the_fork_lands():
-    ad = SA.D512SparseAttention(batch=1, seq_len=8, n_kv_rows=8, n_heads=64, head_dim=512, topk=8, scale=512**-0.5, dtype=torch.bfloat16, device="cpu")
-    with pytest.raises(NotImplementedError, match="has not landed"):
-        ad.check_support()
+def test_d512_adapter_accepts_once_the_fork_exists_and_declines_typed_before():
+    """INVERTED when the fork landed: with the module present a well-formed (64, 512) declaration passes ``check_support`` on
+    Rubin (and off Rubin fails on the ARCH, typed); without it the decline is the typed "has not landed"."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    ad = SA.D512SparseAttention(batch=1, seq_len=8, n_kv_rows=8, n_heads=64, head_dim=512, topk=8, scale=512**-0.5, dtype=torch.bfloat16, device=dev)
+    if not SA.d512_fork_available():
+        with pytest.raises(NotImplementedError, match="has not landed"):
+            ad.check_support()
+    elif _cc() == _SM107:
+        ad.check_support()  # accept: the specialized module is loaded (its validator ran), nothing raised
+        assert ad.params is not None and ad.u_max_tiles == 1 and ad.union_shapes["union_ids"] == (1, 2, 128)
+    else:
+        with pytest.raises(NotImplementedError, match="Rubin"):
+            ad.check_support()
 
 
 @requires_cuda

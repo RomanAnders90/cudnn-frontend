@@ -14,7 +14,8 @@ c_batch_stride``) so that
   ``[B, S + N_c, 512]`` KV buffer directly -- a batched C at batch stride
   ``(S + N_c) * 512`` (D4);
 * the one-launch batched ``wo_a`` (batch stride SMALLER than the row stride) is
-  the unmeasured M6 form, gated ``xfail(strict=False)`` until the dev node says.
+  the M6 form -- it passed on Rubin and measured 6.6x / 2.4x / 1.3x faster than
+  eight launches at S = 2K / 8K / 32K (2026-09-17), so it is the block's default.
 
 Accept tests need Rubin (the block's target); the declaration / bind-check
 rejects run on any device.
@@ -139,10 +140,6 @@ def test_kv_proj_writes_the_prefix_of_a_wider_kv_buffer(batch):
 
 
 @requires_rubin
-@pytest.mark.xfail(
-    strict=False,
-    reason="M6: a batched frost_gemm whose batch stride (4096) is SMALLER than its row stride (32768) is unmeasured; a PASS flips this and enables wo_a_batched",
-)
 def test_M6_wo_a_one_batched_launch_with_an_interleaved_batch_stride():
     o, w, ref = _wo_a_operands()
     o_lora = torch.zeros(_T, _GROUPS * _R, device="cuda", dtype=_BF16)

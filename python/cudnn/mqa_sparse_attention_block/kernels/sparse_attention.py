@@ -43,15 +43,23 @@ Adapters:
     compiles lazily at first execute and keys its cache without shapes.
 
 ``D512SparseAttention``
-    The gathered-list fork of the Rubin d512 SDPA.  A typed
-    ``NotImplementedError("... has not landed")`` until the fork module
-    (``kernels/sparse_attention_d512.py``) exists; feature-detected by import.
+    The gathered-list fork of the Rubin d512 SDPA (``kernels/sparse_attention_d512.py``,
+    plan section 1): one launch per block execute over zero-copy views, fed by the
+    block-owned ``union_lists`` pre-pass (:mod:`.union_lists`, a ``prep`` runner) that
+    turns ``topk_idxs`` into per-4-token-cluster union ids / membership bits / tile counts
+    in the block's workspace.  The kernel writes ``o`` AND the FROST-convention ``lse``
+    directly (no fold); it is loaded ONCE per ``SparseAttentionD512Params`` through
+    ``cudnn.frost.template_loader`` and compiled per ``(B, S, N, NC, has_lse)``.
+    Feature-detected: a typed ``NotImplementedError("... has not landed")`` while the
+    fork module is absent, ``"targets Rubin (SM107)"`` off cc (10, 7).
 """
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import math
+import os
 from typing import Optional
 
 import torch
@@ -351,8 +359,21 @@ class DsaSparseAttention:
 
 
 # ---------------------------------------------------------------------------
-# Adapter 3: the gathered-list fork of the Rubin d512 SDPA (wave B)
+# Adapter 3: the gathered-list fork of the Rubin d512 SDPA
 # ---------------------------------------------------------------------------
+
+D512_FORK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sparse_attention_d512.py")
+D512_TEMPLATE_TAG = "mqa_sparse_attention_d512"
+# The fork's work item is 4 adjacent tokens x 64 heads per 256-row cluster (the SM100 twin's PackGQA row mapping):
+# ``HEADS_PER_TILE = 64``, ``TOKENS_PER_TILE = 2`` per CTA, two CTAs per collective M = 256.  A different head count or
+# head_dim is a different kernel (TP=2 is refused and documented, plan 1(a)).
+D512_N_HEADS = 64
+D512_HEAD_DIM = 512
+# ``dtype_qkv`` vocabulary of the SDPA config (``config_sm100.py``): 0 E4M3, 1 E5M2, 2 BF16, 3 FP16.
+_D512_DTYPE_QKV = {torch.bfloat16: 2, torch.float16: 3}
+# The kernel indexes union columns with a 15-bit quantity (``_validate_sparse_cfg`` re-checks it); the bound is owned by
+# ``union_lists.U_MAX_COLS_LIMIT`` so the adapter, the pre-pass and the fork cannot drift apart.
+from .union_lists import U_MAX_COLS_LIMIT as _D512_U_MAX_COLS_LIMIT  # noqa: E402
 
 
 def d512_fork_available() -> bool:
@@ -363,33 +384,193 @@ def d512_fork_available() -> bool:
         return False
 
 
-class D512SparseAttention:
-    """Stage-7 adapter over the gathered-list d512 fork -- a typed decline until wave B lands it.
+def d512_fork_module():
+    """The fork module under its PLAIN import (default specialization) -- the source of
+    ``SparseAttentionD512Params`` and of the ``compile`` signature.  The specialized module
+    the adapter actually launches is a SEPARATE ``load_template`` instance (below); this
+    import runs the body once with the default params (config build + kernel definitions,
+    no JIT).  Typed decline when the file has not landed."""
+    if not d512_fork_available():
+        raise NotImplementedError(
+            f"attention='d512': the gathered-list d512 sparse-attention fork ({D512_FORK_MODULE}) has not landed; use attention='dsa' or 'torch'"
+        )
+    return importlib.import_module(D512_FORK_MODULE)
 
-    Same plan-time keys as :class:`DsaSparseAttention` plus ``want_lse``; the
-    execute ABI (``compiled(q, kv2d, o, lse, sinks, union_ids, union_bits,
-    union_ntiles, scale_log2, stream)``) and the block-owned ``_UnionLists``
-    pre-pass are wired when the fork module exists.
+
+def d512_scale_log2(scale: float) -> float:
+    """The fork's softmax scale in the exp2 domain: ``scale * log2(e)`` (the SDPA kernels' ``scale_log2`` convention)."""
+    return float(scale) * math.log2(math.e)
+
+
+class D512SparseAttention:
+    """Stage-7 adapter over the gathered-list fork of the Rubin d512 SDPA
+    (``kernels/sparse_attention_d512.py``, plan section 1).
+
+    The kernel is a generic "gathered-list attention with per-row membership": it walks,
+    per 4-token cluster, the ``union_ntiles`` 128-row tiles of ``union_ids`` (gather4 TMA of
+    the flat KV rows, ``-1`` = a zero-filled OOB row), masks each softmax lane's scores with
+    its token slot's ``union_bits`` word pair, folds the per-head sink once into the
+    denominator and writes ``o`` plus the optional ``lse`` in the FROST convention (sink
+    INCLUDED, ``sink`` on a keyless row, ``-inf`` without a key and with no sink).  Every LIST
+    rule (``-1``, duplicates twice, the ``+S`` offset, OOB sanitising, K padding, tokens past
+    ``S``) lives in the block-owned pre-pass :func:`~.union_lists.build_union_lists`, which
+    this adapter exposes as :meth:`build_union_lists` and the block runs as the ``union_lists``
+    ``prep`` runner.  **FLAGGED (v1):** that pre-pass is torch and allocates per call; the
+    kernel launch itself is one call over zero-copy views.
+
+    Plan-time keys: ``(batch, seq_len, n_kv_rows, n_heads, head_dim, topk, dtype, device,
+    want_lse)``.  ``scale`` is a runtime float (``scale_log2``).  The kernel is specialized by
+    ``SparseAttentionD512Params(dtype_qkv, has_sink=True, heads_per_tile=64,
+    u_max_tiles=ceil(4K/128))`` -- the union tile count IS the workspace pitch, so the three
+    ``union_*`` slots the block carves (:attr:`union_shapes`) and the kernel's row pitch agree
+    by construction.  Loaded ONCE per params through ``cudnn.frost.template_loader``.
+
+    Declines (typed, in this order, device-independent ones first): dtype not bf16/f16,
+    ``(n_heads, head_dim) != (64, 512)``, fork module absent -> ``NotImplementedError``;
+    ``B / S / K < 1``, ``N < S``, the union column index past 15 bits, ``B * N`` past int32 ->
+    ``ValueError``; then a device other than Rubin cc (10, 7) -> ``NotImplementedError``.
     """
 
     def __init__(
         self, *, batch: int, seq_len: int, n_kv_rows: int, n_heads: int, head_dim: int, topk: int, scale: float, dtype, device, want_lse: bool = False
     ) -> None:
+        from .union_lists import n_clusters_for, u_max_tiles_for
+
         self.batch, self.seq_len, self.n_kv_rows = int(batch), int(seq_len), int(n_kv_rows)
         self.n_heads, self.head_dim, self.topk = int(n_heads), int(head_dim), int(topk)
         self.scale, self.dtype, self.device, self.want_lse = float(scale), dtype, torch.device(device), bool(want_lse)
+        self.has_sink = True  # the block always hands the kernel its [n_heads] sink (a 0.0 sink is mass, not "no sink")
+        self.n_clusters = n_clusters_for(max(self.seq_len, 0))
+        self.u_max_tiles = u_max_tiles_for(max(self.topk, 0))
+        self._module = None  # the load_template instance (specialized)
+        self._params = None
+        self._compiled = None
+
+    # -- geometry the block carves from -------------------------------------
+
+    @property
+    def u_max(self) -> int:
+        from .union_lists import TILE_ROWS
+
+        return self.u_max_tiles * TILE_ROWS
+
+    @property
+    def union_shapes(self) -> dict:
+        """``{name: shape}`` of the three int32 pre-pass tensors (the kernel's ABI and the block's
+        workspace slots): ``union_ids [B, NC, U_MAX]``, ``union_bits [B, NC, U_MAX_TILES, 4, 4]``,
+        ``union_ntiles [B, NC]`` (``NC = ceil(S / 4)``, ``U_MAX = 128 * ceil(4K / 128)``)."""
+        from .union_lists import TOKENS_PER_CLUSTER, WORDS_PER_SLOT
+
+        b, nc = self.batch, self.n_clusters
+        return dict(
+            union_ids=(b, nc, self.u_max),
+            union_bits=(b, nc, self.u_max_tiles, TOKENS_PER_CLUSTER, WORDS_PER_SLOT),
+            union_ntiles=(b, nc),
+        )
+
+    @property
+    def params(self):
+        """The frozen ``SparseAttentionD512Params`` the kernel was specialized with (after ``check_support``)."""
+        return self._params
+
+    @property
+    def scale_log2(self) -> float:
+        return d512_scale_log2(self.scale)
+
+    # -- support / compile --------------------------------------------------
 
     def check_support(self) -> None:
+        if self.dtype not in _D512_DTYPE_QKV:
+            raise NotImplementedError(f"d512 adapter: bf16 / f16 only, got {self.dtype}")
+        if (self.n_heads, self.head_dim) != (D512_N_HEADS, D512_HEAD_DIM):
+            raise NotImplementedError(
+                f"d512 adapter: the fork's work item is {D512_N_HEADS} heads x head_dim {D512_HEAD_DIM} (4 tokens x 64 heads per cluster); "
+                f"got (n_heads, head_dim) = {(self.n_heads, self.head_dim)}"
+            )
         if not d512_fork_available():
             raise NotImplementedError(
                 f"attention='d512': the gathered-list d512 sparse-attention fork ({D512_FORK_MODULE}) has not landed; use attention='dsa' or 'torch'"
             )
-        raise NotImplementedError(
-            f"attention='d512': the fork module {D512_FORK_MODULE} is present but the block-side wiring (union-list pre-pass + compile ABI) has not landed"
+        if self.topk < 1 or self.seq_len < 1 or self.batch < 1 or self.n_kv_rows < self.seq_len:
+            raise ValueError(f"d512 adapter: need B, S, K >= 1 and N >= S; got B={self.batch} S={self.seq_len} K={self.topk} N={self.n_kv_rows}")
+        if self.u_max >= _D512_U_MAX_COLS_LIMIT:
+            raise ValueError(
+                f"d512 adapter: K={self.topk} needs {self.u_max_tiles} union tiles = {self.u_max} columns per cluster; the kernel's column index "
+                f"stops below {_D512_U_MAX_COLS_LIMIT} (K <= {(_D512_U_MAX_COLS_LIMIT - 128) // 4})"
+            )
+        if self.batch * self.n_kv_rows > 2**31 - 1:
+            raise ValueError(f"d512 adapter: the flat KV row space B * N = {self.batch * self.n_kv_rows} does not fit the int32 union ids")
+        if self.device.type != "cuda":
+            raise NotImplementedError(f"d512 adapter: the fork targets Rubin (SM107); got a {self.device.type} device")
+        cc = tuple(torch.cuda.get_device_capability(self.device))
+        if cc != (10, 7):
+            raise NotImplementedError(f"d512 adapter: the fork targets Rubin (SM107); found SM{cc[0]}{cc[1]}")
+        from cudnn.frost.template_loader import load_template
+
+        fork = d512_fork_module()
+        self._params = fork.SparseAttentionD512Params(
+            dtype_qkv=_D512_DTYPE_QKV[self.dtype], has_sink=self.has_sink, heads_per_tile=D512_N_HEADS, u_max_tiles=self.u_max_tiles
         )
+        # The specialized module: its body re-validates the config (``_validate_sparse_cfg`` raises ``ValueError`` on a
+        # combination the kernel cannot serve) -- surfaced HERE, at plan time, never at execute.
+        self._module = load_template(D512_FORK_PATH, self._params, tag=D512_TEMPLATE_TAG)
 
     def compile(self) -> None:
-        raise NotImplementedError("attention='d512' has not landed (check_support declines first)")
+        """One artifact per ``(B, S, N, NC, has_lse)`` (plan 1(h)): ``compile(b, s, n_kv_rows, n_clusters, has_lse)``."""
+        if self._module is None:
+            raise RuntimeError("call check_support() before compile()")
+        self._compiled = self._module.compile(self.batch, self.seq_len, self.n_kv_rows, self.n_clusters, self.want_lse)
 
-    def execute(self, *args, **kwargs) -> None:
-        raise NotImplementedError("attention='d512' has not landed (check_support declines first)")
+    # -- execute ------------------------------------------------------------
+
+    def build_union_lists(self, topk_idxs: torch.Tensor, union_ids: torch.Tensor, union_bits: torch.Tensor, union_ntiles: torch.Tensor) -> None:
+        """The block-owned index pre-pass into the three workspace views (:attr:`union_shapes`).
+        Stream-ordered torch ops on the CALLER's current stream (the block scopes it).  FLAGGED v1: allocates temporaries."""
+        from .union_lists import build_union_lists
+
+        build_union_lists(
+            topk_idxs,
+            seq_len=self.seq_len,
+            n_kv_rows=self.n_kv_rows,
+            u_max_tiles=self.u_max_tiles,
+            out_ids=union_ids,
+            out_bits=union_bits,
+            out_ntiles=union_ntiles,
+        )
+
+    def execute(
+        self,
+        q: torch.Tensor,  # [B, S, 64, 512] BSHD compact (the block's q workspace view)
+        kv_all: torch.Tensor,  # [B, N, 512] contiguous (the caller's) -- bound as the ONE [B*N, 512] view (asserted below)
+        sink: torch.Tensor,  # [64] fp32 contiguous
+        o: torch.Tensor,  # [B, S, 64, 512] BSHD compact (the block's o workspace view)
+        lse: Optional[torch.Tensor],  # [B, 64, S] fp32, FROST convention (sink included); required iff want_lse
+        union_ids: torch.Tensor,
+        union_bits: torch.Tensor,
+        union_ntiles: torch.Tensor,
+        *,
+        stream: int,
+    ) -> None:
+        """ONE launch over zero-copy views; no allocation, no sync.
+
+        This adapter OWNS the one-buffer-one-descriptor check the fork's ``compile()`` delegates to
+        "the CALLER": ``kv_all`` must be a contiguous ``[B, N, 512]`` so that ``kv_all.view(B * N, 512)``
+        aliases it (``data_ptr`` equal) -- refused as a typed ``ValueError`` before ``.view`` could
+        escape with a bare ``RuntimeError`` on a strided tensor.
+        """
+        if self._compiled is None:
+            raise RuntimeError("call compile() before execute()")
+        if self.want_lse and lse is None:
+            raise RuntimeError("d512 adapter compiled with want_lse=True needs the lse tensor")
+        b, n, d = self.batch, self.n_kv_rows, self.head_dim
+        if tuple(kv_all.shape) != (b, n, d):
+            raise ValueError(f"d512 adapter: kv_all must be [B, N, {d}] = {(b, n, d)}; got {tuple(kv_all.shape)}")
+        if not kv_all.is_contiguous():
+            raise ValueError(
+                f"d512 adapter: kv_all must be contiguous (bound as ONE [B*N, {d}] view -- one buffer, one descriptor); got strides {tuple(kv_all.stride())}"
+            )
+        kv2d = kv_all.view(b * n, d)
+        if kv2d.data_ptr() != kv_all.data_ptr():
+            raise ValueError("d512 adapter: kv_all.view(B * N, 512) does not alias kv_all (data_ptr differs); the kernel binds exactly ONE KV buffer")
+        stream_arg = int(stream)  # the fork's ``run`` accepts an int or a CUstream
+        self._compiled(q, kv2d, o, lse if self.want_lse else None, sink, union_ids, union_bits, union_ntiles, self.scale_log2, stream_arg)

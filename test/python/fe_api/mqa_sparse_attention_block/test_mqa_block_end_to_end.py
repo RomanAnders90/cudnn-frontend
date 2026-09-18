@@ -6,7 +6,9 @@
 What is under test here is the ASSEMBLY: the workspace carve, the strided
 column slices of the grouped ``o_a_proj``, the prefix write into the caller's
 ``kv_all``, the stage order, the index staging and LSE fold of the ``dsa``
-adapter, and that every stage runs on the caller's stream.  Each stage is
+adapter, the ``union_lists`` pre-pass slots of the ``d512`` adapter (rows skip
+typed until the fork module exists), and that every stage runs on the caller's
+stream.  Each stage is
 checked on its own elsewhere; here every intermediate is read back through its
 workspace view and the final output is held to ``cos > 0.999`` against
 ``mqa_block_reference.block_reference``.
@@ -44,6 +46,7 @@ import cudnn.mqa_sparse_attention_block as M  # noqa: E402
 from cudnn.mqa_sparse_attention_block import MqaSparseAttentionBlockFwd, MqaSparseAttentionBlockGeometry  # noqa: E402
 from cudnn.mqa_sparse_attention_block.api import RUNNER_NAMES, TENSOR_NAMES, _check_bound_tensors, _view  # noqa: E402
 from cudnn.mqa_sparse_attention_block.kernels import sparse_attention as SA  # noqa: E402
+from cudnn.mqa_sparse_attention_block.kernels.union_lists import u_max_tiles_for  # noqa: E402
 
 _SM107 = (10, 7)
 
@@ -57,7 +60,11 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs 
 
 # 64 heads x 512 (the DSA variant and the released head geometry) at small d_model / LoRA ranks / lists.
 _TINY = dict(d_model=512, n_heads=64, head_dim=512, rope_dim=64, q_lora_rank=256, o_lora_rank=128, o_groups=8, window=16, index_topk=8)
-_ADAPTERS = ["torch", "dsa"]
+requires_d512_fork = pytest.mark.skipif(not SA.d512_fork_available(), reason=f"the d512 fork module {SA.D512_FORK_MODULE} has not landed (wave W3b)")
+_D512 = pytest.param("d512", marks=requires_d512_fork)
+_ADAPTERS = ["torch", "dsa", _D512]
+_KERNEL_ADAPTERS = ["dsa", _D512]  # the contract-clean kernel adapters (no allocation, no sync on the launch)
+_D512_UNION = ("union_ids", "union_bits", "union_ntiles")
 _BF16 = torch.bfloat16
 
 
@@ -146,6 +153,13 @@ def _check_intermediates(r):
     _assert_stage(o, ref.o_unrot.reshape(t, bg.n_heads, bg.head_dim), "o (stages 7+8)", rtol=2**-4, atol_rel=2**-5)
     o_lora = _view(ws, sl.o_lora, (t, bg.n_o_lora), _BF16)
     _assert_stage(o_lora, ref.o_lora.reshape(t, bg.n_o_lora), "o_lora (stage 9)", rtol=2**-4, atol_rel=2**-5)
+    if r.blk.attention == "d512":
+        # The pre-pass slots: every cluster has >= 1 union tile (never 0 -- the kernel's KV loop always runs) and the
+        # flat union ids stay inside the [B * N, D] row space or are the -1 pad.
+        nt = r.blk.workspace_view(ws, "union_ntiles")
+        ids = r.blk.workspace_view(ws, "union_ids")
+        assert nt.shape[0] == b and int(nt.min()) >= 1, nt
+        assert int(ids.max()) < b * int(r.kv_all.shape[1]) and int(ids.min()) >= -1
 
 
 # ---------------------------------------------------------------------------
@@ -198,15 +212,37 @@ def test_block_accepts_s_smaller_than_the_compress_ratio(attention):
     assert _cos(r.out, r.ref.out) > 0.999
 
 
+# The synthetic Indexer tail caps the compressed list at S // ratio ids (``compressed_idxs_synthetic``), so the released
+# K = 640 (window 128 ++ top-k 512 at ratio 2) exists only from S = 1024 on; below it the d512 pitch is ceil(4K / 128) of the
+# SHORTER list.  The d512 arm adds S = 1024 so the released union pitch (u_max_tiles = 20) is really exercised end to end.
+_RELEASED_SHAPE_CASES = [
+    pytest.param(256, "dsa", id="256-dsa"),
+    pytest.param(512, "dsa", id="512-dsa"),
+    pytest.param(256, "d512", marks=requires_d512_fork, id="256-d512"),
+    pytest.param(512, "d512", marks=requires_d512_fork, id="512-d512"),
+    pytest.param(1024, "d512", marks=requires_d512_fork, id="1024-d512"),
+]
+
+
 @requires_rubin
-@pytest.mark.parametrize("seq_len", [256, 512])
-def test_block_at_the_released_shape(seq_len):
+@pytest.mark.parametrize("seq_len, attention", _RELEASED_SHAPE_CASES)
+def test_block_at_the_released_shape(seq_len, attention):
     """The released geometry (5120 x 64 heads x 512, LoRA 1280 / 1024 x 8, window 128, top-k 512)
-    at a compressed layer (ratio 2): every GEMM at its real N, the identity index path."""
-    r = _run_block({}, batch=1, seq_len=seq_len, ratio=2, attention="dsa")
-    assert not r.blk._attention.needs_idx_staging
+    at a compressed layer (ratio 2): every GEMM at its real N; dsa on the identity index path,
+    d512 at the union pitch of the list the generator can build at ``S`` -- K = 640 / u_max_tiles = 20
+    (the released pitch) from S = 1024 on, K = 128 + S // 2 below it."""
+    r = _run_block({}, batch=1, seq_len=seq_len, ratio=2, attention=attention)
+    k = int(r.inp["topk_idxs"].shape[2])
+    assert k == 128 + min(512, seq_len // 2), f"the generator's list width at S={seq_len}: {k}"
+    if attention == "dsa":
+        assert not r.blk._attention.needs_idx_staging
+    else:
+        info = r.blk.attention_info()
+        assert info["u_max_tiles"] == u_max_tiles_for(k), f"u_max_tiles {info['u_max_tiles']} != ceil(4 x {k} / 128)"
+        if seq_len >= 1024:
+            assert k == 640 and info["u_max_tiles"] == 20, "the released union pitch"
     c = _cos(r.out, r.ref.out)
-    assert c > 0.999, f"released shape S={seq_len}: cos(out, ref) = {c:.5f}"
+    assert c > 0.999, f"released shape S={seq_len} {attention}: cos(out, ref) = {c:.5f}"
 
 
 @requires_rubin
@@ -223,8 +259,9 @@ def test_lse_is_optional_and_returned_in_the_frost_convention(attention):
 
 
 @requires_rubin
-def test_second_execute_is_bitwise_identical_and_never_syncs():
-    r = _run_block(_TINY, batch=2, seq_len=128, ratio=2, attention="dsa", return_lse=True)
+@pytest.mark.parametrize("attention", _KERNEL_ADAPTERS)
+def test_second_execute_is_bitwise_identical_and_never_syncs(attention):
+    r = _run_block(_TINY, batch=2, seq_len=128, ratio=2, attention=attention, return_lse=True)
     out1, lse1 = r.out.clone(), r.lse.clone()
     torch.cuda.set_sync_debug_mode("error")
     try:
@@ -246,16 +283,17 @@ def _park_the_default_stream(seconds: float = 0.5) -> None:
 
 
 @requires_rubin
+@pytest.mark.parametrize("attention", _KERNEL_ADAPTERS)
 @pytest.mark.parametrize("how", ["ambient", "explicit"])
-def test_a_caller_stream_orders_every_stage(how):
-    """Every stage -- five FROST GEMMs, the torch pointwise stages, the DSA kernel --
-    launches on ONE stream, the caller's (ambient ``torch.cuda.stream`` or explicit
-    ``current_stream=``).  The workspace is zeroed and the default stream parked, so
-    a stage enqueued there runs late and the output differs from the default-stream
-    run; correct threading gives a BIT-IDENTICAL result."""
+def test_a_caller_stream_orders_every_stage(how, attention):
+    """Every stage -- five FROST GEMMs, the torch pointwise stages, the attention kernel
+    (and the d512 union-list pre-pass) -- launches on ONE stream, the caller's (ambient
+    ``torch.cuda.stream`` or explicit ``current_stream=``).  The workspace is zeroed and
+    the default stream parked, so a stage enqueued there runs late and the output
+    differs from the default-stream run; correct threading gives a BIT-IDENTICAL result."""
     import cuda.bindings.driver as cuda_drv
 
-    r = _run_block(_TINY, batch=1, seq_len=256, ratio=1, attention="dsa")
+    r = _run_block(_TINY, batch=1, seq_len=256, ratio=1, attention=attention)
     ref_out = r.out.clone()
     ws = torch.zeros_like(r.ws)
     out = torch.zeros_like(r.out)
@@ -275,8 +313,9 @@ def test_a_caller_stream_orders_every_stage(how):
 
 
 @requires_rubin
-def test_workspace_is_sized_honestly():
-    r = _run_block(_TINY, batch=1, seq_len=128, ratio=1, attention="dsa")
+@pytest.mark.parametrize("attention", _KERNEL_ADAPTERS)
+def test_workspace_is_sized_honestly(attention):
+    r = _run_block(_TINY, batch=1, seq_len=128, ratio=1, attention=attention)
     req = r.blk.get_workspace_size()
     with pytest.raises(ValueError, match="workspace is"):
         r.blk.execute(*r.args, torch.empty(req - 1, dtype=torch.uint8, device="cuda"))
@@ -372,6 +411,8 @@ def test_stage_runners_reproduce_execute_and_restore_their_in_place_inputs(atten
         slots["lse_th"] = (sl.lse_th, (t, bg.n_heads), torch.float32)
     if sl.idx_ws is not None:
         slots["idx_ws"] = (sl.idx_ws, (2, 64, r.blk._attention.k_pad), torch.int32)
+    for name, shape in r.blk._attention.union_shapes.items():  # d512: the three pre-pass views
+        slots[name] = (getattr(sl, name), tuple(shape), torch.int32)
 
     def intermediates():
         return {k: _view(r.ws, off, shape, dt).clone() for k, (off, shape, dt) in slots.items()}  # the SLOTS, not the padding / engine scratch
@@ -379,7 +420,8 @@ def test_stage_runners_reproduce_execute_and_restore_their_in_place_inputs(atten
     ref_out, ref_lse, ref_ws = r.out.clone(), r.lse.clone(), intermediates()
     runners = r.blk.stage_runners(*r.args, r.ws, lse=r.lse)
     names = [x.name for x in runners]
-    want = [n for n, _ in RUNNER_NAMES if n != "idx_staging" or (attention == "dsa" and r.blk._attention.needs_idx_staging)]
+    live = {"idx_staging": attention == "dsa" and r.blk._attention.needs_idx_staging, "union_lists": attention == "d512"}
+    want = [n for n, _ in RUNNER_NAMES if live.get(n, True)]
     assert names == want, names
     assert all(x.kind == dict(RUNNER_NAMES)[x.name] for x in runners)
     assert [x.name for x in runners if x.prepare is not None] == ["q_norm", "q_rope", "kv_chain", "o_unrope"]
@@ -405,7 +447,9 @@ def test_stage_runners_reproduce_execute_and_restore_their_in_place_inputs(atten
     # Re-running the clean subset alone is not a valid probe: q_a_proj / kv_proj overwrite qa / kv with un-normed
     # values that the dsa kernel (itself contract-clean) then consumes, so out != ref_out (the first cut did that
     # and only the torch arm, whose attention is not in the set, happened to pass).
-    clean = {"q_a_proj", "q_b_proj", "kv_proj", "o_a_proj", "o_b_proj"} | ({"idx_staging", "sparse_attention"} if attention == "dsa" else set())
+    # (d512: the kernel launch is clean; its torch union_lists pre-pass is FLAGGED and allocates by design.)
+    clean = {"q_a_proj", "q_b_proj", "kv_proj", "o_a_proj", "o_b_proj"}
+    clean |= {"idx_staging", "sparse_attention"} if attention == "dsa" else ({"sparse_attention"} if attention == "d512" else set())
     for x in runners:
         torch.cuda.synchronize()
         before = torch.cuda.memory_allocated()
@@ -537,9 +581,37 @@ def test_declines_unknown_knob_values_in_the_constructor():
         MqaSparseAttentionBlockFwd(*args, R.RefGeometry(**_TINY))
 
 
-@pytest.mark.skipif(SA.d512_fork_available(), reason="the d512 fork module exists in this checkout")
-def test_declines_d512_until_the_fork_lands():
-    _declines(NotImplementedError, "has not landed", attention="d512")
+def test_d512_is_accepted_once_the_fork_exists_and_declined_typed_before():
+    """INVERTED when the fork landed: the block-level ``attention="d512"`` declaration passes ``check_support`` on Rubin;
+    off Rubin the ARCH decline follows (never "has not landed"); without the module the typed "has not landed"."""
+    args = _samples(_TINY_GEOM)
+    blk = MqaSparseAttentionBlockFwd(*args, _TINY_GEOM, attention="d512")
+    if not SA.d512_fork_available():
+        with pytest.raises(NotImplementedError, match="has not landed"):
+            blk.check_support()
+    elif _cc() == _SM107:
+        assert blk.check_support()
+        assert blk._attention.needs_union_lists and blk.attention_info()["adapter"] == "d512"
+    else:
+        with pytest.raises((NotImplementedError, ValueError)) as ei:  # the arch decline (CUDA) or the device decline (CPU)
+            blk.check_support()
+        assert "has not landed" not in str(ei.value)
+
+
+def test_declines_k_above_n_kv_slots_max_under_d512_before_any_device_check():
+    """``K > n_kv_slots_max`` is the geometry's ``ValueError`` on every adapter, ahead of the fork-present and arch checks."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    g = _TINY_GEOM
+    _declines(ValueError, "n_kv_slots_max", replace=dict(topk_idxs=torch.empty(1, 32, g.n_kv_slots_max + 1, dtype=torch.int32, device=dev)), attention="d512")
+
+
+@pytest.mark.skipif(not SA.d512_fork_available(), reason="with the fork absent the 'has not landed' decline precedes the head-geometry one")
+def test_declines_d512_on_a_head_geometry_other_than_64x512():
+    """The fork's work item is 4 tokens x 64 heads x 512 per cluster: 32 heads (TP=2) or another head_dim is a typed decline
+    at knob-check time, device-independent (the block's ``_check_knobs`` runs ahead of the arch check)."""
+    for kw in (dict(n_heads=32), dict(n_heads=128), dict(head_dim=256, q_lora_rank=256)):
+        geom = MqaSparseAttentionBlockGeometry(**dict(_TINY, **kw))
+        _declines(NotImplementedError, "64", geom=geom, attention="d512")
 
 
 @pytest.mark.skipif(
@@ -584,11 +656,18 @@ def test_bound_tensor_check_names_the_offender_on_any_device():
 
 
 def test_runner_name_table_is_the_pipeline():
-    """The names / kinds ``stage_runners`` emits are the perf driver's stage vocabulary."""
+    """The names / kinds ``stage_runners`` emits are the perf driver's stage vocabulary: the ten fixed stages in pipeline
+    order, plus the two adapter pre-passes (``union_lists`` for d512, ``idx_staging`` for dsa) as ``prep`` rows between
+    ``kv_chain`` and ``sparse_attention``."""
     names = [n for n, _ in RUNNER_NAMES]
-    assert names == ["q_a_proj", "q_norm", "q_b_proj", "q_rope", "kv_proj", "kv_chain", "idx_staging", "sparse_attention", "o_unrope", "o_a_proj", "o_b_proj"]
+    fixed = ["q_a_proj", "q_norm", "q_b_proj", "q_rope", "kv_proj", "kv_chain", "sparse_attention", "o_unrope", "o_a_proj", "o_b_proj"]
+    assert [n for n in names if n in fixed] == fixed, names
+    preps = [n for n in names if n not in fixed]
+    assert set(preps) == {"union_lists", "idx_staging"}, preps
+    assert all(dict(RUNNER_NAMES)[n] == "prep" for n in preps)
+    assert all(names.index("kv_chain") < names.index(n) < names.index("sparse_attention") for n in preps), names
     assert set(k for _, k in RUNNER_NAMES) == {"mma", "bw", "prep"}
-    assert dict(RUNNER_NAMES)["idx_staging"] == "prep" and dict(RUNNER_NAMES)["sparse_attention"] == "mma"
+    assert dict(RUNNER_NAMES)["sparse_attention"] == "mma"
     assert hasattr(MqaSparseAttentionBlockFwd, "stage_runners")
 
 
