@@ -40,7 +40,7 @@ Five deltas (plan ``dsv41_frost_unfused_PLAN.md`` section 1, (a)..(e)):
     reproduced exactly (validated by the W3a roundtrip micro).  A ``-1`` / sanitised id is a TMA-OOB row:
     ZERO-FILLED, bytes counted, so the transaction counts are the parent's.
 (3) MASK = MEMBERSHIP.  Each softmax lane loads its 16-B bit slot ``union_bits[b, c, t, j, 0:4]`` at the top
-    of every KV iteration and ``apply_membership_chunk`` writes a TRUE ``-inf`` into every union column that
+    of every KV iteration and ``apply_membership_words`` writes a TRUE ``-inf`` into every union column that
     is not one of its own token's keys.  ONE select after the raw row max keeps the finite ``-3.4e38``
     marker the online softmax is written against: a dead (fully masked) tile-row contributes P = 0 with
     alpha = 1 for a live row and alpha = 0 on a still-dead one, exactly as the parent's first iteration.
@@ -191,7 +191,7 @@ from cudnn.frost.tile_dsl.barrier import (
     wait,
 )
 from cudnn.frost.tile_dsl.handles import GmemTileTma, MmaDesc, SmemTile
-from cudnn.frost.tile_dsl.mask import apply_membership_chunk
+from cudnn.frost.tile_dsl.mask import apply_membership_words
 from cudnn.frost.tile_dsl.mma import mma_ss
 from cudnn.frost.tile_dsl.pointwise import row_max_reduction, row_reduction_pair, vec_scale_pair
 from cudnn.frost.tile_dsl.regtile import RegTile, vec_concat
@@ -1108,9 +1108,11 @@ def _sg0_softmax_kv_iter(
     # (module docstring, "S_acc READ COMPLETION"; frost-kernels.md section 3).  Never remove; never move below the arrive.
     nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
     # Chunk c (union columns 64c .. 64c+63 of this tile) masks with words 2c, 2c+1: a ZERO bit is
-    # "not one of this token's keys" -> a TRUE -inf (never the finite marker).
+    # "not one of this token's keys" -> a TRUE -inf (never the finite marker).  The slot words ARE mask words
+    # (bit i of word s = union column 32 s + i is one of this row's keys), so they go straight into the bit-word
+    # op -- one bit test + one select per cell, R2P + FSEL in SASS (tile_dsl.mask.apply_membership_words).
     words = ((w0, w1), (w2, w3))
-    chunks_S = [apply_membership_chunk(raw_chunks[c], words[c][0], words[c][1], n=SOFTMAX_CHUNK) for c in range(SOFTMAX_N_CHUNKS_LOAD)]
+    chunks_S = [apply_membership_words(raw_chunks[c], words[c], n_cols=SOFTMAX_CHUNK) for c in range(SOFTMAX_N_CHUNKS_LOAD)]
     chunks_max = [row_max_reduction(chunks_S[c]) for c in range(SOFTMAX_N_CHUNKS_LOAD)]
     reg_S_vec = vec_concat(chunks_S)
     current_max_raw = chunks_max[0]

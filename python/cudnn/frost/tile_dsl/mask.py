@@ -392,6 +392,48 @@ def compute_q_loop_bounds(
 # ---------------------------------------------------------------------------
 
 
+def _membership_bit(word, i: int):
+    """The single-bit test mask for bit ``i`` in ``word``'s own integer type: a ``Uint32`` word takes ``1 << i`` as is; an
+    ``Int32`` word (the fork's ``ld.global.nc.v4.s32`` membership words) takes the SIGNED encoding, so bit 31 is
+    ``-2**31`` and never an out-of-range i32 literal."""
+    if isinstance(word, cutlass.Uint32):
+        return cutlass.Uint32(1 << i)
+    return cutlass.Int32((1 << i) - (1 << 32) if i == 31 else (1 << i))
+
+
+def apply_membership_words(reg_S, words, *, n_cols: int = None, mask_value: float = float("-inf")):
+    """``reg_S[c] if keep-bit(c) else mask_value`` over an ``n_cols``-wide register chunk whose mask is a MEMBERSHIP bit
+    table: ``words`` is a tuple of 32-bit words, bit ``i`` of word ``s`` = column ``32 s + i`` is one of THIS row's keys
+    (kept); a zero bit is "not one of this row's keys" (masked).  The bit-word twin of :func:`apply_mask_words` for a
+    list-gathered KV tile, whose per-cell decision is a bit the block pre-computed rather than a band edge -- the words
+    arrive from GMEM already in mask-word form, so there is no ``band_mask_words`` step: ONE bit test + ONE
+    ``arith.select`` per cell, spelled as ``apply_mask_words`` spells it (a Python ``range`` over a compile-time bit index
+    of one register) so ptxas emits ``R2P`` (register -> 7 predicates) + one ``FSEL`` per cell.
+
+    Words may be ``Int32`` (the fork's ``ld.global.nc.v4.s32`` slot words) or ``Uint32``; the bit-31 test uses the word's
+    own signed / unsigned encoding (:func:`_membership_bit`).  The default ``mask_value`` is a TRUE ``-inf`` (not the finite
+    ``_NEG_INF_BITS`` sentinel): a fully-masked chunk's max is then ``-inf`` under any scale and the consumer's
+    ``max == -inf -> substitute`` guard applies (sdpa-invariants.md section 2); a kept cell passes through bit-exactly
+    (NaN payloads included).  Truth table identical to the retired per-cell spelling ``((word >> i) & 1) == 0 ->
+    mask_value`` -- and on sm_107a ptxas that spelling ALREADY lowered to R2P + FSEL (the pre-port fork read 16 R2P, no
+    per-cell ISETP), so this is the shared idiom landing in tile_dsl, not a SASS change: O / LSE bitwise either way.
+    Trace-time helper (plain Python over traced values)."""
+    if n_cols is None:
+        n_cols = MASK_WORD_COLS * len(words)
+    if len(words) * MASK_WORD_COLS < n_cols:
+        raise ValueError(f"apply_membership_words: {len(words)} word(s) cover {len(words) * MASK_WORD_COLS} columns, chunk has {n_cols}")
+    neg_inf = cutlass.Float32(mask_value)
+    elems = []
+    for s, word in enumerate(words):
+        for i in range(MASK_WORD_COLS):
+            c = MASK_WORD_COLS * s + i
+            if c >= n_cols:
+                break
+            keep = cutlass.Boolean(word & _membership_bit(word, i))
+            elems.append(cutlass.Float32(arith.select(keep.ir_value(), reg_S[c].ir_value(), neg_inf.ir_value())))
+    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+
+
 def apply_membership_chunk(reg_S, word_lo, word_hi, *, n: int = 64, mask_value: float = float("-inf")):
     """Per-CELL membership mask for a ``n``-wide chunk of scores: cell ``i`` KEEPS ``reg_S[i]``
     iff bit ``i`` of the 64-bit pair ``(word_lo, word_hi)`` is set, else becomes ``mask_value``.
@@ -401,21 +443,10 @@ def apply_membership_chunk(reg_S, word_lo, word_hi, *, n: int = 64, mask_value: 
     row's keys" (a duplicate-free row sees every copy but its own as zero bits; a ``-1`` /
     sanitised id is a zero-filled row AND a zero bit, so no real logit of 0 survives).
 
-    Same select-not-multiply shape as :func:`apply_mask_chunk` (``arith.select`` per cell); the
-    default ``mask_value`` is a true ``-inf`` so a fully-masked chunk's max is ``-inf`` under any
-    scale and the consumer's ``max == -inf -> substitute`` guard applies (sdpa-invariants.md
-    section 2 -- the finite ``_NEG_INF_BITS`` sentinel is NOT written here).  Words are plain
-    ``Int32``: ``(word >> i) & 1`` is sign-safe because of the ``& 1``.
+    The two-word convenience form of :func:`apply_membership_words` (same select, same ``-inf``
+    default, same truth table); the d512 fork calls the words form directly.
     """
     if cutlass.const_expr(not 1 <= n <= 64):
         raise ValueError(f"apply_membership_chunk: n must be in 1..64 (two 32-bit words), got {n}")
-    neg_inf = cutlass.Float32(mask_value)
-    one = cutlass.Int32(1)
-    zero = cutlass.Int32(0)
-    elems = []
-    for i in range(n):
-        word = word_lo if i < 32 else word_hi
-        bit = (word >> cutlass.Int32(i % 32)) & one
-        masked = bit == zero
-        elems.append(cutlass.Float32(arith.select(masked.ir_value(), neg_inf.ir_value(), reg_S[i].ir_value())))
-    return cutlass.Vector.from_elements(tuple(elems), cutlass.Float32)
+    words = (word_lo,) if n <= MASK_WORD_COLS else (word_lo, word_hi)
+    return apply_membership_words(reg_S, words, n_cols=n, mask_value=mask_value)
