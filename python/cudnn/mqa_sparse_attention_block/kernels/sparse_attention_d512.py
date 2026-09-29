@@ -1102,6 +1102,12 @@ def _kernel(
                 )
 
 
+# The parent's PR #1248 ("restore required FROST SDPA kernel name prefixes"): every FROST @cute.kernel is published
+# under a `cudnn`-prefixed symbol (profilers / the harness's `-k regex:` filters see one namespace); the block's kernels
+# live outside the scanned sdpa/ roots, so the pin test does not reach them -- ported for the same reason anyway.
+_kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+
+
 # ============================================================================
 # sg0 softmax-iter helper -- ONE path: tcgen05.ld + tcgen05.wait::ld + membership
 # mask + software row-max (the HW-fused max cannot observe the -inf written after
