@@ -962,6 +962,22 @@ _FORK_SASS_PROBE = textwrap.dedent("""
         print("SKIP no nvdisasm candidate decodes the cubin"); sys.exit(0)
     sass = subprocess.run([nvd, "-c", cubins[-1]], capture_output=True, text=True, check=True).stdout.splitlines()
     print("FORK CUBIN", os.path.basename(cubins[-1]))
+    print("EXPECT_UTMASTG", mod.TMA_O_ITERS_HOST)
+    print("EXPECT_UTMASTG_MAX_RUN", mod._O_SUBTILES_PER_CHUNK if mod.O_STORE_STREAM else mod.TMA_O_ITERS_HOST)
+    print("EXPECT_VOTE_ANY", 1 if mod.O_EPI_PIPELINE else 0)
+    print("FORK UTMASTG", sum(1 for ln in sass if "UTMASTG" in ln))
+    run = best = 0
+    for ln in sass:  # the longest UTMASTG run with no mbarrier wait between: 1 per chunk under O_STORE_STREAM, all 8 in the burst form
+        if "UTMASTG" in ln:
+            run += 1; best = max(best, run)
+        elif "PHASECHK" in ln:
+            run = 0
+    print("FORK UTMASTG_MAX_RUN", best)
+    print("FORK UTMACMDFLUSH", sum(1 for ln in sass if "UTMACMDFLUSH" in ln))
+    print("FORK VOTE_ANY", sum(1 for ln in sass if "VOTE.ANY" in ln))
+    print("FORK R2P", sum(1 for ln in sass if "R2P" in ln))
+    print("FORK CGAERRBAR", sum(1 for ln in sass if "CGAERRBAR" in ln))
+    print("FORK MEMBAR_GPU", sum(1 for ln in sass if "MEMBAR.ALL.GPU" in ln))
     print("FORK GATHER4", sum(1 for ln in sass if "UTMALDG" in ln and "GATHER4" in ln))
     print("FORK GATHER4_2CTA", sum(1 for ln in sass if "UTMALDG" in ln and "GATHER4.2CTA" in ln))
     print("FORK UTMALDG", sum(1 for ln in sass if "UTMALDG" in ln))
@@ -995,6 +1011,48 @@ def test_fork_sm107a_trace_compile_sass(tmp_path):
     print(f"\nfork sm_107a SASS: {stats}")
     assert stats["GATHER4"] > 0, "the fork's K/V producer is gather4 (UTMALDG.2D.GATHER4)"
     assert stats["USETMAXREG"] > 0, "the per-role register split must reach SASS (USETMAXREG.*), not just PTX"
+    # The ported parent levers (sm107/prefill_d512_f16.py: SPIN_RING_WAITS / O_STORE_STREAM / O_EPI_PIPELINE / the bit-word mask):
+    expect = {ln.split()[0]: int(ln.split()[1]) for ln in out if ln.startswith("EXPECT_") and len(ln.split()) == 2}
+    assert stats["UTMASTG"] == expect["EXPECT_UTMASTG"], f"{stats['UTMASTG']} UTMASTG, the module's TMA-O geometry says {expect['EXPECT_UTMASTG']}"
+    assert stats["UTMASTG_MAX_RUN"] == expect["EXPECT_UTMASTG_MAX_RUN"], (
+        f"longest UTMASTG run without a PHASECHK between = {stats['UTMASTG_MAX_RUN']}, O_STORE_STREAM says {expect['EXPECT_UTMASTG_MAX_RUN']}: "
+        "the streamed store issues ONE subtile per chunk wait; the burst form issues all of them after the last wait"
+    )
+    assert stats["UTMACMDFLUSH"] == 1, f"{stats['UTMACMDFLUSH']} bulk-group commits: the O store is ONE bulk group per tile in either form"
+    assert (
+        stats["VOTE_ANY"] == expect["EXPECT_VOTE_ANY"]
+    ), f"{stats['VOTE_ANY']} VOTE.ANY, O_EPI_PIPELINE says {expect['EXPECT_VOTE_ANY']}: the dead-row fast path is gone"
+    assert stats["R2P"] > 0, "the membership mask must lower to R2P (register -> predicates) + FSEL, not a per-cell compare"
+    assert stats["CGAERRBAR"] == 0 and stats["MEMBAR_GPU"] == 0, "a cluster-scope RELEASE arrive is back on a per-tile path (GPU-scope drain)"
+    assert stats["SPILL"] == 0, f"{stats['SPILL']} STL/LDL: the ported epilogue must not spill (the parent's E4M3 2-block batch did)"
+
+
+@requires_dsl
+@requires_fork
+def test_fork_lever_constants_are_module_constants_and_both_arms_trace():
+    """The three parent levers ported onto the fork (SPIN_RING_WAITS, O_STORE_STREAM, O_EPI_PIPELINE) are ONE bool module
+    constant each, shipped True, folded at their sites (never a literal at a call site), with the previous form still
+    tracing behind the False arm -- so each stays one flip from its A/B; and the membership mask goes through the tile_dsl
+    bit-word op (apply_membership_words), not a private per-cell body."""
+    fork = SA.d512_fork_module()
+    code = _code_lines(open(_fork_path()).read())
+    for name in ("SPIN_RING_WAITS", "O_STORE_STREAM", "O_EPI_PIPELINE"):
+        val = getattr(fork, name)
+        assert isinstance(val, bool) and val is True, f"{name}={val!r}: a bool module constant, shipped True"
+        assert len(re.findall(rf"^{name}: bool = (?:True|False)$", code, re.M)) == 1, f"exactly one {name} definition"
+    assert len(re.findall(r"spin=SPIN_RING_WAITS", code)) >= 21, "every per-KV-iteration ring wait the parent spins takes the module constant"
+    assert not re.search(r"spin=(?:True|False)", code), "a ring wait spells its form as a literal"
+    _o_ready_waits = [ln for ln in code.splitlines() if "mb_tma_o_full[chunk].wait(" in ln]
+    assert _o_ready_waits and not any(
+        "spin=" in ln for ln in _o_ready_waits
+    ), "the TMA-STG's per-chunk O-ready wait is a whole-chunk park and keeps the default form, as the parent"
+    for spelling in ("const_expr(O_STORE_STREAM)", "const_expr(not O_STORE_STREAM)", "const_expr(O_EPI_PIPELINE)"):
+        assert spelling in code, f"{spelling} is not folded at a site -- the lever is no longer an A/B"
+    assert re.search(r"tma_store_tile\(", code) and re.search(r"tma_store_subtile\(", code), "both O store forms must trace"
+    assert (
+        fork._O_SUBTILES_PER_CHUNK * fork.N_O_CHUNKS == fork.TMA_O_ITERS_HOST == 8 and fork._O_SUBTILES_PER_CHUNK == 1
+    ), "the packed (1, 2, 64, 64) O box: one subtile per 128-B chunk"
+    assert "apply_membership_words(" in code and "apply_membership_chunk(" not in code, "the kernel masks through tile_dsl.mask.apply_membership_words"
 
 
 # ---------------------------------------------------------------------------- Rubin: PackGQA-port sites
