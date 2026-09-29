@@ -148,9 +148,9 @@ class VariantPack:
     pointers — silently, because every pointer in it is individually valid.
     """
 
-    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described")
+    __slots__ = ("uids", "native", "_index_of", "workspace", "workspace_bytes", "_device", "graph_described", "overridden")
 
-    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=()):
+    def __init__(self, uids, native, workspace_ptr: int = 0, workspace_bytes: int = 0, graph_described=(), overridden=()):
         self.uids = uids
         self.native = native
         self.workspace = workspace_ptr
@@ -160,6 +160,9 @@ class VariantPack:
         # axis position needs this: the graph and the caller order a matmul's B
         # differently, and the description does not say which one it is.
         self.graph_described = graph_described
+        # Explicit execute overrides change the requested geometry, while a
+        # producer view can still be raw storage under the graph declaration.
+        self.overridden = overridden
         self._index_of = None  # built on first lookup: the backend never does one
         self._device = None
 
@@ -207,6 +210,16 @@ class VariantPack:
 
     def ptr(self, tensor_or_uid) -> int:
         return self.native.pointer(self.index_of(tensor_or_uid))
+
+    def observed_bytes(self, index: int) -> int:
+        """Bytes the PRODUCER guarantees addressable for operand ``index`` (-1: unknown, a bare address),
+        recorded at normalization in the producer's own element width and untouched by graph
+        re-description or overrides. An engine deriving a capacity divides by ITS element size."""
+        return self.native.observed_bytes(index)
+
+    def observed_device(self, index: int):
+        """The producer's DLPack ``(device_type, device_id)`` for operand ``index``; ``(-1, -1)`` unknown."""
+        return self.native.observed_device(index)
 
     def operands(self, indices):
         """The buffers for ``indices``, in one crossing."""

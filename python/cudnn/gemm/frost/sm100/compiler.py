@@ -1198,11 +1198,11 @@ def _quant_device_imports(chain: FusionChain) -> list[str]:
     Both round UP: a scale rounded DOWN makes ``amax / scale`` exceed the output
     format's max, clamping the block's largest element.
 
-    ``ue8m0`` needs no widening helper — it is a bare exponent, so ``byte << 23``
-    IS the fp32. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
+    ``ue8m0`` needs no widening helper — its exponent bits are widened directly,
+    with byte 0 handled as the FP32 subnormal 2**-127. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
     :func:`_check_block_quant_supported`.
 
-    Both take ``x == 0`` to byte 0, which the readback turns back into 0.0."""
+    Both take ``x == 0`` to byte 0: 2**-127 for ue8m0, 0.0 for ue5m3."""
     kinds = {q.scale_dtype for q in chain.quants}
     lines: list[str] = []
     if "fp8_e8m0" in kinds:
@@ -3297,7 +3297,7 @@ def _check_mma_k_dim(chain: FusionChain, config: TileConfig) -> None:
     fp8_dtypes = ("fp8_e4m3", "fp8_e5m2")
     if _mma_a_dtype(chain) not in fp8_dtypes or _mma_b_dtype(chain) not in fp8_dtypes:
         raise NotImplementedError(f"plain matmul at mma_tile_k_bytes=64 requires FP8 E4M3/E5M2 A and B; config {config.name!r}")
-    from ..kernel_registry import MMA_INST_K64_ARCH_RANGES
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
 
     arch = _current_arch()
     if arch is None or not any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES):
@@ -3971,7 +3971,17 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         return config
     sm = sm_count if sm_count is not None else _sm_count()
     output_tiles = mm.batch * -(-mm.M // config.cta_tile_m) * -(-mm.N // config.cta_tile_n)
-    if output_tiles >= sm:
+    # On MMA_INST_K64_ARCH_RANGES silicon the one-wave target overshoots for
+    # nvfp4 block-scale: measured split-K curves pay only below 1/8 grid fill,
+    # near 64 total CTAs, with power-of-two S >= 4. fp8 keeps one-wave sizing
+    # (its shallow narrow-tile splits measure as real wins).
+    from cudnn.gemm.frost.kernel_registry import MMA_INST_K64_ARCH_RANGES
+
+    arch = _current_arch()
+    _k64_part = any(lo <= arch < hi for lo, hi in MMA_INST_K64_ARCH_RANGES) if arch is not None else sm >= 190
+    _fp4_bs = chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1"
+    eager_fill = not (_k64_part and _fp4_bs)
+    if output_tiles >= (sm if eager_fill else -(-sm // 8)):
         return config
     cta_k_elems = _cta_k_elems(chain, config)
     num_k_tiles = -(-mm.K // cta_k_elems)
@@ -3982,7 +3992,18 @@ def _auto_split_k(chain: FusionChain, config: TileConfig, sm_count: "int | None"
         32,  # reducer chain-unroll limit; S>32 runs one serial dynamic loop
         65535 // mm.batch,  # CUDA grid.z hard limit
     )
+    if not eager_fill:
+        slices = min(slices, max(1, 64 // output_tiles))
+        if slices < 4:
+            # the bounds cannot support four slices; S=2/3 measure as losses
+            return config
+        slices = 1 << (slices.bit_length() - 1)  # snap down to a power of two
     if slices <= 1:
+        return config
+    # For matched FP4 operands, a two-way split does not amortize the
+    # partial-output traffic and reduction launch. Keep the unsplit tile;
+    # larger automatic splits and explicitly supplied knobs remain available.
+    if slices == 2 and chain.has_block_scale and mm.a_dtype == mm.b_dtype == "fp4_e2m1":
         return config
     return replace(config, split_k_slices=slices)
 
@@ -3995,14 +4016,7 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
-    """Choose the tile strategy for one analyzed fusion chain.
-
-    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
-    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
-    bypasses the automatic pick; a request that does not spell a canonical
-    config is a decline (NotImplementedError), never a silent snap to a
-    neighbour. Without knobs this is the automatic strategy."""
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -4047,10 +4061,30 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
-    # skip splitK when dynamic_shape is enabled
-    if dynamic_shapes:
+    # skip splitK for MoE and dynamic shapes
+    if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose one strategy, or replay the exact supplied knobs."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    if knobs is not None or dynamic_shapes:
+        return config
+    from ..planning import select_strategy
+
+    return select_strategy(chain, config, probe=probe_chain)
+
+
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+    """Choose a bounded list with the single-plan recommendation first."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    if dynamic_shapes:
+        return [config]
+    from ..planning import select_strategies
+
+    return select_strategies(chain, config, probe=probe_chain)
 
 
 def _precheck_plain(
@@ -4537,7 +4571,6 @@ class CompiledMoeGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -4566,12 +4599,12 @@ class CompiledMoeGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -4968,7 +5001,6 @@ class CompiledMoeBlockScaleGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -5002,9 +5034,10 @@ class CompiledMoeBlockScaleGemm:
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):

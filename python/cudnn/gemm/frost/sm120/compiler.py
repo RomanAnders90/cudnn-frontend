@@ -848,8 +848,21 @@ def _render_tile_constants(
     ``moe_aligned_offsets``.
     """
     _check_own_family(tmpl)
-    if chain.is_multi_gemm or chain.has_mainloop_fusion or chain.has_block_scale:
-        raise NotImplementedError(f"{tmpl.file} renders plain single-GEMM matmul chains only")
+    if chain.has_mainloop_fusion or chain.has_block_scale:
+        raise NotImplementedError(f"{tmpl.file} renders plain matmul chains only (no mainloop fusion, no block scaling)")
+    if chain.is_multi_gemm and not tmpl.supports_multi_gemm:
+        raise NotImplementedError(f"{tmpl.file} renders single-GEMM chains only; multi-GEMM ({chain.num_gemms} GEMMs) is served by the MoE template")
+    if chain.is_multi_gemm:
+        # Sm120KernelTemplate owns the multi-GEMM feasibility rule (SMEM); the
+        # funnel's _extra_reject asks the same method, so both agree. Register
+        # pressure is a perf trade-off, not a gate: a large tile still renders
+        # and ptxas spills its accumulators.
+        _mg = tmpl.multi_gemm_reject(chain, cfg)
+        if _mg is not None:
+            raise NotImplementedError(f"{tmpl.file}: {_mg}")
+        _ab_stages, _, _ = tmpl.multi_gemm_ab_stages(chain, cfg)
+    else:
+        _ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
     if chain.has_moe and chain.matmul.a_major != "k":
         raise NotImplementedError(f"{tmpl.file} loads the MoE token through a K-major TMA box; got a {chain.matmul.a_major}-major token")
     # warps_per_cta is a fact of the TEMPLATE (8 compute + TMA + CLC + 2 donors).
@@ -901,9 +914,15 @@ def _render_tile_constants(
         f"matmul_b_batch = {chain.matmul.b_batch}",
         f"a_is_m_major = {chain.matmul.a_major == 'm'}",
         f"b_is_n_major = {chain.matmul.b_major == 'n'}",
-        # The AB pipeline depth; the template then funds its transposed-STG
-        # epilogue staging out of it.
-        f"ab_stages = {cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)}",
+        # The AB pipeline depth. Single-GEMM: the template funds its transposed-STG
+        # epilogue staging out of it by giving up whole stages (the catalog's
+        # _sm120_smem_feasible sweep counts the same way). Multi-GEMM: one SMEM
+        # tile per DISTINCT operand per stage, with the staging taken off the
+        # budget in BYTES first (Sm120KernelTemplate.multi_gemm_ab_stages) --
+        # a whole multi-operand stage may be all that fits, so the template is
+        # told not to deduct (stg_epi_prefunded).
+        f"ab_stages = {_ab_stages}",
+        f"stg_epi_prefunded = {chain.is_multi_gemm}",
         f"a_tma_group_elems = {a_tma_group_elems}",
         f"b_tma_group_elems = {b_tma_group_elems}",
         # Warp-MMA pairs per warp tile per axis -- the compute-warp grid falls
@@ -927,6 +946,10 @@ def _render_tile_constants(
         f"swizzle_l2_budget_bytes = {_l2_swizzle_budget_bytes()}",
         f"num_a_operands = {chain.num_a_operands}",
         f"num_b_operands = {chain.num_b_operands}",
+        # gemm_a_idx[g] / gemm_b_idx[g] pick GEMM g's operands (single GEMM: (0,), (0,)).
+        f"num_gemms = {chain.num_gemms}",
+        f"gemm_a_idx = {tuple(a for a, _ in chain.gemm_operands)}",
+        f"gemm_b_idx = {tuple(b for _, b in chain.gemm_operands)}",
         f"vec_bytes_epi = {vec_bytes_epi}",
         f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma_store=False)}",
         f"split_k_slices = {cfg.split_k_slices}",
@@ -1015,11 +1038,11 @@ def _quant_device_imports(chain: FusionChain) -> list[str]:
     Both round UP: a scale rounded DOWN makes ``amax / scale`` exceed the output
     format's max, clamping the block's largest element.
 
-    ``ue8m0`` needs no widening helper — it is a bare exponent, so ``byte << 23``
-    IS the fp32. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
+    ``ue8m0`` needs no widening helper — its exponent bits are widened directly,
+    with byte 0 handled as the FP32 subnormal 2**-127. ``ue5m3``'s cvt exists ONLY on sm_107, see the arch gate in
     :func:`_check_block_quant_supported`.
 
-    Both take ``x == 0`` to byte 0, which the readback turns back into 0.0."""
+    Both take ``x == 0`` to byte 0: 2**-127 for ue8m0, 0.0 for ue5m3."""
     kinds = {q.scale_dtype for q in chain.quants}
     lines: list[str] = []
     if "fp8_e8m0" in kinds:
@@ -1567,7 +1590,9 @@ def _render_template(
     compile_ab_pass = ",\n".join([f"fake_a_{i}" for i in range(na)] + [f"fake_b_{j}" for j in range(nb)]) + ","
     # Per-GEMM register-vector bindings in the STG inner loop: GEMM 0 is bound by
     # the template (vec_f32); the rest (vec_f32_1, ...) are injected here.
-    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}][j * vsize : (j + 1) * vsize]" for g in range(1, chain.num_gemms)) or "pass"
+    # (The sm120 STG arm builds one vsize-wide fp32 vector per GEMM, so the binding
+    # is the whole vector -- no sub-slicing by chunk index as on the tcgen05 arm.)
+    stg_vec_bindings = "\n".join(f"vec_f32_{g} = c_rmem_vecs[{g}]" for g in range(1, chain.num_gemms)) or "pass"
     # MoE multi-GEMM: the kernel also takes the raw A (token) tensor per distinct
     # A operand (for the per-group patched base address) — same tensors the host
     # uses to build the A descriptors.
@@ -3317,14 +3342,7 @@ def _graph_dynamic_shapes(graph) -> bool:
     return bool(getattr(graph, "_cpp_graph_kwargs", {}).get("is_dynamic_shape_enabled", False))
 
 
-def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
-    """Choose the tile strategy for one analyzed fusion chain.
-
-    ``knobs`` (a :class:`~cudnn.gemm.frost.knobs.GemmKnobs`, the replay of a
-    recorded ``(engine_id, knobs)`` plan) names one TileConfig exactly and
-    bypasses the automatic pick; a request that does not spell a canonical
-    config is a decline (NotImplementedError), never a silent snap to a
-    neighbour. Without knobs this is the automatic strategy."""
+def _baseline_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
     if knobs is not None:
         try:
             config = knobs.to_config()
@@ -3369,10 +3387,30 @@ def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None)
     # the geometry and only moves when the family cannot serve it (sm120 is
     # warp-scoped MMA, 1-CTA only).
     config = preferred_strategy(chain, config)
-    # skip splitK when dynamic_shape is enabled
-    if dynamic_shapes:
+    # skip splitK for MoE and dynamic shapes
+    if chain.has_moe or dynamic_shapes:
         return config
     return _auto_split_k(chain, config)
+
+
+def plan_config(chain: FusionChain, *, dynamic_shapes: bool = False, knobs=None) -> TileConfig:
+    """Choose one strategy, or replay the exact supplied knobs."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes, knobs=knobs)
+    if knobs is not None or dynamic_shapes:
+        return config
+    from ..planning import select_strategy
+
+    return select_strategy(chain, config, probe=probe_chain)
+
+
+def plan_configs(chain: FusionChain, *, dynamic_shapes: bool = False) -> list[TileConfig]:
+    """Choose a bounded list with the single-plan recommendation first."""
+    config = _baseline_config(chain, dynamic_shapes=dynamic_shapes)
+    if dynamic_shapes:
+        return [config]
+    from ..planning import select_strategies
+
+    return select_strategies(chain, config, probe=probe_chain)
 
 
 def _precheck_plain(
@@ -3855,7 +3893,6 @@ class CompiledMoeGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -3884,12 +3921,12 @@ class CompiledMoeGemm:
     def _make_workspace(self, n_slots, caller=None):
         """The per-CTA tensormap GMEM workspace (16 int64/slot, 128-byte
         aligned). ``n_slots`` = grid_ctas * _desc_slots_per_cta. Carved from the
-        CALLER's buffer when execute() supplied one; otherwise from one this plan
-        owns (the direct jit_from_cudnn_graph path passes no workspace)."""
+        CALLER's buffer; a call without one is a contract error (Rule 8)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):
@@ -4224,7 +4261,6 @@ class CompiledMoeBlockScaleGemm:
     _launchable: Callable
     _grid_ctas: int = 0
     device: int = 0  # CUDA device this plan's baked constants describe
-    _workspace: object = None  # plan-owned DeviceBuffer (lazy), 128B-aligned
     aux_names: list = field(default_factory=list)
     binding: "GemmBinding | None" = None  # role -> cuDNN tensor (variant-pack call)
     # The epilogue chunk width (bytes) the kernel was RENDERED with (tile-
@@ -4258,9 +4294,10 @@ class CompiledMoeBlockScaleGemm:
         CALLER's buffer when execute() supplied one; otherwise from one this plan
         owns (the direct jit_from_cudnn_graph path passes no workspace)."""
         if caller is None:
-            if self._workspace is None:
-                self._workspace = buffers.DeviceBuffer(n_slots * _MOE_DESC_SLOT_BYTES, self.device)
-            caller = self._workspace
+            raise ValueError(
+                f"{type(self).__name__} requires a {n_slots * _MOE_DESC_SLOT_BYTES}-byte workspace but execute() received "
+                "none; size it with workspace_bytes and pass workspace= (a plan owns no device memory, Rule 8)"
+            )
         return _moe_carve_workspace(caller, n_slots, type(self).__name__)
 
     def __call__(self, variant_pack, workspace=None, stream=None):

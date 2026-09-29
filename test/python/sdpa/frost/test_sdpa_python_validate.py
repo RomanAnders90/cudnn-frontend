@@ -44,9 +44,11 @@ def _sdpa_graph(
     s_q=64,
     s_kv=64,
     d=64,
+    with_sink=False,
     **sdpa_kwargs,
 ):
-    """A minimal SDPA forward pygraph; returns (graph, tensors-by-name)."""
+    """A minimal SDPA forward pygraph; returns (graph, tensors-by-name).
+    ``with_sink`` binds a (1, H_q, 1, 1) fp32 ``sink_token`` (cuDNN's contract)."""
     g = cudnn.pygraph(
         io_data_type=cudnn.data_type.HALF,
         intermediate_data_type=cudnn.data_type.FLOAT,
@@ -55,6 +57,8 @@ def _sdpa_graph(
     q = g.tensor(name="q", dim=[b, h_q, s_q, d], stride=[h_q * s_q * d, s_q * d, d, 1])
     k = g.tensor(name="k", dim=[b, h_kv, s_kv, d], stride=[h_kv * s_kv * d, s_kv * d, d, 1])
     v = g.tensor(name="v", dim=[b, h_kv, s_kv, d], stride=[h_kv * s_kv * d, s_kv * d, d, 1])
+    if with_sink:
+        sdpa_kwargs["sink_token"] = g.tensor(name="sink", dim=[1, h_q, 1, 1], stride=[h_q, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
     o, stats = g.sdpa(q, k, v, generate_stats=True, **sdpa_kwargs)
     o.set_output(True)
     if stats is not None:
@@ -213,6 +217,32 @@ def test_sliding_window_sq_gt_skv_rejected(frost_candidate):
     g, _ = _sdpa_graph(s_q=128, s_kv=64, use_causal_mask=True, sliding_window_length=16)
     with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="Sliding window attention"):
         g.validate()
+
+
+def test_sink_at_decode_is_not_a_validity_rule(frost_candidate):
+    """sink_token at s_q == 1 (decode) passes the python-native validator without
+    lowering. Whether a decode graph with a sink is SERVED is a support-surface
+    answer each engine gives at planning time (the FROST SM100 row folds the sink
+    into its epilogue independent of S_q; the backend engines decline it there),
+    not a graph-validity answer -- so the classic rule is deliberately absent
+    here, like every other backend-capability gate."""
+    for kwargs in (dict(), dict(use_causal_mask_bottom_right=True), dict(diagonal_band_left_bound=16, diagonal_band_right_bound=0)):
+        g, _ = _sdpa_graph(s_q=1, s_kv=128, with_sink=True, **kwargs)
+        g.validate()
+        assert g._lowered_graph is None, "sink at s_q == 1 must validate natively (no eager C++ lowering)"
+        assert g._is_validated is True
+
+
+@requires_sm80
+def test_sink_at_decode_classic_path_still_rejects(no_candidates):
+    """Backend-only configuration (no python candidate): the C++ support surface
+    keeps its rule, so sink_token at s_q == 1 is still rejected at validate()
+    with the classic message -- lifting the python twin must not widen what the
+    backend path accepts."""
+    g, _ = _sdpa_graph(s_q=1, s_kv=128, with_sink=True)
+    with pytest.raises(cudnn.cudnnGraphNotSupportedError, match="decode only mode"):
+        g.validate()
+    assert g._is_validated is False and g._lowered_graph is None
 
 
 def test_bwd_sq1_skv1_rejected(frost_candidate):
@@ -411,3 +441,59 @@ def test_mxfp8_unrequested_amax_o_validates_natively(frost_candidate):
     g.validate()
     assert g._is_validated and g._lowered_graph is None
     assert not amax_o.is_virtual and amax_o.dim_assigned and list(amax_o.dim) == [1, 1, 1, 1]
+
+
+def _paged_mxfp8_graph(*, sf_k_pages=None, sf_v_s_scale=None, page=128):
+    """sdpa_mxfp8 over page pools with pool-shaped descales; the overrides mis-size a descale."""
+    b, h, kh, d, max_pages = 2, 4, 2, 256, 6
+    num_pages = b * max_pages
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.FP8_E4M3, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    q = g.tensor(name="q", dim=[b, h, 1, d], stride=[h * d, d, h * d, 1])
+    k = g.tensor(name="k", dim=[num_pages, kh, page, d], stride=[kh * page * d, page * d, d, 1])
+    v = g.tensor(name="v", dim=[num_pages, kh, page, d], stride=[kh * page * d, page * d, d, 1])
+
+    def sf(sd, which):
+        return g.tensor(
+            dim=sd,
+            stride=[sd[1] * sd[2] * sd[3], sd[2] * sd[3], sd[3], 1],
+            data_type=cudnn.data_type.FP8_E8M0,
+            reordering_type=cudnn.tensor_reordering.F8_128x4,
+        )
+
+    i32 = cudnn.data_type.INT32
+    o, _, amax_o = g.sdpa_mxfp8(
+        q,
+        k,
+        v,
+        sf([b, h, 128, d // 32], "q"),
+        sf([sf_k_pages or num_pages, kh, page, d // 32], "k"),
+        sf([num_pages, kh, sf_v_s_scale or page // 32, d], "v"),
+        attn_scale=1.0 / math.sqrt(d),
+        generate_stats=False,
+        use_padding_mask=True,
+        seq_len_q=g.tensor(name="sq", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32),
+        seq_len_kv=g.tensor(name="sk", dim=[b, 1, 1, 1], stride=[1, 1, 1, 1], data_type=i32),
+        paged_attention_k_table=g.tensor(name="tk", dim=[b, 1, max_pages, 1], stride=[max_pages, max_pages, 1, 1], data_type=i32),
+        paged_attention_v_table=g.tensor(name="tv", dim=[b, 1, max_pages, 1], stride=[max_pages, max_pages, 1, 1], data_type=i32),
+        paged_attention_max_seq_len_kv=max_pages * page,
+    )
+    o.set_output(True).set_dim([b, h, 1, d]).set_stride([h * d, d, h * d, 1]).set_data_type(cudnn.data_type.BFLOAT16)
+    amax_o.set_output(True).set_dim([1, 1, 1, 1]).set_stride([1, 1, 1, 1]).set_data_type(cudnn.data_type.FLOAT)
+    return g
+
+
+def test_paged_mxfp8_pool_descales_validate_natively(frost_candidate):
+    """descale_k / descale_v are page pools: their leading dims follow the K/V containers, not (B, H)."""
+    g = _paged_mxfp8_graph()
+    g.validate()
+    assert g._is_validated and g._lowered_graph is None
+
+
+def test_paged_mxfp8_descale_k_must_match_the_pool(frost_candidate):
+    with pytest.raises(ValueError, match="Descale_K batch/head dimensions must match K"):
+        _paged_mxfp8_graph(sf_k_pages=7).validate()
+
+
+def test_paged_mxfp8_descale_v_scales_the_page_rows(frost_candidate):
+    with pytest.raises(ValueError, match="Descale_V s_scale dimension too small"):
+        _paged_mxfp8_graph(sf_v_s_scale=2).validate()

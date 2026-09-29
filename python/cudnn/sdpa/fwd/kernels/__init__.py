@@ -16,6 +16,12 @@ dims: ``sm120/prefill_f16.py`` and ``sm120/prefill_fp8.py`` do, while
 ``sm120/prefill_d256_f16.py`` is the d256 flavor (head dims that tile at 256 on
 both sides). ``sm120/prefill_d512_f16.py`` serves both head dims in (256, 512]
 at multiples of eight, with two warps per Q slab splitting the head dimension.
+A ``decode_`` phase is a second template for the SAME flavor and contract,
+selected by the adapter when the graph is decode-shaped:
+``sm100/decode_d256_f16.py`` takes the f16/bf16 d256 graphs whose S_q x packed
+heads fit 16 rows (``TemplateParams.decode_q_tile``; its 32-row tile compiles but
+is not routed, ``config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS``), the prefill
+template the rest.
 
 Modules shared across arch lines stay at THIS level rather than inside one
 arch's package, so the directory a file lives in always names its only owner:
@@ -30,15 +36,14 @@ Loading
 Every template specializes on its architecture's frozen ``TemplateParams`` at
 import time (module global ``FROST_TEMPLATE_PARAMS``, injected by
 ``cudnn.frost.template_loader.load_template``). Tensor geometry remains an
-input to each module's cached ``compile()`` function. The adapter's
+input to the cached compiler entry or the architecture's prepared host. The adapter's
 ``_SM*_KERNEL_FILES`` maps hold paths RELATIVE to this directory
 (``"sm107/prefill_d128_fp8.py"``), which the loader joins onto it. Import a
 template directly only for its all-defaults standalone path.
 
-The SM80 templates (``sm80/prefill_f16.py``, ``sm80/prefill_d256_f16.py``, and
-the ``bprop_*_sm80.py`` pair under ``bwd/kernels/``) were vendored 2026-07 from
-an internal tile-kernel repository that has since been retired; they are
-maintained in-tree from here on. They predate the ``TemplateParams`` loader:
-they self-cache per shape and take masks/features as runtime kwargs — import
-them directly and call ``forward``/``backward``.
+The SM80 templates were vendored in July 2026 from a retired internal
+repository and are maintained in-tree. They now use the same TemplateParams
+loader. Forward launch lowering lives in ``sm80/prepared_host.py``; the two
+forward templates contain the device implementation, with no tensor compiler
+or fake-operand construction. The public wrappers live in the parent SDPA API.
 """
