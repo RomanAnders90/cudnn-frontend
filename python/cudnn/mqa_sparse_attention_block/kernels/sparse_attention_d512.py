@@ -6,8 +6,9 @@
 
 What is the same (BYTE-IDENTICAL to the parent, by design): the barrier inventory and every init count,
 the SMEM buffers (sizes, offsets, swizzles, the ``DESC_VERSION = 1`` descriptors), the TMEM layout, the MMA
-descriptors / idescs, the sg1 correction warp, the O epilogue store loop, the P / alpha / stats DSMEM
-ships and every end-of-kernel drain.  The pipeline is still
+descriptors / idescs, the sg1 correction warp, the O epilogue (``O_EPI_PIPELINE``) and the TMA-STG store loop
+(``O_STORE_STREAM``, subtile geometry re-derived for the packed O box), the P / alpha / stats DSMEM ships and every
+end-of-kernel drain; the per-KV-iteration ring waits take the parent's ``SPIN_RING_WAITS`` form.  The pipeline is still
 
     sg0 (CTAs 0, 1):  TMA-LDG Q + K_ring; BMM1 = Q.K^T -> S_acc; streaming softmax; ship alpha + P + stats
     sg1 (CTAs 2, 3):  TMA-LDG V_ring; correction; BMM2 = P.V -> O; normalise + cast + TMA-STG O + LSE
@@ -211,6 +212,7 @@ from cudnn.frost.tile_dsl.tma import (
     tma_gather4,
     tma_load_tile,
     tma_store_commit,
+    tma_store_subtile,
     tma_store_tile,
     tma_store_wait,
 )
@@ -222,6 +224,7 @@ from cudnn.mqa_sparse_attention_block.kernels.union_lists import (
     WORDS_PER_SLOT as _UL_WORDS_PER_SLOT,
 )
 from cudnn.sdpa.fwd.config_sm107 import TemplateParams, make_cfg_d512
+from cudnn.sdpa.fwd.kernels._common_blackwell import o_epilogue_convert_store
 
 
 # ----------------------------------------------------------------------------
@@ -390,6 +393,28 @@ DESC_VERSION: int = 1
 # warps' ``_empty`` ring waits (_gather_warp_group) have NO parent twin and stay on the default: flipping them is a
 # separate A/B, not part of the port.  Flipping this constant IS the whole experiment; never a literal at a call site.
 SPIN_RING_WAITS: bool = True
+# The parent's two O-store levers (sm107/prefill_d512_f16.py, branch frost/d512-o-store-stream), ported to the SAME two
+# regions -- the sg1 TMA-STG store loop and the sg1 compute epilogue -- as module constants (never a literal at a call site).
+# O_STORE_STREAM: True = the TMA-STG warp issues chunk c's TMA-O subtile store(s) (tile_dsl.tma.tma_store_subtile) right
+# after mb_tma_o_full[c] completes, so the 128 KiB per-CTA O store streams behind the epilogue instead of queueing as ONE
+# 8-subtile burst after the last chunk -- ahead of the next work item's V ring gathers in the SM's in-order TMA engine.
+# The per-work-item cost is the store's TMA-ENGINE occupancy, not its HBM bytes (MEASURED on the parent's MXFP8 sibling:
+# +16.3 / +16.5 / +5.9 / +0.5 % of time at S_KV = 512 / 1024 / 2048 / 8192; the bf16 parent +1.26 % at S_KV=512).  This
+# fork's work item is ~5-12 union tiles (S_KV-equivalent 640-1536), i.e. the short-S_KV regime where the parent gains
+# most; THIS body's A/B is owed.  False = the whole-tile form (wait all N_O_CHUNKS, then one tma_store_tile), verbatim.
+# Both forms issue ONE bulk group per tile (one commit + one wait_group.read 0 + one mb_tma_o_empty arrive); every
+# mbarrier op, its order and its count are identical -- the barrier rows are written out at the TMA-STG loop.
+O_STORE_STREAM: bool = True
+# O_EPI_PIPELINE: True = software-pipelined TMEM readout (the tcgen05.ld batch of chunk c+1 issued right after the wait
+# that completes chunk c, BEFORE chunk c's ALU / STS / fence / arrive) + the dead-row fast path (one warp-uniform
+# vote.any(_row_empty) per tile: when no lane of the warp holds a dead row the per-element selects are the identity and
+# are skipped; the slow arm keeps the selects verbatim -- never `* 0`, sdpa-invariants.md s2).  A batch is 64 fp32 per lane
+# = one 128-B chunk (2 blocks of 32) at this kernel's bf16 / fp16 O.  Numerics bit-identical by construction (same
+# multiply, same select, same pack, same store offsets, same chunk-arrive order); no barrier count or order changes.
+# False = the classic per-block body (ld -> wait -> convert -> store -> chunk arrive), verbatim.
+O_EPI_PIPELINE: bool = True
+if not (isinstance(O_STORE_STREAM, bool) and isinstance(O_EPI_PIPELINE, bool)):
+    raise TypeError(f"{__name__}: O_STORE_STREAM / O_EPI_PIPELINE are bool module constants; got {O_STORE_STREAM!r} / {O_EPI_PIPELINE!r}")
 TMA_QK_ITERS = _TMA.QK_ITERS
 TMA_VO_ITERS = _TMA.VO_ITERS
 TMA_QK_GRANU_ELEMS = _TMA.QK_GRANU_ELEMS
@@ -443,6 +468,33 @@ BMM2_V_NBLOCK_ADVANCE = CFG.TILE_N * (CFG.BMM2_N_PER_CALL // CFG.CTA_MMA) * CFG.
 
 # O store chunks (TMA-STG arrive granularity -- 128 B per chunk).
 N_O_CHUNKS = (CFG.TILE_O * CFG.BPE_O + 127) // 128  # 8 chunks @ d=512 f16
+# Streamed O store (O_STORE_STREAM) geometry, RE-DERIVED for this fork's PACKED O box -- not copied from the parent.
+# The epilogue publishes chunk c = O columns [c * O_CHUNK_ELEMS, (c + 1) * O_CHUNK_ELEMS) (O_CHUNK_ELEMS = 128 // BPE_O = 64)
+# of all TILE_M rows, laid out in sO as the contiguous block [c * TILE_M * O_D_BLOCK, (c + 1) * TILE_M * O_D_BLOCK) elements
+# (O_D_BLOCK = TILE_O // TMA_O_ITERS_HOST = 64; the per-lane row inside it is `tid * O_D_BLOCK`, 128 B, Swizzle(3, 4, 3)).
+# The TMA-O descriptor's box is (1, TOKENS_PER_TILE, HEADS_PER_TILE, TMA_O_GRANU_ELEMS_HOST) on the [B, S, 64, 512] BSHD
+# tensor: ONE subtile = 2 tokens x 64 heads x 64 d-elems = TILE_M rows x 128 B = 16 KiB, walked by `tma_store_subtile` at
+# SMEM `base + i * sO.tma_subtile_stride_elems` (= i * TILE_M * TMA_O_GRANU_ELEMS_HOST) and GMEM d = i * TMA_O_GRANU_ELEMS_HOST
+# -- exactly subtile i of the whole-tile store, and exactly the epilogue's chunk block i when the two strides agree.  So
+# chunk c covers subtiles [c * _O_SUBTILES_PER_CHUNK, (c + 1) * _O_SUBTILES_PER_CHUNK): ONE at O_SWZ_BYTES = 128 (this
+# kernel), two at a 64 B swizzle.  Every equality below is a body fact the loop relies on; a mismatch raises at module load.
+_O_SUBTILES_PER_CHUNK = TMA_O_ITERS_HOST // N_O_CHUNKS
+_O_CHUNK_ELEMS = 128 // CFG.BPE_O
+_O_D_BLOCK = CFG.TILE_O // TMA_O_ITERS_HOST
+if (
+    (CFG.TILE_O * CFG.BPE_O) % 128 != 0
+    or _O_SUBTILES_PER_CHUNK * N_O_CHUNKS != TMA_O_ITERS_HOST
+    or _O_SUBTILES_PER_CHUNK != 128 // CFG.O_SWZ_BYTES
+    or _O_CHUNK_ELEMS != _O_SUBTILES_PER_CHUNK * TMA_O_GRANU_ELEMS_HOST  # one chunk's columns == its subtiles' columns
+    or TOKENS_PER_TILE * HEADS_PER_TILE != CFG.TILE_M  # the packed (1, 2, 64, d) box's rows == the SMEM tile's rows
+    or CFG.TILE_M * _O_D_BLOCK != CFG.TILE_M * TMA_O_GRANU_ELEMS_HOST  # the epilogue's block stride == sO.tma_subtile_stride_elems
+    or TMA_O_GRANU_ELEMS_HOST * CFG.BPE_O != CFG.O_SWZ_BYTES  # one subtile row == one swizzle row == 128 B
+):
+    raise ValueError(
+        f"{__name__}: streamed O store needs whole 128 B chunks that tile the packed TMA-O subtiles; got TILE_O={CFG.TILE_O} "
+        f"BPE_O={CFG.BPE_O} O_SWZ_BYTES={CFG.O_SWZ_BYTES} TILE_M={CFG.TILE_M} box rows={TOKENS_PER_TILE * HEADS_PER_TILE} "
+        f"(N_O_CHUNKS={N_O_CHUNKS}, TMA_O_ITERS_HOST={TMA_O_ITERS_HOST}, granu={TMA_O_GRANU_ELEMS_HOST})"
+    )
 
 # ----------------------------------------------------------------------------
 # Gather geometry (delta 2).  One issue = 4 consecutive union rows x one 128-B box-row.
@@ -1517,43 +1569,136 @@ def _compute_warp_group(
             #   TMEM[384:512] = d_v[384:512]   (call 1, peer half)
             sO_base = sO[0].base
 
-            for b in cutlass.range_constexpr(CFG.TILE_O // O_EPI_BLOCK_SIZE):
-                b_intra = b & (O_BLOCKS_PER_SUB - 1)
-                b_sub = b // O_BLOCKS_PER_SUB
-                tmem_sub = ((b_sub & 1) << 1) | ((b_sub & 2) >> 1)
-                tmem_block = tmem_sub * O_BLOCKS_PER_SUB + b_intra
+            # Barrier rows this epilogue drives (SUM(issuing lanes) == init, both forms):
+            #   mb_tma_o_full[c]  init COMPUTE_LANES = 128 : the 4 compute warps x 32 lanes each issue ONE bare `.arrive()` per
+            #                     chunk per tile, after that chunk's last block store + fence_proxy, in chunk order -> 4 x 32 = 128.
+            #                     Consumer: the sg1 TMA-STG warp (per-chunk wait; issues the chunk's subtile store under
+            #                     O_STORE_STREAM).  The pipelined form moves the tcgen05.ld ISSUE only; each chunk's fence +
+            #                     arrive still follows the block that completes it, once per lane -> the count is unchanged.
+            #   mb_tma_o_empty    init ONE_WARP = 32 : the TMA-STG warp's 32 lanes, one bare `.arrive()` per tile after its
+            #                     tma_store_wait(0); waited above (`bars.mb_tma_o_empty.wait(epilogue_state)`).  Unchanged.
+            # Two epilogue forms, folded on O_EPI_PIPELINE (the module constant next to CFG): the same per-block body --
+            # `o_fp32 * beta` here, then o_epilogue_convert_store (select the dead-row zero -> pack -> swizzled store) -- in two
+            # ISSUE orders.  Blocks in OUTPUT order; the TMEM block index is bit-permuted (b_sub {0..3} -> {0,2,1,3}, see the
+            # layout above).  The parent's form, mechanically.
+            N_O_EPI_BLOCKS = CFG.TILE_O // O_EPI_BLOCK_SIZE  # 16 blocks of 32 fp32 columns at a half-precision O
+            O_EPI_LD_BATCH_FP32 = 64  # fp32 registers per lane per tcgen05.ld batch (2 batches live under the 1-ahead pipeline = 128)
+            O_EPI_BLOCKS_PER_BATCH = max(1, O_EPI_LD_BATCH_FP32 // O_EPI_BLOCK_SIZE)  # 2 (one 128-B chunk) at a half-precision O
+            if cutlass.const_expr(O_EPI_PIPELINE):
+                # Software-pipelined readout.  Iteration _g issues the tcgen05.ld batch of chunk _g and processes chunk
+                # _p = _g - 1; the wait that completes chunk _p is placed BEFORE chunk _g's loads are issued, so it never
+                # waits on the batch in flight.  A chunk is one batch at a half-precision O: the chunk arrive fires after the
+                # block that completes it, as in the classic form.
+                N_O_EPI_GROUPS = N_O_EPI_BLOCKS // O_EPI_BLOCKS_PER_BATCH
+                # Warp-uniform: does ANY lane of this warp hold a dead row?  When False, `select(_row_empty, 0, x)` is `x`
+                # for every lane of the warp, so the fast arm below is bit-identical to the select arm.
+                _o_epi_any_empty = vote_sync(0xFFFFFFFF, _row_empty, VoteSync.ANY)
+                _o_epi_loads = []  # trace-time bookkeeping only: _o_epi_loads[group] = the Vectors its tcgen05.ld batch returned
+                for _g in cutlass.range_constexpr(N_O_EPI_GROUPS + 1):
+                    _p = _g - 1
+                    if cutlass.const_expr(_p >= 0):
+                        # Completes group _p -- the ONLY batch outstanding (group _g is issued below, after this wait).
+                        nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
+                    if cutlass.const_expr(_g < N_O_EPI_GROUPS):
+                        # Issue group _g: the collective (.sync.aligned) TMEM loads stay unconditional, outside any branch.
+                        _o_epi_loads.append([])
+                        for _j in cutlass.range_constexpr(O_EPI_BLOCKS_PER_BATCH):
+                            _b = _g * O_EPI_BLOCKS_PER_BATCH + _j
+                            _b_intra = _b & (O_BLOCKS_PER_SUB - 1)
+                            _b_sub = _b // O_BLOCKS_PER_SUB
+                            _tmem_sub = ((_b_sub & 1) << 1) | ((_b_sub & 2) >> 1)
+                            _tmem_block = _tmem_sub * O_BLOCKS_PER_SUB + _b_intra
+                            o_addr = tmem_O_base + cutlass.Int32(_tmem_block * O_EPI_BLOCK_SIZE)
+                            _o_epi_loads[_g].append(
+                                nvvm.tcgen05_ld(
+                                    "32x32b",
+                                    nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                                    num=O_EPI_BLOCK_SIZE,
+                                )
+                            )
+                    if cutlass.const_expr(_p >= 0):
+                        # SMEM store targets of group _p -- TMA-O grain layout (O_D_BLOCK elements / chunk); address-only.
+                        _o_epi_smem = []
+                        for _j in cutlass.range_constexpr(O_EPI_BLOCKS_PER_BATCH):
+                            _b = _p * O_EPI_BLOCKS_PER_BATCH + _j
+                            col_offset_const = (_b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
+                            block_idx_const = (_b * O_EPI_BLOCK_SIZE) // O_D_BLOCK
+                            block_offset_const = block_idx_const * O_TMA_GRANU_ELEMS
+                            smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(O_D_BLOCK)
+                            _o_epi_smem.append(sO_base.subview(smem_offset).data_ptr())
+                        # SELECT the zero (never `* 0`: the residue can be a NaN bit pattern, and NaN * 0 is NaN) in the select
+                        # arm; the fast arm skips the per-element select only.  The arms hold ALU + STS only; the fence + arrive
+                        # below sit outside them, unconditional.
+                        if _o_epi_any_empty:
+                            for _j in cutlass.range_constexpr(O_EPI_BLOCKS_PER_BATCH):
+                                o_epilogue_convert_store(
+                                    _o_epi_loads[_p][_j] * beta,
+                                    _row_empty,
+                                    None,
+                                    _o_epi_smem[_j],
+                                    n=O_EPI_BLOCK_SIZE,
+                                    apply_select=True,
+                                    out_dtype=OUT_STORAGE_DTYPE,
+                                    swizzle=_O_EPI_SWIZZLE,
+                                )
+                        else:
+                            for _j in cutlass.range_constexpr(O_EPI_BLOCKS_PER_BATCH):
+                                o_epilogue_convert_store(
+                                    _o_epi_loads[_p][_j] * beta,
+                                    _row_empty,
+                                    None,
+                                    _o_epi_smem[_j],
+                                    n=O_EPI_BLOCK_SIZE,
+                                    apply_select=False,
+                                    out_dtype=OUT_STORAGE_DTYPE,
+                                    swizzle=_O_EPI_SWIZZLE,
+                                )
+                        # Per-128B-chunk arrive on TMA-STG -- after the block that completes the chunk, in chunk order, one
+                        # fence + one arrive per chunk per thread, exactly as the classic form below.
+                        for _j in cutlass.range_constexpr(O_EPI_BLOCKS_PER_BATCH):
+                            _b = _p * O_EPI_BLOCKS_PER_BATCH + _j
+                            if cutlass.const_expr(((_b + 1) * O_EPI_BLOCK_SIZE) % O_CHUNK_ELEMS == 0):
+                                chunk = (_b * O_EPI_BLOCK_SIZE) // O_CHUNK_ELEMS
+                                nvvm.fence_proxy("async.shared", space="cta")
+                                bars.mb_tma_o_full[chunk].arrive()
+            else:
+                for b in cutlass.range_constexpr(N_O_EPI_BLOCKS):
+                    b_intra = b & (O_BLOCKS_PER_SUB - 1)
+                    b_sub = b // O_BLOCKS_PER_SUB
+                    tmem_sub = ((b_sub & 1) << 1) | ((b_sub & 2) >> 1)
+                    tmem_block = tmem_sub * O_BLOCKS_PER_SUB + b_intra
 
-                o_addr = tmem_O_base + cutlass.Int32(tmem_block * O_EPI_BLOCK_SIZE)
-                o_fp32 = nvvm.tcgen05_ld(
-                    "32x32b",
-                    nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
-                    num=O_EPI_BLOCK_SIZE,
-                )
-                nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
-                o_scaled = o_fp32 * beta
-                # SELECT the zero (never `* 0`): the residue can be a NaN bit pattern, and NaN * 0 is NaN.
-                _o_elems = []
-                for _i in cutlass.range_constexpr(O_EPI_BLOCK_SIZE):
-                    _o_elems.append(cutlass.Float32(arith.select(_row_empty.ir_value(), cutlass.Float32(0.0).ir_value(), o_scaled[_i].ir_value())))
-                o_half = cutlass.Vector.from_elements(tuple(_o_elems), cutlass.Float32).to(OUT_STORAGE_DTYPE)
+                    o_addr = tmem_O_base + cutlass.Int32(tmem_block * O_EPI_BLOCK_SIZE)
+                    o_fp32 = nvvm.tcgen05_ld(
+                        "32x32b",
+                        nvvm.make_tmem_ptr(o_addr, cutlass.Float32),
+                        num=O_EPI_BLOCK_SIZE,
+                    )
+                    nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)
 
-                # SMEM store -- TMA-O grain layout (O_D_BLOCK elements / chunk).
-                col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
-                block_idx_const = (b * O_EPI_BLOCK_SIZE) // O_D_BLOCK
-                block_offset_const = block_idx_const * O_TMA_GRANU_ELEMS
-                smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(O_D_BLOCK)
-                smem_ptr = sO_base.subview(smem_offset).data_ptr()
-                smem_ptr.store_swizzled(
-                    o_half,
-                    alignment=64,
-                    swizzle=_O_EPI_SWIZZLE,
-                )
+                    # SMEM store target -- TMA-O grain layout (O_D_BLOCK elements / chunk).
+                    col_offset_const = (b * O_EPI_BLOCK_SIZE) % O_D_BLOCK
+                    block_idx_const = (b * O_EPI_BLOCK_SIZE) // O_D_BLOCK
+                    block_offset_const = block_idx_const * O_TMA_GRANU_ELEMS
+                    smem_offset = cutlass.Int32(block_offset_const + col_offset_const) + tid_in_wg * cutlass.Int32(O_D_BLOCK)
+                    smem_ptr = sO_base.subview(smem_offset).data_ptr()
+                    # SELECT the zero (never `* 0`): the residue can be a NaN bit pattern, and NaN * 0 is NaN.
+                    o_epilogue_convert_store(
+                        o_fp32 * beta,
+                        _row_empty,
+                        None,
+                        smem_ptr,
+                        n=O_EPI_BLOCK_SIZE,
+                        apply_select=True,
+                        out_dtype=OUT_STORAGE_DTYPE,
+                        swizzle=_O_EPI_SWIZZLE,
+                    )
 
-                # Per-128B-chunk arrive on TMA-STG.
-                if ((b + 1) * O_EPI_BLOCK_SIZE) % O_CHUNK_ELEMS == 0:
-                    chunk = (b * O_EPI_BLOCK_SIZE) // O_CHUNK_ELEMS
-                    nvvm.fence_proxy("async.shared", space="cta")
-                    bars.mb_tma_o_full[chunk].arrive()
+                    # Per-128B-chunk arrive on TMA-STG.
+                    if ((b + 1) * O_EPI_BLOCK_SIZE) % O_CHUNK_ELEMS == 0:
+                        chunk = (b * O_EPI_BLOCK_SIZE) // O_CHUNK_ELEMS
+                        nvvm.fence_proxy("async.shared", space="cta")
+                        bars.mb_tma_o_full[chunk].arrive()
 
             # Write LSE [B, 64, S] (natural log, sink included) -- one row per lane, padded tokens skipped.
             if cutlass.const_expr(lse_tensor is not None):
@@ -2100,7 +2245,7 @@ def _gather_warp_group(
 
 
 # ============================================================================
-# TMA-STG warp -- sg1 only: O TMA store (packed box); the parent's, one coord line changed.
+# TMA-STG warp -- sg1 only: O TMA store (packed box); the parent's O_STORE_STREAM loop, one coord line changed.
 # ============================================================================
 @cute.jit
 def _tmastg_warp_group(
@@ -2125,17 +2270,37 @@ def _tmastg_warp_group(
         if is_sg1:
             read_tile_id_arrive(sched.mb_read_tile_id.subview(sched_state.idx), CGA_SIZE)
 
-            # Wait every chunk of O ready.
+            # Barrier rows (SUM(issuing lanes) == init, both O_STORE_STREAM arms):
+            #   mb_tma_o_full[c]  init COMPUTE_LANES = 128 : produced by the 4 sg1 compute warps (32 lanes each, one bare
+            #                     arrive per chunk per tile after fence_proxy) -> 128; THIS warp waits it per chunk (default
+            #                     sleeping form, as the parent: a whole-chunk park, not a KV-ring wait).
+            #   mb_tma_o_empty    init ONE_WARP = 32 : THIS warp's 32 lanes, one bare `.arrive()` per tile after the bulk
+            #                     group's wait_group.read 0 below -> 32; consumed by the compute warps before the next tile's
+            #                     epilogue.  Identical in both arms: one commit, one wait, one arrive per tile.
+            # Both sg1 peers store their own 2 tokens x 64 heads through the packed box; rows past S are clipped by the
+            # descriptor's seq extent (a partial or fully-OOB box writes nothing there).  The compile-time descriptor needs
+            # no tensormap acquire (`tma_store_subtile` ignores `acquire` when the slice has no runtime desc_ptr).
+            q_row_coord = q_super_idx * cutlass.Int32(TOKENS_PER_TILE)
+            if cutlass.const_expr(O_STORE_STREAM):
+                # Streamed store: the GMEM slice is built ONCE per tile (pointer arithmetic only), then chunk c's subtile
+                # store(s) issue right behind mb_tma_o_full[c]: the compute group's fence_proxy + all-thread arrive published
+                # that 128 B column range of every row to the async proxy, so the store of subtile c streams behind the
+                # epilogue while the later chunks are still being written.
+                o_slice = tma_o(cutlass.Int32(0), head_idx * cutlass.Int32(HEADS_PER_TILE), q_row_coord, batch_idx)
             for chunk in cutlass.range_constexpr(N_O_CHUNKS):
                 bars.mb_tma_o_full[chunk].wait(o_full_phase)
-
-            # Both sg1 peers store their own 2 tokens x 64 heads through the packed box; rows past S are
-            # clipped by the descriptor's seq extent (a partial or fully-OOB box writes nothing there).
-            q_row_coord = q_super_idx * cutlass.Int32(TOKENS_PER_TILE)
-            tma_store_tile(
-                sO[0],
-                tma_o(cutlass.Int32(0), head_idx * cutlass.Int32(HEADS_PER_TILE), q_row_coord, batch_idx),
-            )
+                if cutlass.const_expr(O_STORE_STREAM):
+                    for j in cutlass.range_constexpr(_O_SUBTILES_PER_CHUNK):
+                        tma_store_subtile(sO[0], o_slice, chunk * _O_SUBTILES_PER_CHUNK + j)
+            if cutlass.const_expr(not O_STORE_STREAM):
+                # Whole-tile form (VERBATIM): after every chunk is ready, ONE whole-tile store.
+                tma_store_tile(
+                    sO[0],
+                    tma_o(cutlass.Int32(0), head_idx * cutlass.Int32(HEADS_PER_TILE), q_row_coord, batch_idx),
+                )
+            # ONE bulk group per tile: cp.async.bulk.commit_group batches every prior uncommitted bulk op of this thread
+            # (the N_O_CHUNKS streamed subtile stores, or the whole-tile store); wait_group.read 0 drains its SMEM reads
+            # BEFORE mb_tma_o_empty releases sO to the next tile's epilogue.
             tma_store_commit()
             tma_store_wait(0)
 
