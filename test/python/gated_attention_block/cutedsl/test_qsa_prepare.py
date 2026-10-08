@@ -14,6 +14,12 @@ commit prefixes, a finished sequence, a capacity overflow) and prefill shapes, e
 step binds, and the RoPE-only form.  The launch census (``torch.profiler``, CUPTI) measures the step's launches: five
 unfused, one fused.  Plain vectorized LDG / STG plus warp shuffles -- no tcgen05, no TMA -- so these cells run on whatever
 CUDA device is at hand.
+
+The block knob ``fuse_prepare`` (a performance knob: the same function): its declaration rows on the host, the stage list
+(one ``qsa_prepare`` stage in place of ``qk_norm_rope`` + ``cache_write``, the workspace carve unchanged) and, on Rubin,
+the block with the knob on BITWISE the block with it off -- ``out``, the LSE, the pools, the raw-key pool -- on the dense
+block and on the block-sparse band block at a decode shape and a prefill shape, with the block's launch census one (two
+with the band) shorter.
 """
 
 import os
@@ -28,6 +34,8 @@ requirement_error = cutedsl_requirement_error("Gated attention block tests")
 if requirement_error:
     pytest.skip(requirement_error, allow_module_level=True)
 
+from cudnn.gated_attention_block import GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, index_k_raw_view  # noqa: E402
+from cudnn.gated_attention_block.api import _cols, _QsaPrepare, _view  # noqa: E402
 from cudnn.gated_attention_block.kernels.cache_write import compile_cache_write, run_cache_write  # noqa: E402
 from cudnn.gated_attention_block.kernels.qk_norm_rope import compile_qk_norm_rope, run_qk_norm_rope  # noqa: E402
 from cudnn.gated_attention_block.kernels.qsa_compress import (
@@ -48,11 +56,15 @@ from cudnn.gated_attention_block.kernels.qsa_prepare import (  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_qsa_reference import full_block_ids  # noqa: E402
+from gated_block_reference import RefGeometry, make_inputs  # noqa: E402
 
 pytestmark = pytest.mark.L0
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 
+_DEV = "cuda" if torch.cuda.is_available() else "cpu"
 BF16, F16 = torch.bfloat16, torch.float16
 _EPS = 1e-6
 _POOL = 4
@@ -63,6 +75,8 @@ _GEOM_FN = dict(h_q=24, h_kv=2, d=256, rope=64)
 _GEOM_SMALL = dict(h_q=8, h_kv=2, d=256, rope=64)
 _GEOM_D128 = dict(h_q=4, h_kv=2, d=128, rope=64)
 _INDEX = dict(heads=4, head_dim=128)
+_SMALL_D256 = dict(d_model=512, h_q=8, h_kv=2, d_head=256, rope_dim=64)
+_FLASH_NEXT = dict(d_model=2560, h_q=24, h_kv=2, d_head=256, rope_dim=64)
 
 
 def _bits(x: torch.Tensor) -> torch.Tensor:
@@ -602,3 +616,154 @@ def test_decode_step_launch_census_five_unfused_one_fused(rows):
     assert len(fused) == 1 and "frost_qsa_prepare" in fused[0]
     assert len(unfused) == 5
     ch.assert_bitwise(f"census B=4 rows={rows}")
+
+
+# ---------------------------------------------------------------------------
+# The block knob fuse_prepare: declaration rows and the stage list (host), bitwise vs the unfused block (Rubin)
+# ---------------------------------------------------------------------------
+
+
+def _make_block(geom_kw, batch, seq_len, dtype=BF16, qsa=None, **blk_kw):
+    geom = GatedAttentionBlockGeometry(**geom_kw, qsa=qsa)
+    inp = make_inputs(RefGeometry(**geom_kw), batch=batch, seq_len=seq_len, dtype=dtype, device=_DEV)
+    if qsa is not None and qsa.index_band:
+        # The band's columns of W_qkvg: the reference inputs carry the dense four bands; append the indexer band's rows.
+        gen = torch.Generator(device=_DEV).manual_seed(99)
+        extra = (torch.randn(qsa.index_band_cols, geom_kw["d_model"], generator=gen, device=_DEV, dtype=torch.float32) * 0.02).to(dtype)
+        inp["w_qkvg"] = torch.cat([inp["w_qkvg"], extra], 0).contiguous()
+    out = torch.empty(batch, seq_len, geom.d_model, device=_DEV, dtype=dtype)
+    blk = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom, **blk_kw)
+    return blk, inp, out
+
+
+def test_fuse_prepare_declaration_rows():
+    """The knob's rows, typed and naming the knob: a non-bool, no write-through to fold, together with ``fuse_norm_rope``,
+    the out-of-place layout; and the knob accepted on the in-place bf16 block with the attribute."""
+    with pytest.raises(TypeError, match="fuse_prepare must be a bool"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=1)
+    with pytest.raises(ValueError, match="needs paged_kv_page_size > 0"):
+        _make_block(_SMALL_D256, 1, 64, fuse_prepare=True)
+    with pytest.raises(NotImplementedError, match="fuse_norm_rope=True"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, fuse_norm_rope=True)
+    with pytest.raises(ValueError, match="inplace_qkv=False"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, inplace_qkv=False)
+    with pytest.raises(NotImplementedError, match="paged_kv_page_size with save_for_backward"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, save_for_backward=True)
+    blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True)
+    assert blk.fuse_prepare and blk.paged_kv_page_size == 16 and isinstance(blk._prepare, _QsaPrepare)
+    plain, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
+    assert not plain.fuse_prepare and plain._prepare is None
+
+
+@pytest.mark.parametrize("band", [False, True], ids=["dense", "qsa_band"])
+def test_fuse_prepare_builds_one_stage_in_place_of_two_and_keeps_the_carve(band):
+    """With the knob the stage list carries ``qsa_prepare`` in the norm + RoPE slot and neither ``qk_norm_rope`` nor
+    ``cache_write``; without it both; the workspace carve is identical (the stage reserves nothing); the fused stage's
+    byte count is the two stages' minus nothing but the second read of K."""
+    qsa = QsaSpec(index_band=True) if band else None
+    kw = dict(qsa=qsa, paged_kv_page_size=16)
+    off, *_ = _make_block(_SMALL_D256, 2, 128, **kw)
+    on, *_ = _make_block(_SMALL_D256, 2, 128, fuse_prepare=True, **kw)
+    names_off, names_on = [st.name for st in off._stages], [st.name for st in on._stages]
+    assert "qk_norm_rope" in names_off and "cache_write" in names_off and "qsa_prepare" not in names_off
+    assert "qsa_prepare" in names_on and "qk_norm_rope" not in names_on and "cache_write" not in names_on
+    assert names_on.index("qsa_prepare") == names_off.index("qk_norm_rope") and len(names_on) == len(names_off) - 1
+    assert off._layout() == on._layout()
+    assert on._prepare.index_band == band
+    assert not hasattr(on._prepare, "workspace_bytes") and not hasattr(on._prepare, "scratch_workspace_bytes")
+    t = 2 * 128
+    k_read_once = t * 2 * 256 * 2  # the unfused chain reads the K band twice (norm + RoPE, then the cache write); the fused launch once
+    slot_read_once = t * 4 if band else 0  # and the band's second cache-write launch reads the slot mapping again
+    assert on._prepare.moved_bytes() == off._norm_rope.moved_bytes() + off._cache_write.moved_bytes() - k_read_once - slot_read_once
+
+
+def _run_block_pair(geom_kw, batch, seq_len, *, qsa=None, slot_dtype=torch.int32, pad_every=0, seed=7):
+    """The block with ``fuse_prepare`` and the same declaration without, on the same inputs and the same pools' geometry;
+    returns ``(on, off)`` dicts of ``blk / out / lse / pools / slot / ws``."""
+    runs = {}
+    for knob in (True, False):
+        blk, inp, out = _make_block(geom_kw, batch, seq_len, qsa=qsa, paged_kv_page_size=_PAGE, return_lse=True, fuse_prepare=knob)
+        blk.check_support()
+        blk.compile()
+        g, t = blk.geom, batch * seq_len
+        ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
+        gen = torch.Generator(device="cuda").manual_seed(seed)
+        n_pages = t // _PAGE + 3
+        slot = torch.randperm(n_pages * _PAGE, generator=gen, device="cuda")[:t].to(slot_dtype)
+        if pad_every:
+            slot[::pad_every] = -1
+        k_cache = torch.full((n_pages, g.h_kv, _PAGE, g.d_head), float("nan"), device="cuda", dtype=BF16)
+        v_cache = torch.full((n_pages, _PAGE, g.h_kv, g.d_head), float("nan"), device="cuda", dtype=BF16).permute(0, 2, 1, 3)  # NHD by strides
+        index_cache = torch.full((n_pages, _PAGE, g.qsa.index_head_dim), float("nan"), device="cuda", dtype=BF16) if g.index_band else None
+        lse = torch.full((batch, g.h_q, seq_len), float("nan"), device="cuda", dtype=torch.float32)
+        out.fill_(float("nan"))
+        kw = dict(k_cache=k_cache, v_cache=v_cache, slot_mapping=slot, lse=lse)
+        if g.index_band:
+            kw["index_k_raw"] = index_cache
+        if qsa is not None:
+            pos = torch.arange(seq_len, device="cuda").repeat(batch)
+            ids, lens = full_block_ids(pos, qsa.top_k, qsa.block_size)
+            kw.update(block_ids=ids.contiguous(), block_lens=lens.contiguous())
+
+        def run(blk=blk, inp=inp, out=out, ws=ws, kw=kw):
+            blk.execute(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws, **kw)
+
+        run()
+        torch.cuda.synchronize()
+        runs[knob] = dict(blk=blk, out=out, lse=lse, k_cache=k_cache, v_cache=v_cache, index_cache=index_cache, slot=slot, ws=ws, run=run, inp=inp)
+    return runs[True], runs[False]
+
+
+def _assert_block_pair_bitwise(on, off, label):
+    assert torch.isfinite(on["out"].float()).all(), f"{label}: non-finite out"
+    assert _same(on["out"], off["out"]), f"{label}: fuse_prepare changed out"
+    assert torch.equal(on["lse"], off["lse"]), f"{label}: fuse_prepare changed the LSE"
+    assert _same(on["k_cache"].contiguous(), off["k_cache"].contiguous()) and _same(
+        on["v_cache"].contiguous(), off["v_cache"].contiguous()
+    ), f"{label}: pools differ"
+    if on["index_cache"] is not None:
+        assert _same(on["index_cache"], off["index_cache"]), f"{label}: the raw-key pool differs"
+    assert on["blk"].get_workspace_size() == off["blk"].get_workspace_size()
+    g, blk = on["blk"].geom, on["blk"]
+    t = blk.batch * blk.seq_len
+    proj = _view(on["ws"], blk._layout().proj, (t, g.n_qkvg), BF16)
+    live = on["slot"] >= 0
+    s_ = on["slot"][live].long()
+    k_rows = _cols(proj, g.qkvg_offsets[2], g.h_kv, g.d_head)[live]
+    assert _same(on["k_cache"][s_ // _PAGE, :, s_ % _PAGE, :], k_rows), f"{label}: the K pool is not the post-RoPE K band attention consumed"
+    if g.index_band:
+        raw = index_k_raw_view(proj, g, blk.batch, blk.seq_len).reshape(t, -1)[live]
+        assert _same(on["index_cache"][s_ // _PAGE, s_ % _PAGE, :], raw)
+    print(f"{label}: out / LSE / pools bitwise; {int(live.sum())} / {t} live slots")
+
+
+def _assert_block_census(on, off, label, expect_fewer):
+    names = _launch_names(on["run"], off["run"])
+    if names is None:
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable); the bitwise cells stand")
+    n_on, n_off = len(names[0]), len(names[1])
+    print(f"{label}: block launches fuse_prepare on {n_on} / off {n_off}: {[n.split('_tensorptr')[0] for n in names[0]]}")
+    assert n_off - n_on == expect_fewer, f"{label}: expected {expect_fewer} launches fewer, got {n_off} -> {n_on}"
+    assert sum("frost_qsa_prepare" in n for n in names[0]) == 1 and not any("frost_qk_norm_rope" in n or "frost_cache_write" in n for n in names[0])
+
+
+@requires_rubin
+def test_dense_block_with_fuse_prepare_is_bitwise_the_two_stage_block():
+    """The dense 8/2 d256 block with write-through, B=2 x S=256: the knob on vs off -- ``out``, the LSE and the pools
+    bitwise, the K pool the post-RoPE K band; the block's census one launch shorter (the two stages became one)."""
+    on, off = _run_block_pair(_SMALL_D256, 2, 256, slot_dtype=torch.int64, pad_every=9)
+    _assert_block_pair_bitwise(on, off, "dense 8/2 B=2 S=256")
+    _assert_block_census(on, off, "dense 8/2 B=2 S=256", expect_fewer=1)
+
+
+@requires_rubin
+@pytest.mark.parametrize("batch, seq_len", [(4, 4), (1, 512)], ids=["decode_shape_b4_s4", "prefill_b1_s512"])
+def test_qsa_band_block_with_fuse_prepare_is_bitwise_the_two_stage_block(batch, seq_len):
+    """The block-sparse model's TP-1 geometry with the indexer band and write-through (the full list = the identity
+    below the bound), at the decode shape (4 sequences x 4 rows: one block completing per sequence) and a prefill shape:
+    ``out`` / LSE / the K, V and raw-key pools bitwise with the knob on; the census TWO launches shorter (norm + RoPE, the
+    K / V write and the raw-key write became one launch)."""
+    qsa = QsaSpec(index_band=True)
+    on, off = _run_block_pair(_FLASH_NEXT, batch, seq_len, qsa=qsa, pad_every=13)
+    _assert_block_pair_bitwise(on, off, f"fn24-2 band B={batch} S={seq_len}")
+    _assert_block_census(on, off, f"fn24-2 band B={batch} S={seq_len}", expect_fewer=2)
