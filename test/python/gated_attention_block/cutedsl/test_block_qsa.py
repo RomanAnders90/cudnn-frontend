@@ -4,10 +4,11 @@
 """``QsaSpec`` -- the block-sparse attention declaration of the gated attention block -- and the fifth (indexer) band.
 
 Host cells (CPU arithmetic, the declaration-time declines on any GPU, the index-tensor form checks under
-``torch.cuda.set_sync_debug_mode("error")``) plus ONE Rubin cell: the unfused projection serving the 13952-column slab at the
-24-query-head / 2-KV-head geometry, its indexer band checked against the fp64 matmul and the raw indexer key read back as a
-zero-copy view.  The sparse SDPA stage itself is a typed decline until the sparse core lands; its accept matrix is that
-change's.
+``torch.cuda.set_sync_debug_mode("error")``, the block's declines read off the sparse adapter's capabilities record and the
+adapter's own accept / decline set equal to that record, the CuTe DSL floor declining through the block BEFORE any kernel
+import) plus ONE Rubin cell: the unfused projection serving the 13952-column slab at the 24-query-head / 2-KV-head geometry,
+its indexer band checked against the fp64 matmul and the raw indexer key read back as a zero-copy view.  The sparse SDPA stage
+end to end -- the block against the QSA oracle, the accept matrix, the degenerate rows -- is ``test_block_qsa_end_to_end.py``.
 """
 
 import contextlib
@@ -336,10 +337,11 @@ def test_declaration_declines_every_sparse_request_it_cannot_serve(geom_kw, qsa,
             assert "QsaSpec" not in str(e)
 
 
-def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_check_support():
-    """The accept half of the contract today: the block CONSTRUCTS with the sparse stage in stage (4)'s slot, every
-    stage ahead of it accepts the five-band geometry, and the sparse stage is the typed decline (the core has not
-    landed) -- on every device, with no host sync."""
+def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_reads_off_the_record():
+    """The block CONSTRUCTS with the sparse stage in stage (4)'s slot (the five-band geometry accepted by every stage ahead
+    of it), with no host sync; ``check_support`` then asks the sparse ADAPTER, whose record names the arch range -- so off
+    Rubin the decline is the adapter's typed one naming the found cc (the block keeps no ``(10, 7)`` literal of its own for
+    the sparse path), and on Rubin the block is supported (the end-to-end module runs it)."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
     kw = _samples(geom)
     with _no_host_sync():
@@ -349,9 +351,14 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_declines_at_chec
         assert blk._sdpa.token_stride == geom.n_qkvg == 5760  # the slab's stride, like the dense stage would read it
         blk._check_declaration()  # the five-band W_qkvg [5760, 512] and every descriptor pass
         if torch.cuda.is_available():
-            with pytest.raises(NotImplementedError, match="sparse attention core"):
-                blk.check_support()
-            assert not blk._is_supported
+            cc = tuple(torch.cuda.get_device_capability())
+            if cc != (10, 7):
+                with pytest.raises(NotImplementedError, match=rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}"):
+                    blk.check_support()
+                assert not blk._is_supported
+                assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None  # declined before any kernel module was loaded
+            else:
+                assert blk.check_support() and blk._is_supported
     # The fused projection fork's own decline is geometry-first (reads the same on every device).
     with pytest.raises(NotImplementedError, match="256-column tiles"):
         _FusedQkvProjection(geom, batch=1, seq_len=8, dtype=torch.bfloat16, want_rstd=False).check_support()
@@ -384,6 +391,178 @@ def test_index_k_raw_locates_the_slab_inside_the_workspace():
     )
     with pytest.raises(ValueError, match="declares no indexer band"):
         dense.index_k_raw(ws)
+
+
+# ---------------------------------------------------------------------------
+# The block's declines, the adapter's declines and the record are ONE fact (any device, no GPU needed)
+# ---------------------------------------------------------------------------
+
+
+def _record():
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SPARSE_CAPABILITIES
+
+    return SPARSE_CAPABILITIES
+
+
+def test_the_api_constants_and_the_block_declines_read_the_sparse_record():
+    """The block transcribes NOTHING of the sparse core's claims: the API's list constants agree with the record (a drift
+    is a test failure, not a silent narrowing); the dtype / head-dim / GQA / block-size / top_k declines come from the
+    record's fields (a request at each bound is served iff the record says so); the THD / gate / bottom-right declines name
+    the record's state; and ``_SparseSdpa`` reads the same record object the adapter enforces."""
+    from cudnn.gated_attention_block.api import _check_qsa_geometry_against_record, _sparse_record, _sparse_record_torch_dtypes
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    rec = _record()
+    assert _sparse_record() is rec and _SparseSdpa._record() is rec and SparseGqaFwdDslSm107.claims() is rec
+    assert QSA_TOP_K_MAX == rec.index_top_k_max and QSA_TOP_K_ALIGN == rec.index_top_k_min and QSA_BLOCK_SIZE in rec.index_block_sizes
+    assert set(_sparse_record_torch_dtypes(rec)) == {torch.bfloat16, torch.float16}
+    assert (256, 256) in rec.d_shapes and rec.index_gqa_group_max == 16 and rec.index_gqa_group_min == 1
+    # Every dtype of the record is served, every other activation dtype declined naming the served set.
+    for dt in _sparse_record_torch_dtypes(rec):
+        _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), dt)
+    with pytest.raises(NotImplementedError, match="bf16 / f16"):
+        _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()), torch.float32)
+    # The GQA bound is the record's: served AT the bound, declined one past it.
+    at = GatedAttentionBlockGeometry(**{**_SMALL_D256, "h_q": 2 * rec.index_gqa_group_max, "h_kv": 2}, qsa=QsaSpec())
+    _check_qsa_geometry_against_record(at, torch.bfloat16)
+    past = GatedAttentionBlockGeometry(**{**_SMALL_D256, "h_q": 2 * (rec.index_gqa_group_max + 1), "h_kv": 2}, qsa=QsaSpec())
+    with pytest.raises(NotImplementedError, match=rf"h_q // h_kv <= {rec.index_gqa_group_max}"):
+        _check_qsa_geometry_against_record(past, torch.bfloat16)
+    # The head dim is the record's d_shapes.
+    with pytest.raises(NotImplementedError, match="d_head == 256"):
+        _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**{**_SMALL_D256, "d_head": 128}, qsa=QsaSpec()), torch.bfloat16)
+    # top_k: every multiple of 4 in the record's range is served; the API's validator and the record agree on the bounds.
+    for top_k in (rec.index_top_k_min, 64, rec.index_top_k_max):
+        _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(top_k=top_k)), torch.bfloat16)
+    # The three arm declines of the declaration name the record's state (today: declined by the record).
+    kw = _samples(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()))
+    for blk_kw, geom_kw, field in (
+        (dict(thd=True, num_sequences=1, max_seq_len=8), {}, "thd"),
+        (dict(fuse_gate=True), {}, "epilogue_gate"),
+        ({}, dict(causal_bottom_right=True), "bottom_right"),
+    ):
+        geom = GatedAttentionBlockGeometry(**{**_SMALL_D256, **geom_kw}, qsa=QsaSpec())
+        with pytest.raises(NotImplementedError) as e:
+            GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
+        assert ("the sparse adapter's record declines" in str(e.value)) == (not getattr(rec, field)), (field, str(e.value))
+    del kw
+
+
+def _adapter_request(**over):
+    """A served request through the adapter with storage-free operands at the 24/2 geometry (B=1, S=64), the Rubin cc
+    given explicitly; ``over`` overrides the constructor arguments."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, SparseOperandDesc
+
+    B, S, H, KH, D, top_k = 1, 64, 24, 2, 256, 512
+    half = torch.bfloat16
+    kw = dict(
+        q=SparseOperandDesc((B, S, H, D), (S * H * D, H * D, D, 1), half),
+        k=SparseOperandDesc((B, S, KH, D), (S * KH * D, KH * D, D, 1), half),
+        v=SparseOperandDesc((B, S, KH, D), (S * KH * D, KH * D, D, 1), half),
+        o=SparseOperandDesc((B, S, H, D), (S * H * D, H * D, D, 1), half),
+        lse=SparseOperandDesc((B, H, S), (H * S, S, 1), torch.float32),
+        block_ids=SparseOperandDesc((B * S, top_k), (top_k, 1), torch.int32),
+        block_lens=SparseOperandDesc((B * S,), (1,), torch.int32),
+        top_k=top_k,
+        device_cc=(10, 7),
+    )
+    kw.update(over)
+    return SparseGqaFwdDslSm107(**kw)
+
+
+def test_adapter_accept_decline_set_equals_the_record():
+    """The record-driven consistency check (Form A): for EVERY arm field of the record, a request that asks for the arm is
+    accepted by the adapter's ``check_support`` iff the record claims it -- today every arm is False and every request a
+    typed decline naming the arm; the served baseline (dense BSHD bf16 / f16, d 256, caller lists, per-batch KV lengths)
+    passes on any host with the public ``sm_107a`` DSL (the cc is handed in, nothing is launched)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
+
+    rec = _record()
+    assert _adapter_request().check_support()  # the served baseline, bf16
+    f16 = {nm: SparseOperandDesc((1, 64, h, 256), (64 * h * 256, h * 256, 256, 1), torch.float16) for nm, h in (("q", 24), ("k", 2), ("v", 2), ("o", 24))}
+    assert _adapter_request(**f16).check_support()  # ... and f16: every member of the record's dtypes
+    arms = {
+        "thd": dict(thd=True),
+        "paged_kv": dict(paged_kv=True),
+        "epilogue_gate": dict(epilogue_gate=object()),
+        "split_kv": dict(split_kv=2),
+        "bottom_right": dict(bottom_right=True),
+        "sink": dict(sink=object()),
+        "swa": dict(window_left=64),
+        "padded": dict(seq_q_lens=SparseOperandDesc((1,), (1,), torch.int32)),
+        "stats_log2": dict(stats_log2=True),
+    }
+    for field, over in arms.items():
+        claimed = getattr(rec, field)
+        req = _adapter_request(**over)
+        if claimed:
+            assert req.check_support(), field
+        else:
+            with pytest.raises(NotImplementedError, match="not served by the kernel body yet"):
+                req.check_support()
+    # the record's numeric bounds: served at the bound, declined past it
+    assert _adapter_request(
+        q=SparseOperandDesc((1, 64, 32, 256), (64 * 32 * 256, 32 * 256, 256, 1), torch.bfloat16),
+        o=SparseOperandDesc((1, 64, 32, 256), (64 * 32 * 256, 32 * 256, 256, 1), torch.bfloat16),
+        lse=SparseOperandDesc((1, 32, 64), (32 * 64, 64, 1), torch.float32),
+    ).check_support()
+    with pytest.raises(NotImplementedError, match=rf"\[1, {rec.index_gqa_group_max}\]"):
+        _adapter_request(
+            q=SparseOperandDesc((1, 64, 34, 256), (64 * 34 * 256, 34 * 256, 256, 1), torch.bfloat16),
+            o=SparseOperandDesc((1, 64, 34, 256), (64 * 34 * 256, 34 * 256, 256, 1), torch.bfloat16),
+            lse=SparseOperandDesc((1, 34, 64), (34 * 64, 64, 1), torch.float32),
+        ).check_support()
+    with pytest.raises(NotImplementedError, match=rf"\[{rec.index_top_k_min}, {rec.index_top_k_max}\]"):
+        _adapter_request(
+            top_k=rec.index_top_k_max + 4, block_ids=SparseOperandDesc((64, rec.index_top_k_max + 4), (rec.index_top_k_max + 4, 1), torch.int32)
+        ).check_support()
+    with pytest.raises(NotImplementedError, match="bf16 or f16"):
+        _adapter_request(q=SparseOperandDesc((1, 64, 24, 256), (64 * 24 * 256, 24 * 256, 256, 1), torch.float32)).check_support()
+    with pytest.raises(NotImplementedError, match="exactly"):
+        _adapter_request(
+            q=SparseOperandDesc((1, 64, 24, 128), (64 * 24 * 128, 24 * 128, 128, 1), torch.bfloat16),
+            k=SparseOperandDesc((1, 64, 2, 128), (64 * 2 * 128, 2 * 128, 128, 1), torch.bfloat16),
+            v=SparseOperandDesc((1, 64, 2, 128), (64 * 2 * 128, 2 * 128, 128, 1), torch.bfloat16),
+            o=SparseOperandDesc((1, 64, 24, 128), (64 * 24 * 128, 24 * 128, 128, 1), torch.bfloat16),
+        ).check_support()
+    # the arch range off the record
+    with pytest.raises(NotImplementedError, match="got cc 10.0"):
+        _adapter_request(device_cc=(10, 0)).check_support()
+    # a descriptor-declared adapter refuses to launch without the tensors (never a dereference of nothing)
+    req = _adapter_request()
+    req.check_support()
+    with pytest.raises(ValueError, match="SparseOperandDesc"):
+        req._bind("q", None, req.q, required=True)
+    with pytest.raises(ValueError, match="must match its declaration"):
+        req._bind("q", SparseOperandDesc((1, 64, 24, 256), (64 * 24 * 256 * 2, 24 * 256, 256, 1), torch.bfloat16), req.q, required=True)
+    with pytest.raises(ValueError, match="was not declared"):
+        req._bind("seq_kv_lens", SparseOperandDesc((1,), (1,), torch.int32), None, required=False)
+
+
+def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monkeypatch):
+    """AGENTS.md Rule 7 through the BLOCK: a too-old DSL is a typed version decline from the sparse stage's ``check_support``
+    (the adapter's first check), raised before the kernel module is loaded -- never a ``KeyError('sm_107a')`` from inside the
+    DSL.  Both halves: the library floor (the installed version substituted below 4.7.0) and the ``sm_107a`` target (a DSL
+    without it on a cc 10.7 device, the device capability substituted so the probe runs on any GPU).  No launch, no GPU work."""
+    import re
+
+    import cudnn.frost.buffers as buffers
+
+    if not torch.cuda.is_available():
+        pytest.skip("the block's check_support reads the device capability")
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
+        blk.check_support()
+    assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None, "the kernel module must not be loaded below the floor"
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a, **k: (10, 7))
+    blk2 = GatedAttentionBlockFwd(**_samples(geom), geometry=geom)
+    with pytest.raises(NotImplementedError, match="sm_107a"):
+        blk2.check_support()
+    assert blk2._sdpa._impl._module is None
 
 
 # ---------------------------------------------------------------------------
@@ -483,8 +662,8 @@ def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
 @requires_rubin
 def test_unfused_projection_serves_the_indexer_band_at_flash_next():
     """Stage (1) at N = 13952 (the four dense bands + the 640-column indexer band) through the block's own stage objects,
-    into the block's own slab slot of a workspace -- the block itself declines at its sparse stage, AFTER the projection
-    and norm + RoPE accepted the five-band geometry.  The band equals ``h @ W_i^T`` to the GEMM suite's bf16 bar (one
+    into the block's own slab slot of a workspace (the whole block, sparse stage included, is supported on Rubin; the
+    end-to-end module runs it).  The band equals ``h @ W_i^T`` to the GEMM suite's bf16 bar (one
     rounding of the fp32 accumulation), the four dense bands equal the four-band projection's, norm + RoPE leaves the band
     untouched, and the raw indexer key reads back as a zero-copy view at the right offset."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -508,8 +687,7 @@ def test_unfused_projection_serves_the_indexer_band_at_flash_next():
 
     blk = GatedAttentionBlockFwd(h, w_qkvg, wn, wn, cos, sin, w_o, out, geom)
     assert isinstance(blk._sdpa, _SparseSdpa)
-    with pytest.raises(NotImplementedError, match="sparse attention core"):
-        blk.check_support()  # the declaration, the projection and norm + RoPE accepted; the sparse stage is the decline
+    assert blk.check_support()  # the declaration, the projection (with the band), norm + RoPE and the sparse stage all accept on Rubin
     blk4 = GatedAttentionBlockFwd(h, w_dense, wn, wn, cos, sin, w_o, out, dense)
 
     def project(block, weight):

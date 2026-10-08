@@ -184,7 +184,7 @@ different function; the indexer and the sparse core are not part of the block to
     `sf_blob_bytes(d_model, H_q * D, block)` bytes in F8_128x4 order (padded to whole 128-row x 4-block atoms; pad
     bytes, if any, `0x00`).
 
-### Sparse attention (QSA) -- declaration, layout and loader; the sparse core is a typed decline
+### Sparse attention (QSA) -- declaration, layout, loader and the sparse attention core
 
 `QsaSpec` (frozen dataclass; attached as `GatedAttentionBlockGeometry(qsa=...)`; `validate()` raises `ValueError`) declares
 block-sparse attention: every query attends to the keys of its SELECTED 4-token blocks and to the open tail block of its visible
@@ -218,13 +218,30 @@ Served today:
   selected complete blocks (block `b` = tokens `[4b, 4b + 4)` of its own sequence), the valid prefix then `-1`; `block_lens` `[T]`
   int32 optional. Checked for form only (dtype, rank, shape, contiguity, device -- never read on the host; an int64 list is
   refused, not converted); refused on a block declared without `qsa`.
+- the sparse attention core: stage (4) of a block declared with `qsa` is the index-list sparse d256 forward (the Rubin kernel
+  behind the standalone adapter `cudnn.sdpa.fwd.sparse_gqa_sm107`), at the same operands and strides as the dense stage --
+  the slab's Q / K / V column slices in place, or the compact buffers with `inplace_qkv=False` -- and the same launch count;
+  `get_workspace_size()` is the dense block's (the core needs no scratch). What a query attends to, on device: the keys of
+  its listed complete blocks that lie inside its causal range, plus the open tail block of its visible range (always), under
+  the per-batch `seq_lens` when given. The list's count per query is `min(top_k, floor((pos + 1) / 4))`, clamped by
+  `block_lens[t]` when given; a `-1` at an index below the count contributes no key (a masked block -- its bytes are still
+  fetched, so short lists should pass `block_lens`); entries at or beyond the count are never read. A row with no visible
+  key (`seq_lens[b] == 0`) is `out = 0`, `LSE = -inf` exactly. With the full list -- every complete block, which fits up to
+  `identity_bound` visible tokens -- the block computes dense causal attention: the same function within the suite's
+  budget, summed in another order (not bitwise). Served: bf16 / f16, `d_head == 256`, `h_q // h_kv <= 16`, dense
+  `[B, S, d_model]` with or without `seq_lens`, `return_lse` on or off, `fuse_norm_rope` (without the band), `inplace_qkv`
+  on or off, the indexer band on the unfused projection, `paged_kv_page_size` write-through; validated on Rubin (SM107) at
+  the 24/2, 12/1, 6/1 and 32/2 geometries against the fp32 QSA oracle.
 
-A typed decline today -- the sparse attention core has not landed: a block declared with `qsa` declines at `check_support`
-after its projection (with the band) and norm + RoPE stages accepted the geometry; and at declaration, naming the feature:
+Every claim of the sparse core -- the dtypes, the head dim, the block size, the `top_k` range, the GQA group, the arms it does
+not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.sparse_gqa_sm107.SPARSE_CAPABILITIES`), which the
+adapter's own `check_support` enforces; the block transcribes none of it. Typed declines at declaration, naming the feature:
 `thd`, `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
-`fuse_gate`, `fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole
-number of them -- the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`,
-`index_source="indexer"`, `d_head != 256`.
+`fuse_gate` (the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch), `fuse_norm_rope` together with
+`index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them -- the unfused projection serves
+the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `index_source="indexer"`, `d_head != 256`; and at
+`check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0 wheel), named with the installed version,
+before the kernel module is imported.
 
 ### Serving: write-through into a paged KV cache (`paged_kv_page_size`)
 
@@ -751,8 +768,10 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
-- Block-sparse attention (`QsaSpec`): the declaration, the layout, the loader and the indexer band on the UNFUSED projection
-  are served; the sparse SDPA stage is a typed decline until the sparse core lands ("Sparse attention (QSA)" above).
+- Block-sparse attention (`QsaSpec`): bf16 / f16 inference, dense `[B, S, d_model]` (with or without `seq_lens`), `d_head == 256`,
+  `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`); the indexer band on the UNFUSED
+  projection; `thd`, `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band, `causal_bottom_right`
+  and `index_source="indexer"` are typed declines ("Sparse attention (QSA)" above).
 - Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
   only; the pools are the activation dtype; `quant`, `save_for_backward` and `thd` together with it are typed declines;
   the paged-READ mode (`block_table` / `kv_lens`) is a typed decline ("Serving: write-through into a paged KV cache" above).

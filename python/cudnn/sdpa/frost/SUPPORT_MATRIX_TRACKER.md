@@ -1893,7 +1893,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
-| Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), THD, paged pools, the fused epilogue gate, split-KV, bottom-right, a sink, a band, Q-length trimming, log2 stats, the decode form | SM107 — the standalone `sparse_gqa_sm107` adapter serves dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths; every other arm is a typed decline by name (see the SM107 index-list section below) |
+| Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), THD, paged pools, the fused epilogue gate, split-KV, bottom-right, a sink, a band, Q-length trimming, log2 stats, the decode form | SM107 — frontend-only: the gated attention block's sparse stage (`GatedAttentionBlockGeometry(qsa=QsaSpec(...))`, `execute(block_ids=, block_lens=)`) and the standalone `sparse_gqa_sm107` adapter serve dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths; every other arm is a typed decline by name (see the SM107 index-list section below) |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2100,11 +2100,15 @@ use the same declared envelope; other requests retain their existing policy.
 
 ### SM107 d256 index-list sparse forward
 
-Frontend-only (the standalone adapter `python/cudnn/sdpa/fwd/sparse_gqa_sm107.py` and the gated attention block's sparse
-stage), no graph form: no `sdpa` node carries a block-index list, so there is NO engine row and NO manifest slot — an
-`EngineSpec` whose `lower` cannot run would break the engine contract.  The kernel's claims live in the adapter's frozen
-`SparseCapabilities` record, spelled in the `Capabilities` vocabulary where a field exists, and its `check_support` is the
-enforcement point (the CuTe DSL `sm_107a` gate first, then every field as a typed decline).
+Frontend-only (the gated attention block's sparse stage — `GatedAttentionBlockGeometry(qsa=QsaSpec(...))` routes stage (4) to
+it and `execute(block_ids=, block_lens=)` carries the list — and the standalone adapter
+`python/cudnn/sdpa/fwd/sparse_gqa_sm107.py`), no graph form: no `sdpa` node carries a block-index list, so there is NO engine
+row and NO manifest slot — an `EngineSpec` whose `lower` cannot run would break the engine contract.  The kernel's claims live
+in the adapter's frozen `SparseCapabilities` record, spelled in the `Capabilities` vocabulary where a field exists, and its
+`check_support` is the enforcement point (the CuTe DSL `sm_107a` gate first, then every field as a typed decline); the block
+reads the same record for its own declines (dtypes, head dim, block size, `top_k`, the GQA group) and transcribes nothing.
+The block route is validated end to end on Rubin against the fp32 QSA oracle at the 24/2, 12/1, 6/1 and 32/2 geometries
+(`test/python/gated_attention_block/cutedsl/test_block_qsa_end_to_end.py`).
 
 Served (bring-up body, 2026-10-08): dense BSHD f16 / bf16, d_qk = d_v = 256 exactly, one query token per work item with its
 packed query-head group (1..16 heads per KV head), caller block lists `block_ids` int32 `[B, S_q, top_k]` (contiguous, `top_k`
