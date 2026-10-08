@@ -1039,10 +1039,20 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
 # === SOFTMAX warps (0-3): 128 key lanes, 16 columns = the item's query heads ============================================
 
 
+# The hot max / min sites of the softmax body are spelled ``ftz=True`` so they lower to FMNMX (fused FMNMX3 in the dependent
+# chains); the bare ``cute.math.max`` default is ``arith.maxnumf`` = a compare + select pair per op (FSETP + FSEL), which was
+# 54 % of the executed softmax instructions on this body's decode twin.  Numerics: ``ftz`` flushes sub-normal OPERANDS, so the
+# two spellings can differ only where a column max is itself an fp32 sub-normal (|s| < 2^-126) or a signed zero -- O is
+# unchanged there (the exp2 of a flushed sub-normal is 1.0 either way) and LSE moves by at most that sub-normal (<= 1.2e-38,
+# and only with a single live key -- with more, ``m + log(l)`` rounds it away); no measured cell reached it, and O / LSE were
+# BITWISE identical on every one (0 mismatching elements).  MEASURED against the compare-select
+# spelling on a Rubin perf node (212 SMs, 2376 MHz lock, A/B/A x 3 rounds, control pairs <= 0.03 %): +13.4 / +13.4 / +13.5 %
+# at S = 8K / 32K / 128K on recorded layer lists (3369 -> 2971, 3301 -> 2910, 3288 -> 2896 clk per K + V tile pair), the
+# per-tile body -9.9 % (2894 -> 2607 clk steady state), the per-item fixed cost -21 %; O and LSE bitwise identical.
 @cute.jit
 def _warp_reduce_max(x):
     for off in cutlass.range_constexpr(5):
-        x = cute.math.max(x, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, x, 16 >> off, 31, kind=nvvm.Shfl.BFLY)))
+        x = cute.math.max(x, cutlass.Float32(nvvm.shfl_sync(0xFFFFFFFF, x, 16 >> off, 31, kind=nvvm.Shfl.BFLY)), ftz=True)
     return x
 
 
@@ -1145,7 +1155,7 @@ def _softmax_warp_group(
             for j in cutlass.range_constexpr(COLS):
                 tm = col_max[j]
                 for w in cutlass.range_constexpr(SOFTMAX_WARPS):
-                    tm = cute.math.max(tm, cutlass.Float32((red_ptr + (red_read + cutlass.Int32(w * COLS + j))).load()))
+                    tm = cute.math.max(tm, cutlass.Float32((red_ptr + (red_read + cutlass.Int32(w * COLS + j))).load()), ftz=True)
                 tile_max.append(tm)
 
             # Online update per column (identical in every lane: alpha is uniform, so O^T's rescale is exact).
@@ -1156,10 +1166,10 @@ def _softmax_warp_group(
             p_cols = []
             for j in cutlass.range_constexpr(COLS):
                 m_old_j = cutlass.Float32(m_vec[j])
-                m_new_j = cute.math.max(m_old_j, tile_max[j])
+                m_new_j = cute.math.max(m_old_j, tile_max[j], ftz=True)
                 ms_old = row_max_for_exp2(m_old_j)
                 ms_new = row_max_for_exp2(m_new_j)
-                alpha_j = cute.math.exp2(cute.math.min(ms_old - ms_new, ZERO), fastmath=True)
+                alpha_j = cute.math.exp2(cute.math.min(ms_old - ms_new, ZERO, ftz=True), fastmath=True)
                 p_j = cute.math.exp2(s_cols[j] - ms_new, fastmath=True)
                 l_new.append(cutlass.Float32(l_vec[j]) * alpha_j + p_j)
                 m_new.append(m_new_j)
