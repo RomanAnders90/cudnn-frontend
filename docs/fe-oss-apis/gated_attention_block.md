@@ -226,6 +226,27 @@ after its projection (with the band) and norm + RoPE stages accepted the geometr
 number of them -- the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`,
 `index_source="indexer"`, `d_head != 256`.
 
+### Serving: write-through into a paged KV cache (`paged_kv_page_size`)
+
+A serving stack keeps every token's post-norm, post-RoPE K and its V in a paged cache. `GatedAttentionBlockFwd(...,
+paged_kv_page_size=P)` (appended; `0` = off, the default) declares that write-through: after norm + RoPE the block writes
+each token's K and V row into the caller's pools at `execute(slot_mapping=)` -- ONE extra launch -- and then attends over its
+own K / V exactly as before, so `out` is bitwise the block's without it and `get_workspace_size()` does not change. It is a
+declaration ATTRIBUTE (it changes the input contract), never a knob:
+
+| input (appended to `execute`) | shape / dtype | contract |
+|---|---|---|
+| `k_cache`, `v_cache` | `[num_pages, H_kv, P, D]` in the activation dtype (bf16 / f16); HND compact, or NHD storage declared through the strides (`D` contiguous, every other stride a whole number of 16-byte vectors, a 16-byte-aligned base) | REQUIRED under `paged_kv_page_size > 0`; post-RoPE K lands in `k_cache`, V in `v_cache` |
+| `slot_mapping` | `[T]` int32 or int64, contiguous; the flat slot `page * P + offset` of every token | REQUIRED; a NEGATIVE slot (a padded token) writes nothing; a slot past the pool's capacity writes nothing either -- never a write past the pool; slot VALUES are device data, never read on the host |
+| `index_k_raw` | `[num_pages, P, index_head_dim]` activation dtype, `D` contiguous: the raw indexer key's pool, written at the same slots | REQUIRED iff the geometry declares the indexer band (`QsaSpec.index_band`), refused otherwise |
+| `block_table`, `kv_lens` | the paged-READ mode's page table and logical lengths | a typed `NotImplementedError` until attention over the pools lands |
+
+`P` is a positive multiple of 16 (the serving stacks' page granularity; a 4-token sparse block then never straddles a page);
+a block declared without the attribute REFUSES every one of these inputs (`ValueError`) rather than ignoring a pool it would
+never write. Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_norm_rope` on or off, `fuse_gate`
+on or off, dense `[B, S, d_model]`); `quant` (the pools of a quantized cache arrive with the cache-dtype attribute and its cast
+kernel), `save_for_backward` and `thd` with `paged_kv_page_size` are typed `NotImplementedError`s naming the feature.
+
 ### Forward
 
 ```python
@@ -732,6 +753,9 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
 - Block-sparse attention (`QsaSpec`): the declaration, the layout, the loader and the indexer band on the UNFUSED projection
   are served; the sparse SDPA stage is a typed decline until the sparse core lands ("Sparse attention (QSA)" above).
+- Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
+  only; the pools are the activation dtype; `quant`, `save_for_backward` and `thd` together with it are typed declines;
+  the paged-READ mode (`block_table` / `kv_lens`) is a typed decline ("Serving: write-through into a paged KV cache" above).
 - fp4 (`MxQuantSpec.w_qkvg_dtype` / `o_fp4`): MXFP8 pipeline only (unrepresentable on `QuantSpec` / bf16); inference
   only (`save_for_backward` is a typed decline for the fp4 modes); no global per-tensor scale in
   either fp4 format (`scale_o == descale_w_o == 1.0` under `o_fp4`); `d_head % (4 * block) == 0` under `o_fp4`
