@@ -662,8 +662,8 @@ def _bf16_ulp(x: torch.Tensor) -> torch.Tensor:
 @requires_rubin
 def test_unfused_projection_serves_the_indexer_band_at_flash_next():
     """Stage (1) at N = 13952 (the four dense bands + the 640-column indexer band) through the block's own stage objects,
-    into the block's own slab slot of a workspace -- the block itself declines at its sparse stage, AFTER the projection
-    and norm + RoPE accepted the five-band geometry.  The band equals ``h @ W_i^T`` to the GEMM suite's bf16 bar (one
+    into the block's own slab slot of a workspace (the whole block, sparse stage included, is supported on Rubin; the
+    end-to-end module runs it).  The band equals ``h @ W_i^T`` to the GEMM suite's bf16 bar (one
     rounding of the fp32 accumulation), the four dense bands equal the four-band projection's, norm + RoPE leaves the band
     untouched, and the raw indexer key reads back as a zero-copy view at the right offset."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -687,8 +687,7 @@ def test_unfused_projection_serves_the_indexer_band_at_flash_next():
 
     blk = GatedAttentionBlockFwd(h, w_qkvg, wn, wn, cos, sin, w_o, out, geom)
     assert isinstance(blk._sdpa, _SparseSdpa)
-    with pytest.raises(NotImplementedError, match="sparse attention core"):
-        blk.check_support()  # the declaration, the projection and norm + RoPE accepted; the sparse stage is the decline
+    assert blk.check_support()  # the declaration, the projection (with the band), norm + RoPE and the sparse stage all accept on Rubin
     blk4 = GatedAttentionBlockFwd(h, w_dense, wn, wn, cos, sin, w_o, out, dense)
 
     def project(block, weight):
