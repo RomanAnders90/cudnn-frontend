@@ -36,6 +36,19 @@ the kernel's selection (the block oracle on the kernel's list, the standard asse
 (no scorer launch, bitwise the caller-list block on the full list), the step-0 reuse pin (``block_ids_out`` / ``block_lens_out``
 fed to a caller-list block reproduce the output bitwise; ``index_k_compressed`` rows written and the rest untouched), and the
 write-through composition.
+
+PACKED SEQUENCES (``thd=True``, since 2026-10-08): the sparse core's packed arm through the block -- ONE token matrix
+``[T, d_model]`` (or ``[1, T, d_model]``) holding ``B`` sequences, ``execute(seq_lens=)`` as ``[B]`` lengths or ``[B+1]``
+prefix sums (``cu_seqlens``) for both length sides, ``block_ids`` ``[T, top_k]`` with every id RELATIVE TO ITS SEQUENCE.
+Every cell runs the per-sequence QSA oracle (``gated_attention_block_qsa_reference_packed`` + ``compare_packed``: a
+cross-sequence leak names its sequence) at the same bounds, on the packings of the THD suites -- ``[300, 128, 200]`` (bf16
+AND f16), ``[2048, 4096, 6144, 8192]`` with random lists past the identity bound, a zero-length sequence in front / in the
+middle / trailing, a 5-token sequence (never a 1-token one), lengths that are not multiples of 4 (a 1-3 token tail on every
+sequence), one block total with ``B x H_kv > 1`` -- across the forms (the prefix sums, the ``[T, .]`` input rank,
+``block_lens`` absent, no LSE) and the pipeline knobs (fused norm + RoPE, the compact K / V layout, the indexer band,
+``top_k`` 4 / 256, the TP and 397B geometries); a one-sequence packing is BITWISE the dense ``B = 1, S = T`` sparse block on
+``out``, the gated O and the LSE; the workspace carries the packed metadata; the lengths are REQUIRED at execute.  THD
+together with the in-block indexer or the paged write-through stays a typed decline (``test_block_qsa.py``).
 """
 
 import math
@@ -64,13 +77,22 @@ from gated_block_qsa_reference import (  # noqa: E402
     RefQsaGeometry,
     RefQsaSpec,
     block_ids_contract_violations,
+    dense_geometry,
     full_block_ids,
     gated_attention_block_qsa_reference,
+    gated_attention_block_qsa_reference_packed,
     make_qsa_inputs,
     qsa_indexer_reference,
     random_block_ids,
 )
-from gated_block_reference import RefGeometry, apply_partial_rope, gated_attention_block_reference, make_inputs  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    RefGeometry,
+    apply_partial_rope,
+    compare_packed,
+    gated_attention_block_reference,
+    make_inputs,
+    make_packed_inputs,
+)
 
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 
@@ -1005,6 +1027,367 @@ def test_indexer_block_with_write_through_is_bitwise_the_one_without():
     live = slot >= 0
     s_ = slot[live].long()
     assert torch.equal(_bits(index_cache[s_ // ps, s_ % ps, :]), _bits(raw[0, live, 0]))
+
+
+# ============================================================================ THD: packed sequences through the sparse stage
+def _packed_lists(lens, top_k: int, source: str, seed: int = 0, device="cuda") -> tuple:
+    """Per-sequence lists for a packing, concatenated along the token axis: ``[T, top_k]`` ids RELATIVE TO THEIR SEQUENCE (block
+    ``j`` of sequence ``b`` = its tokens ``[4j, 4j + 4)``) and the ``[T]`` counts -- the oracle's own builders run per sequence
+    over that sequence's positions, as the standalone adapter's packed cells build them.  ``source``: ``"full"`` (every complete
+    block below the identity bound) or ``"synthetic"`` (a random subset in random order).  An empty sequence contributes no rows."""
+    g = torch.Generator(device=device).manual_seed(int(seed) + 0x5EED)
+    ids, cnt = [], []
+    for n in lens:
+        if not int(n):
+            continue
+        pos = torch.arange(int(n), device=device)[None]
+        i, c = full_block_ids(pos, top_k, BS) if source == "full" else random_block_ids(pos, top_k, BS, generator=g)
+        ids.append(i[0])
+        cnt.append(c[0])
+    return torch.cat(ids).contiguous(), torch.cat(cnt).contiguous()
+
+
+@dataclass
+class _ThdCell:
+    """What one packed block run leaves behind: per launch ``(out [1, T, d_model], lse [1, H_q, T] | None, o_gated [T, H_q, D])``,
+    the per-sequence oracle list, the block, the inputs, the packing metadata, the lists and the lengths tensor it ran with."""
+
+    runs: list
+    refs: Optional[list]
+    blk: object
+    inp: dict
+    meta: dict
+    ws: torch.Tensor
+    geom: object
+    ids: torch.Tensor
+    lens: Optional[torch.Tensor]
+    seq_lens: torch.Tensor
+    mags: dict = field(default_factory=dict)
+
+
+def _run_thd(
+    geom_kw,
+    lens,
+    *,
+    dtype=BF16,
+    top_k=512,
+    source="full",
+    cu=False,
+    rank2=False,
+    block_lens=True,
+    return_lse=True,
+    fuse_norm_rope=False,
+    inplace_qkv=None,
+    index_band=False,
+    max_seq_len=None,
+    seed=0,
+    launches=2,
+    lists=None,
+    inp=None,
+    refs=True,
+) -> _ThdCell:
+    """Declare, check, compile and run a PACKED (``thd=True``) ``QsaSpec`` block ``launches`` times on sentinel-filled outputs
+    and the per-sequence QSA oracle on the same inputs and lists.  ``lens`` is the packing (ints, zero-length sequences
+    allowed; ``max_seq_len`` defaults to the longest); ``cu`` hands the ``[B+1]`` prefix sums over instead of the ``[B]``
+    lengths, ``rank2`` the ``[T, .]`` input spelling; ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp``
+    reuses another cell's ``(inputs, meta)``; ``refs=False`` skips the oracle (the bitwise pins)."""
+    ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=index_band))
+    geom = GatedAttentionBlockGeometry(**geom_kw, qsa=QsaSpec(top_k=top_k, index_band=index_band))
+    if inp is None:
+        inp, meta = make_packed_inputs(dense_geometry(ref_geom), lens, dtype=dtype, seed=seed, max_seq_len=max_seq_len)
+        if index_band:
+            # the INDEX band rows of W_qkvg, drawn as make_qsa_inputs draws them (a second generator); the raw key the band
+            # projects is unused under packed sequences (the in-block indexer is a typed decline there)
+            g2 = torch.Generator(device="cuda").manual_seed(int(seed) + 0x9E37)
+            w_i = (torch.randn(ref_geom.qsa.index_band_width, ref_geom.d_model, generator=g2, device="cuda", dtype=torch.float32) * 0.02).to(dtype)
+            inp["w_qkvg"] = torch.cat([inp["w_qkvg"], w_i], dim=0)
+    else:
+        inp, meta = inp
+    t = meta["t"]
+    ids, cnt = _packed_lists(lens, top_k, source, seed=seed) if lists is None else lists
+    assert ids.shape == (t, top_k) and cnt.shape == (t,)
+    lens_arg = cnt if block_lens else None
+    seq_lens = meta["cu_seqlens"] if cu else meta["seq_lens"]
+    ref_list = (
+        gated_attention_block_qsa_reference_packed(
+            inp["h"],
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            inp["cos"],
+            inp["sin"],
+            inp["w_o"],
+            ref_geom,
+            meta["lens"],
+            block_ids=ids,
+            block_lens=lens_arg,
+        )
+        if refs
+        else None
+    )
+    h, cos, sin = inp["h"], inp["cos"], inp["sin"]
+    out = torch.empty(1, t, geom.d_model, device="cuda", dtype=dtype)
+    if rank2:
+        h, cos, sin, out = h[0], cos[0], sin[0], out[0]
+    blk = GatedAttentionBlockFwd(
+        h,
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        cos,
+        sin,
+        inp["w_o"],
+        out,
+        geom,
+        return_lse=return_lse,
+        fuse_norm_rope=fuse_norm_rope,
+        inplace_qkv=inplace_qkv,
+        thd=True,
+        num_sequences=meta["b"],
+        max_seq_len=meta["max_seq_len"],
+        cu_seqlens=cu,
+    )
+    assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and (blk.batch, blk.seq_len) == (1, t)
+    assert blk.check_support()
+    blk.compile()
+    ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
+    lse = torch.empty(1, geom.h_q, t, device="cuda", dtype=torch.float32) if return_lse else None
+    sent = _sentinel(dtype)
+    lay = blk._layout()
+    runs = []
+    for _ in range(launches):
+        out.fill_(sent)
+        if lse is not None:
+            lse.fill_(sent)
+        blk.execute(
+            h, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], cos, sin, inp["w_o"], out, ws, seq_lens=seq_lens, lse=lse, block_ids=ids, block_lens=lens_arg
+        )
+        torch.cuda.synchronize()
+        o_gated = _view(ws, lay.o, (t, geom.h_q, geom.d_head), dtype).clone()
+        runs.append((out.reshape(1, t, geom.d_model).clone(), None if lse is None else lse.clone(), o_gated))
+    return _ThdCell(runs=runs, refs=ref_list, blk=blk, inp=inp, meta=meta, ws=ws, geom=geom, ids=ids, lens=lens_arg, seq_lens=seq_lens)
+
+
+def _check_thd(c: _ThdCell, label: str) -> dict:
+    """The standard assertions PER SEQUENCE: finite + no sentinel over the WHOLE packed output first (every row belongs to a
+    sequence under ``sum == T``), the launches bitwise, then every non-empty sequence against ITS OWN oracle through
+    ``compare_packed`` (the verdicts collected, a cross-sequence leak names its sequence): ``cos(out) > 0.999``, the gated O
+    and the LSE within ``atol 2e-2``, no row dead (self-attention: every token sees itself).  The worst magnitudes over the
+    sequences are printed and returned."""
+    out, lse, o = c.runs[0]
+    sent = _sentinel(out.dtype)
+    assert torch.isfinite(out.float()).all(), f"{label}: non-finite out"
+    assert not (out.float() == sent).any(), f"{label}: a sentinel survived in out"
+    assert torch.isfinite(o.float()).all(), f"{label}: non-finite gated O (a row the SDPA never wrote keeps the workspace fill)"
+    for out2, lse2, o2 in c.runs[1:]:
+        assert torch.equal(_bits(out), _bits(out2)) and torch.equal(_bits(o), _bits(o2)), f"{label}: two launches are not bitwise on out / O"
+        if lse is not None:
+            assert torch.equal(lse, lse2), f"{label}: two launches are not bitwise on LSE"
+    if lse is not None:
+        assert not (lse == sent).any(), f"{label}: a sentinel survived in LSE"
+    mags = dict(cos=1.0, d_out=0.0, d_o=0.0, d_lse=0.0, seqs=0)
+
+    def check(i, lo, hi, ref):
+        assert (ref.n_visible[0] > 0).all(), "a packed sequence has no dead row under self-attention"
+        cos = _cos(out[0, lo:hi], ref.out[0])
+        d_out = float((out[0, lo:hi].float() - ref.out[0].float()).abs().max())
+        d_o = float((o[lo:hi].float() - ref.o_gated[0].float()).abs().max())
+        d_lse = 0.0 if lse is None else float((lse[0, :, lo:hi] - ref.lse[0]).abs().max())
+        mags.update(
+            cos=min(mags["cos"], cos), d_out=max(mags["d_out"], d_out), d_o=max(mags["d_o"], d_o), d_lse=max(mags["d_lse"], d_lse), seqs=mags["seqs"] + 1
+        )
+        assert cos > COS_OUT, f"cos(out) {cos:.6f} <= {COS_OUT}"
+        assert d_o <= ATOL, f"gated O off the oracle by {d_o} (budget {ATOL})"
+        assert d_lse <= ATOL, f"LSE off the oracle by {d_lse} (budget {ATOL})"
+
+    failures = compare_packed(c.refs, c.meta["lens"], check)
+    assert not failures, f"{label}:\n" + "\n".join(failures)
+    c.mags = mags
+    print(
+        f"\n{label}: lens {c.meta['lens']} ({mags['seqs']} live sequences): min cos(out) {mags['cos']:.6f} max|d out| {mags['d_out']:.4e} "
+        f"max|d O_gated| {mags['d_o']:.4e} max|d LSE| {mags['d_lse']:.2e}"
+    )
+    return mags
+
+
+# (id, geometry, packing, dtype, list source, top_k, cu_seqlens, rank-2 inputs, block_lens given, return_lse, fuse_norm_rope, inplace_qkv, index_band)
+_THD_MATRIX = [
+    # the contract's packings, bf16 AND f16, at the block-sparse model's geometry; random lists past the identity bound
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], BF16, "full", 512, False, False, True, True, False, None, False, id="fn24-2-three-seqs-bf16-full"),
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], F16, "full", 512, False, False, True, True, False, None, False, id="fn24-2-three-seqs-f16-full"),
+    pytest.param(
+        GEOM_FLASH_NEXT, [2048, 4096, 6144, 8192], BF16, "synthetic", 512, False, False, True, True, False, None, False, id="fn24-2-long-four-bf16-synthetic"
+    ),
+    # a zero-length sequence in front / in the middle / trailing; a 5-token sequence (bf16 and f16); 1-3 token tails; one block total
+    pytest.param(GEOM_SMALL, [0, 300, 200], BF16, "full", 512, False, False, True, True, False, None, False, id="small8-2-empty-front"),
+    pytest.param(GEOM_SMALL, [300, 0, 200], BF16, "synthetic", 512, False, False, True, True, False, None, False, id="small8-2-empty-middle-synthetic"),
+    pytest.param(GEOM_SMALL, [300, 200, 0], BF16, "full", 512, True, False, True, True, False, None, False, id="small8-2-empty-trailing-cu"),
+    pytest.param(GEOM_SMALL, [5, 300, 128], BF16, "full", 512, False, False, True, True, False, None, False, id="small8-2-five-token-bf16"),
+    pytest.param(GEOM_SMALL, [5, 300, 128], F16, "full", 512, False, False, True, True, False, None, False, id="small8-2-five-token-f16"),
+    pytest.param(GEOM_SMALL, [4097, 13, 2051], BF16, "synthetic", 512, False, False, True, True, False, None, False, id="small8-2-tails-4097-13-2051"),
+    pytest.param(GEOM_SMALL, [4, 5, 7], BF16, "full", 512, False, False, True, True, False, None, False, id="small8-2-one-block-4-5-7"),
+    # the forms: the [B+1] prefix sums with the [T, .] input rank, block_lens absent (the kernel's derived count), no LSE
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "synthetic", 512, True, True, True, True, False, None, False, id="small8-2-cu-seqlens-rank2"),
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "full", 512, False, False, False, True, False, None, False, id="small8-2-no-block-lens"),
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "synthetic", 512, False, False, True, False, False, None, False, id="small8-2-no-lse"),
+    # the pipeline knobs: fused norm + RoPE (no band), the compact K / V layout, the indexer band, top_k 4 / 256
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], BF16, "synthetic", 512, False, False, True, True, True, None, False, id="fn24-2-fuse-norm-rope"),
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "synthetic", 512, False, False, True, True, False, False, False, id="small8-2-compact-kv"),
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "synthetic", 512, False, False, True, True, False, None, True, id="small8-2-index-band"),
+    pytest.param(GEOM_SMALL, [300, 128, 200], BF16, "synthetic", 4, False, False, True, True, False, None, False, id="small8-2-top4"),
+    pytest.param(GEOM_SMALL, [2051, 13, 2052], BF16, "synthetic", 256, False, False, True, True, False, None, False, id="small8-2-top256-2051-2052"),
+    # the TP geometries and the 397B sibling (the GQA group at the record's cap)
+    pytest.param(GEOM_TP2, [300, 128, 200], F16, "full", 512, False, False, True, True, False, None, False, id="tp2-12-1-f16-full"),
+    pytest.param(GEOM_TP4, [300, 128, 200], BF16, "synthetic", 512, False, False, True, True, False, None, False, id="tp4-6-1-synthetic-ldg-norm"),
+    pytest.param(GEOM_397B, [300, 128, 200], BF16, "synthetic", 512, False, False, True, True, False, None, False, id="g397b-32-2-synthetic-gqa16"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, lens, dtype, source, top_k, cu, rank2, block_lens, return_lse, fuse_norm_rope, inplace_qkv, index_band", _THD_MATRIX)
+def test_thd_qsa_block_matches_the_per_sequence_oracle(
+    request, geom_kw, lens, dtype, source, top_k, cu, rank2, block_lens, return_lse, fuse_norm_rope, inplace_qkv, index_band
+):
+    """Every sequence of a packed ``QsaSpec`` block against its own oracle (``_check_thd``): the contract's packings, the
+    degenerate ones, every form and knob of the matrix above."""
+    c = _run_thd(
+        geom_kw,
+        lens,
+        dtype=dtype,
+        top_k=top_k,
+        source=source,
+        cu=cu,
+        rank2=rank2,
+        block_lens=block_lens,
+        return_lse=return_lse,
+        fuse_norm_rope=fuse_norm_rope,
+        inplace_qkv=inplace_qkv,
+        index_band=index_band,
+    )
+    _check_thd(c, request.node.callspec.id)
+
+
+@requires_rubin
+def test_thd_qsa_length_forms_and_input_ranks_are_bitwise():
+    """The ``[B]`` lengths and the ``[B+1]`` prefix sums (at base 0 and sliced from a larger prefix), the ``[1, T, .]`` and the
+    ``[T, .]`` input spellings, and ``block_lens`` given vs absent (the kernel's derived count equals the given count on a
+    valid-prefix list) all run the SAME function: ``out``, the gated O and the LSE BITWISE across the five runs."""
+    lens, geom_kw = [300, 128, 200], GEOM_SMALL
+    base = _run_thd(geom_kw, lens, source="synthetic", launches=1, refs=False)
+    inp = (base.inp, base.meta)
+    lists = (base.ids, base.lens)
+    variants = {
+        "cu": _run_thd(geom_kw, lens, source="synthetic", cu=True, inp=inp, lists=lists, launches=1, refs=False),
+        "rank2": _run_thd(geom_kw, lens, source="synthetic", rank2=True, inp=inp, lists=lists, launches=1, refs=False),
+        "no-block-lens": _run_thd(geom_kw, lens, source="synthetic", block_lens=False, inp=inp, lists=lists, launches=1, refs=False),
+    }
+    # a prefix tensor sliced from a larger one (the kernels normalize a prefix to its first entry)
+    big = torch.tensor([0, 77] + [77 + x for x in base.meta["cu"]], dtype=torch.int32, device="cuda")
+    assert big[2:].is_contiguous() and big[2:].numel() == len(lens) + 1
+    cu_blk, cu_ws = variants["cu"].blk, variants["cu"].ws
+    t, g = base.meta["t"], cu_blk.geom
+    out_s = torch.full((1, t, g.d_model), _sentinel(BF16), device="cuda", dtype=BF16)
+    lse_s = torch.full((1, g.h_q, t), _sentinel(BF16), device="cuda", dtype=torch.float32)
+    i = base.inp
+    cu_blk.execute(
+        i["h"],
+        i["w_qkvg"],
+        i["w_q_norm"],
+        i["w_k_norm"],
+        i["cos"],
+        i["sin"],
+        i["w_o"],
+        out_s,
+        cu_ws,
+        seq_lens=big[2:],
+        lse=lse_s,
+        block_ids=base.ids,
+        block_lens=base.lens,
+    )
+    torch.cuda.synchronize()
+    sliced = (out_s.clone(), lse_s.clone(), _view(cu_ws, cu_blk._layout().o, (t, g.h_q, g.d_head), BF16).clone())
+    out0, lse0, o0 = base.runs[0]
+    for name, (out1, lse1, o1) in [(k, v.runs[0]) for k, v in variants.items()] + [("cu-sliced", sliced)]:
+        assert torch.equal(_bits(out0), _bits(out1)), f"{name}: out differs from the lengths-form rank-3 run"
+        assert torch.equal(_bits(o0), _bits(o1)), f"{name}: the gated O differs from the lengths-form rank-3 run"
+        assert torch.equal(lse0, lse1), f"{name}: the LSE differs from the lengths-form rank-3 run"
+    print(f"\nTHD forms bitwise: lengths / prefix sums / a sliced prefix / rank-2 inputs / block_lens absent, lens {lens}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [BF16, F16], ids=["bf16", "f16"])
+def test_thd_one_sequence_is_bitwise_the_dense_b1_qsa_block(dtype):
+    """``B = 1`` packed ``(T,)`` against the dense ``B = 1, S = T`` ``QsaSpec`` block over the SAME bytes and the SAME (random)
+    list: ``out``, the gated O and the LSE BITWISE -- the token-wise stages are the same launches at ``(1, T)``, and the sparse
+    core's packed arm does the same gathers in the same order as its dense form (the standalone adapter's pin, through the
+    block).  A difference here is a finding, never a tolerance."""
+    t, top_k = 600, 512
+    ref_geom = RefQsaGeometry(**GEOM_FLASH_NEXT, qsa=RefQsaSpec(top_k=top_k))
+    dinp = make_qsa_inputs(ref_geom, 1, t, dtype=dtype, seed=3, index_source="synthetic")
+    pinp, meta = make_packed_inputs(dense_geometry(ref_geom), [t], dtype=dtype, seed=3)
+    for k in ("h", "w_qkvg", "w_o", "cos", "sin", "w_q_norm", "w_k_norm"):
+        assert torch.equal(dinp[k], pinp[k]), k  # the packed draw IS the dense B = 1 draw, element for element
+    dense = _run(GEOM_FLASH_NEXT, 1, t, dtype=dtype, top_k=top_k, index_source="synthetic", inp=dinp, launches=1, seed=3)
+    packed = _run_thd(
+        GEOM_FLASH_NEXT,
+        [t],
+        dtype=dtype,
+        top_k=top_k,
+        inp=(pinp, meta),
+        lists=(dinp["block_ids"].view(t, top_k), dinp["block_lens"].view(t)),
+        launches=1,
+        refs=False,
+    )
+    (out_d, lse_d, o_d), (out_p, lse_p, o_p) = dense.runs[0], packed.runs[0]
+    d = float((out_p.float() - out_d.float()).abs().max())
+    assert torch.equal(
+        _bits(out_p), _bits(out_d.reshape(1, t, -1))
+    ), f"out: packed B = 1 differs from the dense QsaSpec block (max|diff| {d:.3e}) -- a finding, not a tolerance"
+    assert torch.equal(_bits(o_p), _bits(o_d.reshape(t, -1, o_d.shape[-1]))), "gated O: packed B = 1 differs from the dense QsaSpec block"
+    assert torch.equal(lse_p, lse_d), "LSE: packed B = 1 differs from the dense QsaSpec block"
+    print(
+        f"\nTHD one sequence {dtype}: packed (T = {t},) BITWISE the dense B = 1 QsaSpec block on out / O / LSE (dense cos(out) vs the oracle {_cos(out_d, dense.ref.out):.6f})"
+    )
+
+
+@requires_rubin
+def test_thd_qsa_workspace_carries_the_packed_metadata_and_execute_requires_the_lengths():
+    """``get_workspace_size()`` of a packed ``QsaSpec`` block is the dense ``B = 1, S = T`` carve plus the engine arm sized by the
+    larger of the GEMMs' scratch and the sparse stage's packed metadata (``THD_META_WORDS(B) = 4 B + 4`` int32 words, 16-byte
+    rounded -- the ONE scratch the arm needs, folded through ``scratch_workspace_bytes``); ``execute`` REQUIRES ``seq_lens``
+    (the block's typed refusal before any launch) and refuses a lengths tensor of the wrong extent or dtype and a list of the
+    wrong rank."""
+    from cudnn.frost.tile_dsl.thd import THD_META_WORDS
+    from cudnn.gated_attention_block.api import _align_up
+
+    lens = [300, 128, 200]
+    c = _run_thd(GEOM_SMALL, lens, launches=1, refs=False)
+    blk, i = c.blk, c.inp
+    meta_bytes = -(-(THD_META_WORDS(len(lens)) * 4) // 16) * 16
+    assert meta_bytes == 64 and blk._sdpa.scratch_workspace_bytes() == meta_bytes
+    lay = blk._layout()
+    engine = max(blk._proj.workspace_bytes(), blk._out_proj.workspace_bytes(), meta_bytes, 1)
+    assert blk.get_workspace_size() == lay.total_bytes + _align_up(engine) == c.ws.numel()
+    # the dense QsaSpec block at (1, T) carves the same intermediates (only the engine arm may differ)
+    dense = GatedAttentionBlockFwd(
+        i["h"], i["w_qkvg"], i["w_q_norm"], i["w_k_norm"], i["cos"], i["sin"], i["w_o"], torch.empty_like(i["h"]), blk.geom, return_lse=True
+    )
+    assert dense.check_support()
+    assert dense._layout() == lay and dense._sdpa.scratch_workspace_bytes() == 0
+    out = torch.empty(1, c.meta["t"], blk.geom.d_model, device="cuda", dtype=BF16)
+    lse = torch.empty(1, blk.geom.h_q, c.meta["t"], device="cuda", dtype=torch.float32)
+    args = (i["h"], i["w_qkvg"], i["w_q_norm"], i["w_k_norm"], i["cos"], i["sin"], i["w_o"], out, c.ws)
+    with pytest.raises(ValueError, match=r"thd=True: execute\(seq_lens=\) is required"):
+        blk.execute(*args, lse=lse, block_ids=c.ids, block_lens=c.lens)
+    with pytest.raises(ValueError, match="of 3 elements"):
+        blk.execute(*args, seq_lens=c.seq_lens[:2], lse=lse, block_ids=c.ids, block_lens=c.lens)
+    with pytest.raises(ValueError, match="of 3 elements"):
+        blk.execute(*args, seq_lens=c.meta["cu_seqlens"], lse=lse, block_ids=c.ids, block_lens=c.lens)
+    with pytest.raises(ValueError, match="int32"):
+        blk.execute(*args, seq_lens=c.seq_lens.to(torch.int64), lse=lse, block_ids=c.ids, block_lens=c.lens)
+    with pytest.raises(ValueError, match="block_ids"):
+        blk.execute(*args, seq_lens=c.seq_lens, lse=lse, block_ids=c.ids[None, None], block_lens=c.lens)
+    print(f"\nTHD QsaSpec workspace: {blk.get_workspace_size()} B = carve {lay.total_bytes} + engine arm {_align_up(engine)} (packed metadata {meta_bytes} B)")
 
 
 # ============================================================================ host: what the matrix cannot run yet
