@@ -60,6 +60,10 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   straight out of the GEMM, so the quantize passes disappear.
 - `fuse_gate=True` folds stage (5) into the SDPA epilogue: `O *= sigmoid(GATE)` after the dead-row select, with
   the gate tile TMA-staged by the load warp (inference only: no pre-gate `O` for the backward).
+- `fuse_prepare=True` (serving, with `paged_kv_page_size > 0`) folds stages (2)+(3) and the paged-cache write-through (4w)
+  into ONE launch: Q / K are normed and rotated in place and the post-RoPE K, the V and the raw indexer key land in the
+  pools from the same registers -- every output bitwise the two-stage form, one launch fewer (two with the indexer band).
+  In-place bf16 / f16 only; `fuse_norm_rope` together with it is a typed decline (pick one). See "Serving: write-through".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -435,9 +439,11 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 
 A serving stack keeps every token's post-norm, post-RoPE K and its V in a paged cache. `GatedAttentionBlockFwd(...,
 paged_kv_page_size=P)` (appended; `0` = off, the default) declares that write-through: after norm + RoPE the block writes
-each token's K and V row into the caller's pools at `execute(slot_mapping=)` -- ONE extra launch -- and then attends over its
-own K / V exactly as before, so `out` is bitwise the block's without it and `get_workspace_size()` does not change. It is a
-declaration ATTRIBUTE (it changes the input contract), never a knob:
+each token's K and V row into the caller's pools at `execute(slot_mapping=)` -- ONE extra launch (two with the indexer band's
+raw-key pool), or NONE with the knob `fuse_prepare=True`, which runs norm + RoPE and the write-through as a single launch that
+is bitwise the two-stage form -- and then attends over its own K / V exactly as before, so `out` is bitwise the block's
+without it and `get_workspace_size()` does not change. It is a declaration ATTRIBUTE (it changes the input contract), never a
+knob (`fuse_prepare` is the knob: it changes no input and no output, only the launch count):
 
 | input (appended to `execute`) | shape / dtype | contract |
 |---|---|---|
@@ -451,6 +457,10 @@ a block declared without the attribute REFUSES every one of these inputs (`Value
 never write. Served on the bf16 / f16 inference pipelines (`inplace_qkv` on or off, `fuse_norm_rope` on or off, `fuse_gate`
 on or off, dense `[B, S, d_model]`); `quant` (the pools of a quantized cache arrive with the cache-dtype attribute and its cast
 kernel), `save_for_backward` and `thd` with `paged_kv_page_size` are typed `NotImplementedError`s naming the feature.
+`fuse_prepare=True` needs the attribute (a `ValueError` without it), the in-place pipeline (`inplace_qkv=True`, a `ValueError`
+otherwise) and not `fuse_norm_rope` (a typed `NotImplementedError`: the norm + RoPE already live in the projection epilogue
+there); its kernel (`kernels/qsa_prepare.py`) also carries the indexer's decode-step arms -- the queries' norm + RoPE, the
+raw-key ring and the incremental compress of the compressed-key cache -- which the block binds when its decode mode lands.
 
 ### Forward
 
@@ -472,6 +482,8 @@ blk = GatedAttentionBlockFwd(
     num_sequences=None,          # THD only, REQUIRED there: B, the number of sequences in the packing
     max_seq_len=None,            # THD only, REQUIRED there: S_max, the longest sequence the plan admits
     cu_seqlens=False,            # THD only: execute(seq_lens=) is [B+1] int32 prefix sums instead of [B] int32 lengths
+    paged_kv_page_size=0,        # serving: write the post-RoPE K / V through into paged pools at execute(slot_mapping=) -- see "Serving: write-through"
+    fuse_prepare=False,          # serving: stages (2)+(3) and that write-through as ONE launch (needs paged_kv_page_size > 0; same function)
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -480,9 +492,9 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
             w_o_sf=None)         # required iff MxQuantSpec.o_fp4, refused otherwise
 ```
 
-Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, and the four packing knobs `thd` / `num_sequences` /
-`max_seq_len` / `cu_seqlens`) sits at the end with a default, so positional callers of the bf16, FP8 and MXFP8 pipelines are
-unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typed `ValueError` names the missing half), and
+Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, the four packing knobs `thd` / `num_sequences` /
+`max_seq_len` / `cu_seqlens`, the serving attribute `paged_kv_page_size` and the knob `fuse_prepare`) sits at the end with a
+default, so positional callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given together (a typed `ValueError` names the missing half), and
 `num_sequences` / `max_seq_len` / `cu_seqlens` are refused without `thd=True`.
 
 #### Training forward (`save_for_backward=True`)
