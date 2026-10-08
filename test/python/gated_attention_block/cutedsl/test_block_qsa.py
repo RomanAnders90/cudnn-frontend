@@ -625,9 +625,10 @@ def _adapter_request(**over):
 def test_adapter_accept_decline_set_equals_the_record():
     """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
     the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
-    arm's own operands -- the paged read's pools, table and lengths; an unclaimed arm's request is a typed decline naming
-    the arm); the served baseline (dense BSHD bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with
-    the public ``sm_107a`` DSL (the cc is handed in, nothing is launched)."""
+    arm's own operands -- the paged read's pools, table and lengths; THD's two length descriptors of a one-sequence packing on
+    the batch-extent-1 operands; an unclaimed arm's request is a typed decline naming the arm); the served baseline (dense BSHD
+    bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with the public ``sm_107a`` DSL (the cc is handed
+    in, nothing is launched)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
 
     rec = _record()
@@ -645,7 +646,7 @@ def test_adapter_accept_decline_set_equals_the_record():
         seq_kv_lens=SparseOperandDesc((1,), (1,), torch.int32),
     )
     arms = {
-        "thd": dict(thd=True),
+        "thd": dict(thd=True, seq_q_lens=SparseOperandDesc((1,), (1,), torch.int32), seq_kv_lens=SparseOperandDesc((1,), (1,), torch.int32)),
         "paged_kv": paged,
         "epilogue_gate": dict(epilogue_gate=object()),
         "split_kv": dict(split_kv=2),
