@@ -241,7 +241,7 @@ def _run(
         # operands it scored: the oracle runs on THAT list (stage 2 of the two-stage oracle), never on a list of its own.
         st = blk._indexer
         v = st.views(ws, lay)
-        k_ids = (ix["ids_out"] if ix is not None else (v["ids"] if v is not None else st._const["identity_ids"])).view(batch, seq_len, top_k).clone()
+        k_ids = (ix["ids_out"] if ix is not None else (v["ids_sorted"] if v is not None else st._const["identity_ids"])).view(batch, seq_len, top_k).clone()
         k_lens = (ix["lens_out"] if ix is not None else st._const["counts"]).view(batch, seq_len).clone()
         ix = dict(
             ix or {},
