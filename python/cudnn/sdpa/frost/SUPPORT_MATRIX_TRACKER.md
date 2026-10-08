@@ -2198,7 +2198,10 @@ non-multiple-of-4 sequences; a one-sequence packing BITWISE the dense `B = 1` sp
 decline (the packed sequence's K / V row offset `cu_k[b]` composes with a dense `[1, T_kv, H_kv, D]` tensor only, never with a
 page pool; the combination lands with its own accept cells when a serving stack asks for it); through the block, `thd=True`
 together with the in-block indexer (`index_source="indexer"`: the scorer reads dense `[B, S]` prompts) or with the paged
-write-through (`paged_kv_page_size`) stays a typed decline naming the feature.
+write-through (`paged_kv_page_size`) stays a typed decline naming the feature.  `fuse_gate=True` composes with `thd=True`
+through the block (the GATE is the packed `[1, T, H_q, D]` slab slice like O, gated in the sparse core's epilogue; validated on
+Rubin, bf16 and f16: the gated packed block within one rounding of the activation dtype of the unfused packed block on O, the
+LSE bitwise).
 
 Served since 2026-10-08, standalone adapter only -- the DECODE FORM (`bottom_right=True`, `list_per_sequence=True`,
 `split_kv=S`; three `TemplateParams` arms of the same kernel, each a `const_expr` fold: the dense rendering traces the same

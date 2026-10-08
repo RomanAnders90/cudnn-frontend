@@ -5184,7 +5184,9 @@ class GatedAttentionBlockFwd(APIBase):
                     "arm ('epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True run the UNFUSED quantized pipeline "
                     "(fuse_norm_rope=False, fuse_gate=False)"
                 )
-            if self.fuse_gate:
+            # Under QsaSpec the sparse core's epilogue gate COMPOSES with its packed arm (the GATE is the packed [1, T, H_q, D] slab
+            # slice like O; _SparseSdpa reads the record's claim), so the decline below is the DENSE SDPA's and does not apply there.
+            if self.fuse_gate and geometry.qsa is None:
                 raise NotImplementedError(
                     "fuse_gate=True is dense-only: the Rubin d256 SDPA's epilogue gate has no THD gate descriptor (sdpa/fwd/api_dsl.py declines "
                     "'epilogue gate fusion is dense-only (no THD gate descriptor)'); under thd=True use fuse_gate=False (stage (5) runs as its "
