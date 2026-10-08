@@ -6,9 +6,11 @@
 Host cells (CPU arithmetic, the declaration-time declines on any GPU, the index-tensor form checks under
 ``torch.cuda.set_sync_debug_mode("error")``, the block's declines read off the sparse adapter's capabilities record and the
 adapter's own accept / decline set equal to that record, the CuTe DSL floor declining through the block BEFORE any kernel
-import) plus ONE Rubin cell: the unfused projection serving the 13952-column slab at the 24-query-head / 2-KV-head geometry,
-its indexer band checked against the fp64 matmul and the raw indexer key read back as a zero-copy view.  The sparse SDPA stage
-end to end -- the block against the QSA oracle, the accept matrix, the degenerate rows -- is ``test_block_qsa_end_to_end.py``.
+import, the in-block indexer's declaration -- its stage in the list, its workspace carve, the execute contract that flips with
+``index_source`` -- and the scorer's own declines) plus ONE Rubin cell: the unfused projection serving the 13952-column slab at
+the 24-query-head / 2-KV-head geometry, its indexer band checked against the fp64 matmul and the raw indexer key read back as a
+zero-copy view.  The sparse SDPA stage end to end -- the block against the QSA oracle, the accept matrix, the degenerate rows,
+the in-block indexer against the two-stage oracle -- is ``test_block_qsa_end_to_end.py``.
 """
 
 import contextlib
@@ -309,7 +311,20 @@ _DECLINES = [
     pytest.param(dict(causal_bottom_right=True), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "causal_bottom_right=True", id="bottom_right"),
     pytest.param({}, QsaSpec(), {}, torch.float32, NotImplementedError, "bf16 / f16", id="dtype"),
     pytest.param(dict(h_q=48), QsaSpec(), {}, torch.bfloat16, NotImplementedError, r"h_q // h_kv <= 16", id="gqa_group"),
-    pytest.param({}, QsaSpec(index_source="indexer", index_band=True), {}, torch.bfloat16, NotImplementedError, "in-block indexer", id="indexer"),
+    # the in-block indexer: the scorer's dtype (bf16), its head dim and its head groups -- each named in the message
+    pytest.param({}, QsaSpec(index_source="indexer", index_band=True), {}, torch.float16, NotImplementedError, "bf16 activations", id="indexer_f16"),
+    pytest.param(
+        {},
+        QsaSpec(index_source="indexer", index_band=True, index_head_dim=256),
+        {},
+        torch.bfloat16,
+        NotImplementedError,
+        "128-wide heads",
+        id="indexer_head_dim",
+    ),
+    pytest.param(
+        {}, QsaSpec(index_source="indexer", index_band=True, index_heads=3), {}, torch.bfloat16, NotImplementedError, "head groups", id="indexer_heads"
+    ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
     pytest.param(dict(is_causal=False), QsaSpec(), {}, torch.bfloat16, ValueError, "is_causal=True", id="bidirectional"),
     pytest.param(dict(window_left=64), QsaSpec(), {}, torch.bfloat16, ValueError, "sliding window", id="window"),
@@ -335,6 +350,143 @@ def test_declaration_declines_every_sparse_request_it_cannot_serve(geom_kw, qsa,
             GatedAttentionBlockFwd(**kw_d, geometry=dense, **blk_kw)
         except (NotImplementedError, ValueError) as e:  # a dense decline of its own is fine; the sparse wording is not
             assert "QsaSpec" not in str(e)
+
+
+def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contract_flips():
+    """``QsaSpec(index_source="indexer")`` CONSTRUCTS (no host sync): the indexer stage sits right before the sparse SDPA in the
+    stage list; below the identity bound it reserves nothing (the carve is the caller-list block's, the selection a plan-time
+    identity) and past it the five slots (its queries, the compressed keys, the list, the scores, the scorer's scratch -- the
+    scratch's closed form equal to the DSA sizing helper's count); ``execute`` then REQUIRES the two indexer norm weights,
+    REFUSES ``block_ids`` / ``block_lens``, form-checks the three optional outputs, and a caller-list or a dense block refuses
+    every one of the five; off Rubin ``check_support`` declines ahead of any launch -- below cc 10 from the indexer stage, naming
+    the scorer's device family, on a cc 10.x part other than Rubin from the sparse adapter's record, naming the found cc (the
+    indexer accepts the family) -- both texts exercised on every GPU host through a simulated capability.  Form only, no plan,
+    no launch."""
+    from cudnn.deepseek_sparse_attention.indexer_forward import compress_topk_cand_buffer_size_thd
+    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _Indexer, _qsa_cand_floats, _qsa_indexer_slots
+
+    spec = QsaSpec(index_source="indexer", index_band=True)
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=spec)
+    with _no_host_sync():
+        for b, s, lens in ((2, 8, False), (1, spec.identity_bound, False), (1, spec.identity_bound + 1, False), (2, 2300, True)):
+            blk = GatedAttentionBlockFwd(**_samples(geom, batch=b, seq_len=s), geometry=geom, return_lse=True, seq_lens_present=lens)
+            ix = blk._indexer
+            assert isinstance(ix, _Indexer) and blk._stages.index(ix) == blk._stages.index(blk._sdpa) - 1
+            assert ix.selects == (s > spec.identity_bound) and ix.n_blocks == s // spec.block_size
+            lay = blk._layout()
+            caller = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
+            lay_c = GatedAttentionBlockFwd(**_samples(caller, batch=b, seq_len=s), geometry=caller, return_lse=True, seq_lens_present=lens)._layout()
+            if not ix.selects:
+                assert ix.cand_floats == 0 and lay == lay_c and lay.ix_q == -1
+            else:
+                e, t = _itemsize(torch.bfloat16), b * s
+                assert ix.cand_floats == _qsa_cand_floats(b, s, spec.block_size) > 0
+                # the slots in the stage's own order, each 256-B aligned, appended after the caller-list block's carve; the names and
+                # byte counts are the stage's (the layout pins the arithmetic: order, alignment, the total)
+                slots = _qsa_indexer_slots(geom, b, s, e, ix.cand_floats)
+                assert [nm for nm, _ in slots] == ["ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand", "ix_ids_sorted", "ix_sort_idx"]
+                assert (
+                    dict(slots)["ix_q"] == t * spec.index_heads * spec.index_head_dim * e and dict(slots)["ix_kbar"] == b * (s // 4) * spec.index_head_dim * e
+                )
+                assert dict(slots)["ix_ids"] == dict(slots)["ix_ids_sorted"] == t * spec.top_k * 4 and dict(slots)["ix_cand"] == ix.cand_floats * 4
+                acc = lay_c.total_bytes
+                for nm, nbytes in slots:
+                    assert getattr(lay, nm) == acc, nm
+                    acc += _align_up(nbytes)
+                assert lay.total_bytes == acc
+    if torch.cuda.is_available():
+        # the scratch's closed form against the DSA helper that sizes it on device (a drift would mis-size the workspace)
+        for b, s in ((1, 2052), (2, 2300), (3, 4097)):
+            cu_q = (torch.arange(b + 1, device="cuda") * s).to(torch.int32)
+            cu_k = (torch.arange(b + 1, device="cuda") * (s // 4)).to(torch.int32)
+            assert compress_topk_cand_buffer_size_thd(cu_q, cu_k, 4, None)[1] == _qsa_cand_floats(b, s, 4)
+    # the execute contract (form only, before any plan): what the indexer block needs, refuses and form-checks
+    b, s = 2, 8
+    kw = _samples(geom, batch=b, seq_len=s)
+    args = tuple(kw[k] for k in ("sample_h", "sample_w_qkvg", "sample_w_q_norm", "sample_w_k_norm", "sample_cos", "sample_sin", "sample_w_o", "sample_out"))
+    ws = torch.zeros(16, dtype=torch.uint8, device=_DEV)
+    w = torch.ones(spec.index_head_dim, dtype=torch.bfloat16, device=_DEV)
+    i32 = lambda *shape: torch.zeros(*shape, dtype=torch.int32, device=_DEV)  # noqa: E731
+    kb = lambda nb: torch.zeros(b, nb, spec.index_head_dim, dtype=torch.bfloat16, device=_DEV)  # noqa: E731
+    with _no_host_sync():
+        blk = GatedAttentionBlockFwd(**kw, geometry=geom)
+        for ex_kw, match in (
+            (dict(block_ids=i32(b * s, 512), w_iq_norm=w, w_ik_norm=w), "derives the selection"),
+            (dict(block_lens=i32(b * s), w_iq_norm=w, w_ik_norm=w), "derives the selection"),
+            (dict(w_ik_norm=w), "needs w_iq_norm"),
+            (dict(w_iq_norm=w), "needs w_ik_norm"),
+            (dict(w_iq_norm=w.half(), w_ik_norm=w), r"w_iq_norm must be a contiguous \[128\] torch.bfloat16"),
+            (dict(w_iq_norm=w, w_ik_norm=w[:64]), r"w_ik_norm must be a contiguous \[128\]"),
+            (dict(w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(1)), r"index_k_compressed must be \[B=2, >= 2"),
+            (dict(w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(2).half()), "index_k_compressed must be a contiguous torch.bfloat16"),
+            (dict(w_iq_norm=w, w_ik_norm=w, block_ids_out=i32(b * s, 511)), r"block_ids_out must be \[16, 512\] or \[2, 8, 512\]"),
+            (dict(w_iq_norm=w, w_ik_norm=w, block_ids_out=i32(b * s, 512).to(torch.int64)), "block_ids_out must be int32"),
+            (dict(w_iq_norm=w, w_ik_norm=w, block_lens_out=i32(b * s + 1)), r"block_lens_out must be \[16\] or \[2, 8\]"),
+        ):
+            with pytest.raises(ValueError, match=match):
+                blk.execute(*args, ws, **ex_kw)
+        # well-formed (every optional output, the cache wider than the prompt's blocks): the next refusal is the plan's
+        with pytest.raises(RuntimeError, match="call compile"):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(5), block_ids_out=i32(b, s, 512), block_lens_out=i32(b * s))
+        with pytest.raises(RuntimeError, match="call compile"):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w)
+        # the mirror images: a caller-list block and a dense block refuse the indexer's tensors rather than ignoring them
+        caller = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
+        blk_c = GatedAttentionBlockFwd(**_samples(caller, batch=b, seq_len=s), geometry=caller)
+        for ex_kw in (
+            dict(w_iq_norm=w),
+            dict(w_ik_norm=w),
+            dict(index_k_compressed=kb(2)),
+            dict(block_ids_out=i32(b * s, 512)),
+            dict(block_lens_out=i32(b * s)),
+        ):
+            with pytest.raises(ValueError, match="index_source='caller'"):
+                blk_c.execute(*args, ws, block_ids=i32(b * s, 512), **ex_kw)
+        dense = GatedAttentionBlockGeometry(**_SMALL_D256)
+        kw_d = _samples(dense, batch=b, seq_len=s)
+        args_d = tuple(
+            kw_d[k] for k in ("sample_h", "sample_w_qkvg", "sample_w_q_norm", "sample_w_k_norm", "sample_cos", "sample_sin", "sample_w_o", "sample_out")
+        )
+        blk_d = GatedAttentionBlockFwd(**kw_d, geometry=dense)
+        for ex_kw in (dict(w_iq_norm=w), dict(block_ids_out=i32(b * s, 512)), dict(index_k_compressed=kb(2))):
+            with pytest.raises(ValueError, match="declared without geometry.qsa"):
+                blk_d.execute(*args_d, ws, **ex_kw)
+    if torch.cuda.is_available():
+        # the canonical row sort the stage runs after the top-k: torch's small-segment sort into PREALLOCATED outputs, descending
+        # (the -1 padding last), equal to torch's own result, and no allocation retained across the call (Rule 1's observable)
+        rows, top_k = 4096 + 7, spec.top_k
+        g = torch.Generator(device="cuda").manual_seed(3)
+        raw = torch.randperm(4 * top_k, device="cuda", generator=g)[:top_k].to(torch.int32).repeat(rows, 1)
+        raw[:, 300:] = -1
+        dst = torch.empty_like(raw)
+        scratch = torch.empty(_QSA_SORT_ROWS, top_k, dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        for r0 in range(0, rows, _QSA_SORT_ROWS):
+            r1 = min(rows, r0 + _QSA_SORT_ROWS)
+            torch.sort(raw[r0:r1], dim=-1, descending=True, out=(dst[r0:r1], scratch[: r1 - r0]))
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == before
+        assert (
+            torch.equal(dst, torch.sort(raw, dim=-1, descending=True).values)
+            and bool((dst[:, 300:] == -1).all())
+            and bool((dst[:, :299] > dst[:, 1:300]).all())
+        )
+    if torch.cuda.is_available():
+        # Off Rubin the block declines before any launch, and WHICH stage speaks depends on the part: below cc 10 the indexer
+        # stage (it precedes the sparse SDPA) names the scorer's device family; on a cc 10.x part other than Rubin (B200 / GB300)
+        # the indexer ACCEPTS -- the scorer is an SM100-family kernel -- and the sparse adapter's record declines, naming the
+        # found cc.  Both texts on every GPU host through a simulated capability (restored on exit), then the real device.
+        for sim_cc, pattern in (((9, 0), r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"), ((10, 0), r"Rubin-line GPU.*got cc 10\.0")):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(torch.cuda, "get_device_capability", lambda *a, _cc=sim_cc, **k: _cc)
+                with pytest.raises(NotImplementedError, match=pattern):
+                    blk.check_support()
+        cc = tuple(torch.cuda.get_device_capability())
+        if cc != (10, 7):
+            pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] == 10 else r"cc 10\.x"
+            with pytest.raises(NotImplementedError, match=pattern):
+                blk.check_support()
 
 
 def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_reads_off_the_record():
@@ -554,7 +706,9 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     """AGENTS.md Rule 7 through the BLOCK: a too-old DSL is a typed version decline from the sparse stage's ``check_support``
     (the adapter's first check), raised before the kernel module is loaded -- never a ``KeyError('sm_107a')`` from inside the
     DSL.  Both halves: the library floor (the installed version substituted below 4.7.0) and the ``sm_107a`` target (a DSL
-    without it on a cc 10.7 device, the device capability substituted so the probe runs on any GPU).  No launch, no GPU work."""
+    without it on a cc 10.7 device, the device capability substituted so the probe runs on any GPU).  Then the in-block indexer's
+    three arms: its floor at DECLARATION (ahead of the head-group read that imports the scorer's package), its floor and its
+    ``sm_107a`` target from the stage's own ``check_support``.  No launch, no GPU work."""
     import re
 
     import cudnn.frost.buffers as buffers
@@ -574,6 +728,29 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     with pytest.raises(NotImplementedError, match="sm_107a"):
         blk2.check_support()
     assert blk2._sdpa._impl._module is None
+    # The in-block indexer (QsaSpec(index_source="indexer")) carries the floor TWICE: at DECLARATION -- the scorer's packed head
+    # groups are read off the DSA tree, whose package imports its kernel modules, so the version decline must come first -- and
+    # from the stage's own check_support; the sm_107a target from the stage.  The head-group reader is replaced by a failing
+    # stub, so REACHING it below the floor is the failure, never an import error from inside the DSL.
+    import cudnn.gated_attention_block.qsa_select as qsa_select
+
+    real_groups = qsa_select.indexer_scorer_head_groups
+    geom_ix = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    blk_ix = GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # declared AT the floor (4.8.0 above): the stage arms run on it
+    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
+        GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # the declaration-time arm
+    with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
+        blk_ix._indexer.check_support()  # the stage on its own
+    assert blk_ix._indexer._k_recipe is None and blk_ix._sdpa._impl is None  # nothing compiled; no stage past the indexer was asked
+    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", real_groups)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)  # the capability still reads (10, 7) from above
+    with pytest.raises(NotImplementedError, match="sm_107a"):
+        blk_ix._indexer.check_support()
+    assert blk_ix._indexer._k_recipe is None
 
 
 # ---------------------------------------------------------------------------

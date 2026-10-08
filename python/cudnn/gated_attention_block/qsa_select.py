@@ -59,9 +59,19 @@ import torch
 from cudnn.api_base import TupleDict
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
-__all__ = ["qsa_select", "QSA_BLOCK_SIZE", "QSA_TOP_K", "qsa_select_decode", "decode_row_positions_and_counts", "TOP_K_KERNEL_MAX"]
+__all__ = [
+    "qsa_select",
+    "QSA_BLOCK_SIZE",
+    "QSA_TOP_K",
+    "qsa_select_decode",
+    "decode_row_positions_and_counts",
+    "TOP_K_KERNEL_MAX",
+    "INDEXER_SCORER_HEAD_DIM",
+    "indexer_scorer_head_groups",
+]
 
 QSA_BLOCK_SIZE = 4  # tokens per compressed block (the compression ratio of the indexer)
+INDEXER_SCORER_HEAD_DIM = 128  # the head dim the indexer scorer packs (qi and kbar rows); the block's in-block indexer declines any other
 QSA_TOP_K = 512  # blocks kept per token (2048 selected tokens / 4)
 TOP_K_KERNEL_MAX = 2048  # the radix top-k kernel's bound on top_k (0 < top_k <= 2048); the block's own cap (512) is QsaSpec's
 _SCORE_ROW_ALIGN = 8  # fp32 score rows are read by the top-k kernel in 256-bit vectors: n_blocks_max must be a multiple of 8
@@ -73,6 +83,18 @@ _MXFP8_TILE_ROWS = 128  # the MXFP8 scorer's packed-row tile (fixed; the bf16 sc
 
 _ones_cache: dict = {}
 _ones_cache_lock = Lock()
+
+
+def indexer_scorer_head_groups() -> tuple:
+    """The indexer head counts per token the bf16 scorer packs on its MMA tile -- the DSA kernel's own contract, read, not
+    transcribed.  The module that spells it carries no kernel import of its own, but importing it runs the DSA package's
+    ``__init__`` (its kernel modules): a declaration-time caller gates the CuTe DSL floor FIRST
+    (``api._check_qsa_indexer_geometry``), so a too-old DSL reads as a version decline, never as an error from inside the DSL."""
+    from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
+
+    return tuple(SUPPORTED_QHEAD_PER_KV_HEAD_BF16)
+
+
 _cu_k_cache: dict = {}
 _cu_k_cache_lock = Lock()
 _unit_scale_cache: dict = {}

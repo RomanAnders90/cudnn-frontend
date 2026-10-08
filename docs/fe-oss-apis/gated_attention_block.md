@@ -195,9 +195,9 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 |---|---|
 | `block_size` (`4`) | tokens per selectable block; 4 only (one gather of four rows per block) |
 | `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
-| `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer (not served yet) |
+| `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer over its own band and derives the selection (bf16, `index_band=True`; "The in-block indexer" below) |
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
-| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); no kernel scores with them today |
+| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); under `index_source="indexer"` the scorer reads them (`index_heads` one of its packed head groups, `index_head_dim` its head dim) |
 
 `QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
 every query's complete blocks fit the list, so a full list reproduces dense causal attention exactly. `is_causal=False` or a
@@ -232,6 +232,11 @@ Served today:
   `[B, S, d_model]` with or without `seq_lens`, `return_lse` on or off, `fuse_norm_rope` (without the band), `inplace_qkv`
   on or off, the indexer band on the unfused projection, `paged_kv_page_size` write-through; validated on Rubin (SM107) at
   the 24/2, 12/1, 6/1 and 32/2 geometries against the fp32 QSA oracle.
+- the in-block indexer: a block declared `QsaSpec(index_source="indexer", index_band=True)` derives the selection itself from
+  the band -- `execute(..., w_iq_norm=, w_ik_norm=)` instead of `block_ids=` -- and hands it back through the optional
+  `block_ids_out` / `block_lens_out` / `index_k_compressed`; the contract is "The in-block indexer" in the serving section
+  below.  bf16 only (the scorer's dtype); validated on Rubin against the two-stage oracle (the selection under the margin
+  rule, attention exact given the kernel's selection).
 
 Every claim of the sparse core -- the dtypes, the head dim, the block size, the `top_k` range, the GQA group, the arms it does
 not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.sparse_gqa_sm107.SPARSE_CAPABILITIES`), which the
@@ -239,9 +244,12 @@ adapter's own `check_support` enforces; the block transcribes none of it. Typed 
 `thd`, `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
 `fuse_gate` (the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch), `fuse_norm_rope` together with
 `index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them -- the unfused projection serves
-the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `index_source="indexer"`, `d_head != 256`; and at
-`check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0 wheel), named with the installed version,
-before the kernel module is imported.
+the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`; under `index_source="indexer"` also an f16
+activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
+(4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0
+wheel), named with the installed version, before the kernel module is imported. Under `index_source="indexer"` the floor is
+checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose package imports its kernels, so a
+too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the stage's `check_support`).
 
 ### Serving: index lists and paged KV
 
@@ -297,8 +305,9 @@ twice-attended reading so a change of it is visible.
 visible tokens has at most 512 complete blocks, so the FULL list makes the sparse core compute dense causal attention (the
 same function, summed in another order). The block still ALWAYS runs the sparse core under `index_source="caller"`: it
 never reads a list, so it cannot know that a list is the identity, and a dense route would ignore the list -- a different
-function, never a knob. A dense route below the bound is legal only under `index_source="indexer"` (the block derives the
-selection itself and knows that nothing is dropped; a follow-up).
+function, never a knob. Under `index_source="indexer"` the block DOES know: at `S <= 2051` it launches no scorer and hands the
+sparse core the identity list as a plan-time constant (below); routing that case to the dense SDPA instead of the sparse core
+would be a legal performance knob there, and stays a follow-up.
 
 **The decode mode and the speculative (MTP) rows -- the contract is fixed; the mode is a follow-up.** `S_q <= 4` query
 rows per sequence (one new token, or `1 + drafts`), attention over the pools through `block_table` / `kv_lens`. ONE list per
@@ -312,13 +321,71 @@ approximations of a per-row re-selection. The reference oracle takes the step-0 
 `None` yields the per-row-tail reading, so a shim that needs that parity can pin it. Chunked prefill over a cached prefix
 is the same paged-READ mode with one list per new row (`[T, top_k]`) at positions `prefix_len + s`.
 
-**Inert indexer fields.** `QsaSpec.index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` size the fifth
+**The indexer fields.** `QsaSpec.index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` size the fifth
 band of `W_qkvg` -- and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool `index_k_raw` (next
-section); no kernel SCORES with them today (the in-block indexer is a follow-up).
+section); under `index_source="caller"` no kernel scores with them, under `index_source="indexer"` they are the scorer's.
+
+**The in-block indexer (`QsaSpec(index_source="indexer", index_band=True)`, bf16).** The block derives the selection
+from its own fifth band -- five launches at `T <= 4096` (two compress launches, the scorer GEMM, the radix top-k, the row
+sort; one more sort window per further 4096 rows), no kernel of its own: (1) the band's indexer QUERIES, RMSNormed with
+`w_iq_norm` (`index_norm_eps`) and partially rotated at the token's position -- the block-compress kernel at pool 1 over
+the slab's query columns, bitwise the block's own norm + RoPE chain on those rows (one fp32 pass, one rounding); (2) the
+COMPRESSED KEYS -- the band's raw key head mean-pooled in fp32 per complete 4-token block, RMSNormed with `w_ik_norm` and
+rotated at the block START position `4j`, one rounding -- the same kernel over the slab's raw-key slice; (3) the
+SELECTION -- the indexer scorer `sum_h relu(q_h . kbar_j) / sqrt(index_head_dim)` over the blocks below
+`floor((pos + 1) / 4)` and the fused radix top-k (ties to the smaller id) -- `cudnn.gated_attention_block.qsa_select`, the
+DSA compressed-logits path, so the dense `[T, n_blocks]` score tensor is never materialized; (4) the CANONICAL ORDER -- the
+top-k's set is reproducible but its slot order is not, and the core accumulates in list order, so each row is sorted (the
+selected ids descending, the `-1` padding last) before the core: two executes of the block are bitwise, and the list a caller
+gets back is canonical. The list is `[T, top_k]` int32 with exactly the derived count `min(top_k, floor((pos + 1) / 4))` of
+valid ids then `-1`, so the sparse core takes it without `block_lens`.
+
+| the stack hands in / gets back | form | meaning |
+|---|---|---|
+| `w_iq_norm`, `w_ik_norm` | `[index_head_dim]` activation dtype, contiguous; REQUIRED | the indexer's two RMSNorm weights in the pre-folded `(1 + w)` form the attention's `w_q_norm` / `w_k_norm` use (the loader's convention) |
+| `block_ids` / `block_lens` | -- | REFUSED: the block derives the selection |
+| `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous; optional | the block's OWN selection in canonical order (ids descending, then `-1`), written in place (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
+| `block_lens_out` | int32 `[T]` or `[B, S_q]`, contiguous; optional | the valid-prefix length of every row of that list, `min(top_k, floor((pos + 1) / 4))` -- the position rule, padding rows included |
+| `index_k_compressed` | activation dtype `[B, >= floor(S / 4), index_head_dim]`, contiguous; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
+
+**The RoPE tables are the attention's own.** The compress reads `cos` / `sin` at row `4j` for block `j` (every block start
+is a position of the prefill) and the query norm at row `pos`: no appended block-start table and no position ids. A
+decode step's per-token tables do not reach a block start; its compress (the step form of the same kernel) states its own
+table-extent rule.
+
+**The identity below 2051 visible tokens.** At `S <= QsaSpec.identity_bound` every query's complete blocks fit the list,
+so the selection is the identity: the block launches NO scorer and NO query norm, hands the sparse core a plan-time constant
+list (`ids[t, j] = j` below the row's count, `-1` past it; copied into `block_ids_out` on request) and reserves no indexer
+workspace; the key compress runs only when `index_k_compressed` is given (a serving cache wants the prompt's compressed
+keys whatever its length). Past the bound the block is BITWISE the caller-list block fed its own `block_ids_out`.
+
+**Padding rows and `seq_lens`.** A row at or past its sequence's KV length is scored like every other row (the position
+rule); the compressed-key rows past the sequence's complete blocks are zero-filled in the block's workspace per execute, so
+such a row's extra candidates score 0 -- a positive visible block always wins, a zero-score tie goes to the smaller
+(visible) id -- and the sparse core masks every key past the length anyway. The caller's `index_k_compressed` is not
+zero-filled (its rows past a sequence's blocks are the caller's); a padding row's list may name blocks past its range,
+which attention never reads.
+
+**What it costs.** Past the bound the workspace grows by the indexer's queries (`T x index_heads x index_head_dim x 2` B),
+the compressed keys (`B x S / 4 x index_head_dim x 2` B), the list, its sorted copy and its scores (`T x top_k x 12` B), the
+row sort's index scratch and the scorer's compact-logits scratch, `~ B x S^2 / 8` fp32 (512 MiB per 32K-token sequence):
+the price of one launch pair that never
+materializes the dense score tensor; a row-windowed selection bounds it and is the lever for longer prompts.
+`compile()` warms the scorer and the top-k at the real shape (their compile keys carry it), so `execute` compiles nothing
+and allocates nothing.
+
+**What the suite asserts** (`test_block_qsa_end_to_end.py`, the two-stage oracle): the selection as a SET against the
+top-k of the scores recomputed in fp64 from the kernel's own bf16 queries and compressed keys up to ties; against the
+fp32-operand oracle under the MARGIN RULE -- a block in exactly one of the two sets is accepted iff its oracle score lies
+within `tol` of the row's k-th oracle score, `tol` the measured perturbation of the scores by the bf16 rounding of the
+operands (not a tuned number); the same against the HF-rounding oracle (the pooled key cast to bf16 before its norm); the
+queries and compressed keys within one bf16 ulp of the once-rounded fp32 chain; the count rule on every row; and attention
+EXACT given the kernel's selection -- the block oracle on the kernel's list within the dense suites' budgets.
 
 **The CuTe DSL floor.** The Rubin sparse core needs the public `nvidia-cutlass-dsl` 4.8.0 wheel (the `sm_107a`
 target); below it `check_support()` raises a typed `NotImplementedError` that names the installed version, BEFORE any
-kernel module is imported -- never a `KeyError` from inside the DSL.
+kernel module is imported -- never a `KeyError` from inside the DSL. An `index_source="indexer"` block raises the same
+decline already at declaration (the declines paragraph above).
 
 A prefill step with write-through into the stack's pools, the stack's own lists:
 
@@ -345,6 +412,7 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 | the stack has | the block / core takes |
 |---|---|
 | the top-k output over compressed blocks -- vLLM's `block_indices [num_tokens, 512]` BEFORE its block-to-token expansion, SGLang's `topk_indices [rows, 512]` when its backend keeps block indices | `block_ids`, as is (int32, contiguous); no expansion to token ids |
+| the stack's own indexer chain (the `index_qk_proj` GEMM, the compress, the scorer, the top-k) | `QsaSpec(index_source="indexer")`: the block's -- the band in the one projection GEMM, two compress launches, the scorer pair, the row sort; `block_ids_out` / `block_lens_out` hand the list back, `index_k_compressed` fills the stack's compressed-key cache |
 | the per-row count -- vLLM's `min(visible_blocks, 512)` (the expand kernel's `complete_blocks`), SGLang's visible-block count of its row ranges | `block_lens` (optional; pass it whenever a list is shorter than the derived default) |
 | vLLM's packed `[num_tokens, 2052]` buffer of token ids with the trailing count column | not a served form (the token-id arm is a follow-up) -- keep the block-id output of the top-k |
 | `slot_mapping` / `out_cache_loc` | `slot_mapping` (flat slot = page x P + offset; negative = no write) |
@@ -879,10 +947,12 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
 - Block-sparse attention (`QsaSpec`): bf16 / f16 inference, dense `[B, S, d_model]` (with or without `seq_lens`), `d_head == 256`,
-  `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`); the indexer band on the UNFUSED
-  projection; `thd`, `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band, `causal_bottom_right`
-  and `index_source="indexer"` are typed declines ("Sparse attention (QSA)" above); what a serving stack hands in -- the list
-  form, the count rule, the decode-mode list, the pools -- is the contract page "Serving: index lists and paged KV" above.
+  `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`) or the in-block indexer
+  (`index_source="indexer"`: bf16, the band, `index_head_dim` 128, `index_heads` in the scorer's packed groups); the indexer
+  band on the UNFUSED projection; `thd`, `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band
+  and `causal_bottom_right` are typed declines ("Sparse attention (QSA)" above); what a serving stack hands in -- the list
+  form, the count rule, the decode-mode list, the pools, the indexer's inputs and outputs -- is the contract page "Serving:
+  index lists and paged KV" above.
 - Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
   only; the pools are the activation dtype; `quant`, `save_for_backward` and `thd` together with it are typed declines;
   the paged-READ mode (`block_table` / `kv_lens`) is a typed decline ("Serving: write-through into a paged KV cache" above).

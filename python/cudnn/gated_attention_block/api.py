@@ -520,7 +520,12 @@ class QsaSpec:
         ``"caller"``: ``execute(block_ids=)`` carries the selection -- ``[T, top_k]`` int32, per query the ids of its
         selected complete blocks (block ``b`` = tokens ``[4b, 4b + 4)`` of the query's own sequence), the valid prefix
         then ``-1`` padding; ``block_lens`` optional.  ``"indexer"``: the block runs the indexer over its fifth band
-        itself -- a typed decline at declaration until that arm lands.
+        itself (``index_band`` required; bf16 activations): the band's query heads are RMSNormed and rotated per token,
+        its raw key head is mean-pooled per complete block, RMSNormed and rotated at the block START, and the scorer
+        keeps the ``top_k`` blocks per query -- ``execute`` then takes ``w_iq_norm`` / ``w_ik_norm`` and refuses
+        ``block_ids``; the selection, its counts and the compressed keys come out through the optional caller buffers
+        ``block_ids_out`` / ``block_lens_out`` / ``index_k_compressed``.  At ``S <= identity_bound`` the block launches
+        no scorer: the selection is the identity, a plan-time constant (:class:`_Indexer`).
     index_band
         ``W_qkvg`` carries a FIFTH band, ``ProjBlock.INDEX``, of ``(index_heads + index_kv_heads) * index_head_dim``
         columns below V: the indexer's query heads first, its single raw key head last (the checkpoint's own row
@@ -528,10 +533,11 @@ class QsaSpec:
         the wider slab; :func:`index_k_raw_view` exposes the raw key); the fused projection fork renders 256-column
         tiles and declines a 640-column band, typed.
     index_heads, index_kv_heads, index_head_dim, index_norm_eps
-        The indexer's geometry.  They SIZE THE BAND ONLY today and are UNREAD by any kernel -- documented inert; the
-        in-block indexer that scores with them is the follow-up.  ``index_kv_heads`` is 1 (one raw key head, the
-        checkpoint's own validator pins it); ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer
-        head keeps the band tile-aligned.
+        The indexer's geometry.  Under ``index_source="caller"`` they SIZE THE BAND ONLY (no kernel reads them); under
+        ``"indexer"`` they are the scorer's: ``index_heads`` a head group the indexer scorer packs, ``index_head_dim``
+        its head dim, ``index_norm_eps`` the epsilon of both indexer RMSNorms (``cudnn.gated_attention_block.qsa_select``
+        names the two).  ``index_kv_heads`` is 1 (one raw key head, the checkpoint's own validator pins it);
+        ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer head keeps the band tile-aligned.
 
     Fixed semantics that are deliberately NOT fields: the open tail block is always visible, the causal mask is always
     applied, and the id dtype is int32 (one legal value; an int64 list is refused at ``execute``).  A dense route below
@@ -1202,6 +1208,16 @@ class _Intermediates:
     # so never reserved); on the fused arm ``o`` (bf16) takes its place, since the gated SDPA then writes bf16 O.
     o4: int = -1
     sf_o: int = -1
+    # The in-block indexer (``QsaSpec.index_source="indexer"``, ``S`` past the identity bound) only (-1 otherwise), at the END of
+    # the layout: the normed + rotated indexer queries, the compressed keys the scorer reads, the selection (ids + scores) and
+    # the scorer's compact-logits scratch -- :func:`_qsa_indexer_slots`.  Every layout without the indexer is byte-identical.
+    ix_q: int = -1  # [T, index_heads, index_head_dim] activation dtype
+    ix_kbar: int = -1  # [B, floor(S / block_size), index_head_dim] activation dtype
+    ix_ids: int = -1  # [T, top_k] int32: the top-k's output (its slot order unspecified)
+    ix_scores: int = -1  # [T, top_k] fp32
+    ix_cand: int = -1  # [cand_floats] fp32
+    ix_ids_sorted: int = -1  # [T, top_k] int32: the canonical list the sparse core consumes (ids descending, then -1)
+    ix_sort_idx: int = -1  # [min(T, _QSA_SORT_ROWS), top_k] int64: the row sort's index output, reused per row window
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -1238,6 +1254,7 @@ def _plan_workspace(
     o_fp4: Optional[Fp4Format] = None,
     want_saved: bool = False,
     saved_gate_copy: bool = False,
+    qsa_indexer_cand_floats: Optional[int] = None,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -1269,6 +1286,11 @@ def _plan_workspace(
     is not reserved); on the fused arm the bf16 ``o`` the gated SDPA then writes
     takes ``o8``'s place.  Every layout with ``o_fp4=None`` is byte-identical to
     before (pinned by ``test_workspace_layout_is_byte_identical_without_fp4``).
+
+    ``qsa_indexer_cand_floats`` (appended; ``None`` = no in-block indexer) appends
+    the indexer's five slots (:func:`_qsa_indexer_slots`, the scorer's compact-logits
+    scratch sized at that many fp32) at the END of the unfused layout; every layout
+    without it is byte-identical to before.
 
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
@@ -1302,6 +1324,11 @@ def _plan_workspace(
             )
     elif saved_gate_copy:
         raise ValueError("saved_gate_copy=True selects the gate-copy SAVE mode of a training forward and has no meaning without want_saved=True")
+    if qsa_indexer_cand_floats is not None and (fp8_fused or fp8 or want_saved):
+        raise ValueError(
+            "qsa_indexer_cand_floats (the in-block indexer's workspace slots) belongs to the bf16 inference pipeline: the block declines the "
+            "indexer under quant / save_for_backward at declaration, so a quantized or training carve never reserves them"
+        )
     e = _itemsize(dtype)
     t = b * s
     off = 0
@@ -1412,6 +1439,9 @@ def _plan_workspace(
     if o_fp4 is not None:
         # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
         slots += _o_fp4_slots(geom, t, o_fp4)
+    if qsa_indexer_cand_floats is not None:
+        # The in-block indexer: its queries, compressed keys, selection and the scorer's scratch, after everything else.
+        slots += _qsa_indexer_slots(geom, b, s, e, qsa_indexer_cand_floats)
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -1436,6 +1466,13 @@ def _plan_workspace(
         sf_v=offsets.get("sf_v", -1),
         o4=offsets.get("o4", -1),
         sf_o=offsets.get("sf_o", -1),
+        ix_q=offsets.get("ix_q", -1),
+        ix_kbar=offsets.get("ix_kbar", -1),
+        ix_ids=offsets.get("ix_ids", -1),
+        ix_scores=offsets.get("ix_scores", -1),
+        ix_cand=offsets.get("ix_cand", -1),
+        ix_ids_sorted=offsets.get("ix_ids_sorted", -1),
+        ix_sort_idx=offsets.get("ix_sort_idx", -1),
     )
 
 
@@ -1462,6 +1499,42 @@ def _o_fp4_slots(geom: GatedAttentionBlockGeometry, t: int, o_fp4: Fp4Format) ->
         ("o4", _o_fp4_code_bytes(geom, t)),
         ("sf_o", sf_blob_bytes(t, geom.h_q * geom.d_head, o_fp4.block_size)),
     ]
+
+
+def _qsa_cand_floats(batch: int, seq_len: int, block_size: int) -> int:
+    """fp32 elements of the indexer scorer's compact-logits scratch for ``batch`` dense sequences of ``seq_len`` tokens.
+
+    The scorer writes, per query at position ``p``, its ``floor((p + 1) / block_size)`` ratio-causal candidate scores
+    compactly, so one sequence needs ``sum_{m=1}^{S} floor(m / bs)`` floats -- the closed form the DSA sizing helper
+    (``compress_topk_cand_buffer_size_thd``) evaluates on device; :meth:`_Indexer.compile` cross-checks the two and
+    raises on a drift.  Quadratic in ``S`` (``~ S^2 / (2 bs)``): 512 MiB per 32K-token sequence at ``bs = 4``.
+    """
+    q, r = divmod(int(seq_len), int(block_size))
+    return int(batch) * (int(block_size) * q * (q - 1) // 2 + q * (r + 1))
+
+
+def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, cand_floats: int) -> list:
+    """The in-block indexer's workspace slots, in the order its launches write them: the normed + rotated indexer
+    queries ``ix_q`` ``[T, index_heads, index_head_dim]``, the compressed keys ``ix_kbar`` ``[B, floor(S / bs), index_head_dim]``
+    (the scorer's key operand), the selection ``ix_ids`` / ``ix_scores`` ``[T, top_k]`` int32 / fp32 and the scorer's
+    compact-logits scratch ``ix_cand`` (``cand_floats`` fp32).  Reserved only when the scorer runs (``S`` past the
+    identity bound); below it the block has nothing to select and the carve is the dense one."""
+    q = geom.qsa
+    t = b * s
+    return [
+        ("ix_q", t * q.index_heads * q.index_head_dim * e),
+        ("ix_kbar", b * (s // q.block_size) * q.index_head_dim * e),
+        ("ix_ids", t * q.top_k * _itemsize(torch.int32)),
+        ("ix_scores", t * q.top_k * _itemsize(torch.float32)),
+        ("ix_cand", int(cand_floats) * _itemsize(torch.float32)),
+        ("ix_ids_sorted", t * q.top_k * _itemsize(torch.int32)),
+        ("ix_sort_idx", min(t, _QSA_SORT_ROWS) * q.top_k * _itemsize(torch.int64)),
+    ]
+
+
+_QSA_SORT_ROWS = 4096
+"""Rows per launch of the in-block indexer's canonical row sort: bounds the int64 index scratch the sort writes (16 MiB at
+``top_k = 512``) at the price of ``ceil(T / 4096)`` launches."""
 
 
 # ---------------------------------------------------------------------------
@@ -4216,6 +4289,317 @@ class _CacheWrite(_Stage):
 
 
 # ---------------------------------------------------------------------------
+# 5b. The in-block indexer (block-sparse attention, QsaSpec.index_source="indexer")
+# ---------------------------------------------------------------------------
+
+
+def _cu_check(err, what: str) -> None:
+    """Raise on a CUDA driver error from one of the block's own stream-ordered driver calls (a memset or a device copy)."""
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"{what} failed: {err}")
+
+
+def _check_qsa_indexer_geometry(geom: GatedAttentionBlockGeometry, dtype: torch.dtype, *, thd: bool = False) -> None:
+    """``QsaSpec(index_source="indexer")`` against the indexer scorer's contract -- device-free, typed
+    ``NotImplementedError`` naming the feature: the activation dtype the scorer packs, its head dim, its head groups,
+    the packed form.  Called at declaration (``GatedAttentionBlockFwd._check_qsa_indexer_declaration``) and again by the
+    stage's ``check_support`` so the stage stays honest on its own."""
+    from cudnn.frost.buffers import cutedsl_requirement_error
+
+    from .qsa_select import INDEXER_SCORER_HEAD_DIM, indexer_scorer_head_groups
+
+    q = geom.qsa
+    if dtype != torch.bfloat16:
+        raise NotImplementedError(
+            f"QsaSpec(index_source='indexer') needs bf16 activations: the indexer scorer packs bf16 queries and compressed keys, got {dtype}; "
+            "declare the bf16 pipeline, or hand the selection in under index_source='caller'"
+        )
+    if q.index_head_dim != INDEXER_SCORER_HEAD_DIM:
+        raise NotImplementedError(
+            f"QsaSpec(index_source='indexer', index_head_dim={q.index_head_dim}): the indexer scorer packs {INDEXER_SCORER_HEAD_DIM}-wide heads; "
+            "another head dim has no scorer (the caller-list form serves any tile-aligned band)"
+        )
+    if thd:
+        raise NotImplementedError(
+            "QsaSpec(index_source='indexer') with thd=True: the in-block indexer scores dense [B, S] prompts; its packed-sequence form (the "
+            "scorer over a query prefix, one compressed-key row range per sequence) is a follow-up -- hand the selection in under "
+            "index_source='caller'"
+        )
+    # The scorer's head groups are read off the DSA tree, whose package imports its kernel modules: the CuTe DSL floor first
+    # (Rule 7), so a too-old DSL reads as a version decline here and never as an error from inside the DSL.
+    too_old = cutedsl_requirement_error("the in-block indexer (the indexer scorer)")
+    if too_old is not None:
+        raise NotImplementedError(too_old)
+    groups = indexer_scorer_head_groups()
+    if q.index_heads not in groups:
+        raise NotImplementedError(
+            f"QsaSpec(index_source='indexer', index_heads={q.index_heads}): the indexer scorer packs head groups {groups} on its MMA tile; "
+            "another head count has no scorer"
+        )
+
+
+class _Indexer(_Stage):
+    """(4i) The in-block indexer of a block-sparse (``QsaSpec``) block declared with ``index_source="indexer"``: the
+    per-query selection stage (4) consumes, derived from the slab's fifth band instead of handed in by the caller.
+
+    **Five launches at ``T <= 4096`` -- two compress, the scorer GEMM, the radix top-k, the row sort -- one more sort window
+    per further 4096 rows (:meth:`launches_per_execute`); no kernel of its own.**
+
+    1. The indexer QUERIES -- the band's ``index_heads`` x ``index_head_dim`` query columns of every token, RMSNormed
+       (``w_iq_norm``, ``index_norm_eps``) and partially rotated at the token's position -- through the block-compress
+       kernel (``kernels/qsa_compress.py``) at ``pool = 1`` over a ``[T, index_heads, index_head_dim]`` view of the slab
+       (batch = token, block = head; the tables broadcast over the heads with a zero stride): bitwise the block's own
+       norm + RoPE chain on those rows (one fp32 pass, one rounding), written compact into the ``ix_q`` slot.
+    2. The COMPRESSED KEYS -- the band's raw key head mean-pooled per complete ``block_size``-token block, RMSNormed
+       (``w_ik_norm``) and rotated at the block START position ``block_size * j`` -- the same kernel at
+       ``pool = block_size`` over the slab's raw-key column slice (token stride ``n_qkvg``, no copy), into the
+       ``ix_kbar`` slot ``[B, floor(S / bs), D_i]`` and, when the caller passes ``index_k_compressed``, into that buffer
+       as well (its rows at or past a sequence's complete blocks are never written: a cache sized for a longer context
+       keeps them).
+    3. The SELECTION -- :func:`qsa_select` (the indexer scorer ``sum_h relu(q_h . kbar_j) / sqrt(D_i)`` over the blocks
+       below ``floor((pos + 1) / bs)`` + the fused radix top-k, ties to the smaller id) into ``ix_ids`` / ``ix_scores``:
+       ``[T, top_k]`` int32, the ``min(top_k, floor((pos + 1) / bs))`` selected ids then ``-1`` -- exactly the count rule
+       the sparse core derives, so stage (4) needs no ``block_lens``.  The top-k's SET is reproducible but its slot order
+       is not (the radix pass assigns slots with atomics), and the core accumulates in list order, so
+    4. the CANONICAL ORDER -- each row sorted descending (the selected ids descending, the ``-1`` padding last; a
+       row-windowed ``torch.sort`` into preallocated workspace slots, no temporaries) into ``ix_ids_sorted`` or the
+       caller's ``block_ids_out``: two executes of the block are bitwise, and the list a caller gets back is canonical.
+
+    **The RoPE tables are the attention's own** ``cos`` / ``sin`` ``[B, S, rope_dim]``: the key compress reads row
+    ``bs * j`` for block ``j`` (every block start is a position of the prefill), the query norm reads row ``pos``.  No
+    table of its own, no position ids; the decode step, whose per-token tables do not reach a block start, carries its
+    own table rule in the compress kernel's step form.
+
+    **The identity below the bound.**  At ``S <= QsaSpec.identity_bound`` every query's complete blocks fit the list, so
+    the selection is the identity: the block launches NO scorer and NO query norm, hands stage (4) a plan-time constant
+    list (``ids[t, j] = j`` below the row's count, ``-1`` past it) and reserves no indexer slot; the key compress runs
+    only into a caller's ``index_k_compressed`` (a serving cache wants the prompt's compressed keys whatever its length).
+
+    **Padding rows under ``seq_lens``.**  A query at or past its sequence's KV length scores blocks past the sequence's
+    complete ones; the ``ix_kbar`` slot is zero-filled per execute there (one memset, only under ``seq_lens_present``),
+    so those blocks score 0 -- a positive visible block always wins, a zero-score tie goes to the smaller (visible) id
+    -- and the sparse core masks every key past the length anyway.  The caller's ``index_k_compressed`` is NOT
+    zero-filled: its rows past a sequence's blocks are the caller's.
+
+    **What it costs.**  ``ix_q`` ``T x H_i x D_i x 2`` B, ``ix_kbar`` ``B x S / bs x D_i x 2`` B, the list
+    ``T x top_k x 8`` B, and the scorer's compact-logits scratch ``~ B x S^2 / (2 bs)`` fp32 (512 MiB per 32K-token
+    sequence) -- the price of never materializing the dense ``[T, n_blocks]`` score tensor in one launch pair; a
+    row-windowed select bounds it and is the lever for longer prompts.  ``compile`` warms the scorer GEMM and the top-k
+    at the real ``(B, S, n_blocks)`` (their compile keys carry the shape) on temporaries of the slot sizes, freed after
+    one synchronous run, so ``execute`` compiles nothing and allocates nothing (Rules 1 / 4); the plan-time constants
+    (the query prefix, the scratch offsets, the counts, the identity list) are device tensors of the plan.
+
+    Barrier / SMEM tables: the compress kernel has no mbarrier and no SMEM (its module docstring: both tables empty by
+    construction); the scorer and the top-k are the DSA kernels with their own suites.  Declines, typed: at declaration
+    (:func:`_check_qsa_indexer_geometry`) f16 activations, an ``index_head_dim`` other than the scorer's, an
+    ``index_heads`` outside its packed groups, THD, and the CuTe DSL floor as well (ahead of the head-group read, which
+    imports the scorer's package); at ``check_support`` the floor again and the ``sm_107a`` target, both before any kernel
+    import, and a device outside the scorer's family (cc 10.x).
+    """
+
+    name = "qsa_indexer"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, device, seq_lens_present: bool) -> None:
+        q = geometry.qsa
+        if q is None or q.index_source != "indexer":
+            raise ValueError(f"{self.name}: the geometry declares no QsaSpec(index_source='indexer')")
+        self.geom = geometry
+        self.batch = int(batch)
+        self.seq_len = int(seq_len)
+        self.dtype = dtype
+        self.device = device
+        self.seq_lens_present = bool(seq_lens_present)
+        self.n_blocks = self.seq_len // q.block_size  # compressed-key rows per sequence the scorer reads
+        self.selects = self.seq_len > q.identity_bound  # False: the identity -- no scorer launch, no workspace slot
+        self.cand_floats = _qsa_cand_floats(self.batch, self.seq_len, q.block_size) if self.selects else 0
+        self._q_recipe = self._k_recipe = None
+        self._const = None  # plan-time device constants (compile): counts [T]; identity_ids [T, top_k] | cu_seqlens_q [B+1], cand_batch_offsets [B+1]
+        self.launches = 0  # launches issued so far (a test pin of the short-circuit; the block never reads it)
+
+    def launches_per_execute(self, cache: bool) -> int:
+        """Launches one ``execute`` issues: the cache compress iff a caller passes ``index_k_compressed``; past the identity
+        bound also the key compress, the query norm, the scorer GEMM, the radix top-k and the row sort's windows."""
+        if not self.selects:
+            return 1 if cache else 0
+        return (1 if cache else 0) + 4 + -(-(self.batch * self.seq_len) // _QSA_SORT_ROWS)
+
+    def check_support(self) -> None:
+        """The scorer's contract (device-free, re-run so the stage is honest on its own), the CuTe DSL floor / target
+        BEFORE any kernel import (Rule 7), the device family the scorer runs on, the compress kernel's row geometry."""
+        from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
+
+        g, q = self.geom, self.geom.qsa
+        _check_qsa_indexer_geometry(g, self.dtype)
+        too_old = cutedsl_requirement_error("the in-block indexer (block compress + the indexer scorer)")
+        if too_old is not None:
+            raise NotImplementedError(too_old)
+        cc = tuple(torch.cuda.get_device_capability(self.device))
+        no_target = cutedsl_arch_requirement_error(cc)
+        if no_target is not None:
+            raise NotImplementedError(no_target)
+        # cc 10.x = the family the scorer has run on (cc 10.0 / 10.3 / 10.7); the sparse record's 11.9 upper bound is the attention
+        # CORE's, not the scorer's -- a cc 11.x part is a typed decline here until the scorer is run on one (widen from that run).
+        if cc[0] != 10:
+            raise NotImplementedError(f"{self.name}: the indexer scorer is an SM100-family (cc 10.x) tcgen05 kernel; found cc {cc[0]}.{cc[1]}")
+        from .kernels.qsa_compress import DEFAULT_THREADS_PER_CTA, validate_compress_shape
+
+        for pool in (1, q.block_size):
+            validate_compress_shape(q.index_head_dim, g.rope_dim, pool, DEFAULT_THREADS_PER_CTA)
+
+    def compile(self) -> None:
+        """The two compress recipes, the plan-time constants, and -- when the scorer runs -- its warm-up at the real shape."""
+        from .kernels.qsa_compress import compile_qsa_compress
+
+        g, q = self.geom, self.geom.qsa
+        b, s, t, top_k, dev = self.batch, self.seq_len, self.batch * self.seq_len, q.top_k, self.device
+        # The key compress: block_size rows per compressed key; the per-batch lengths traced iff declared (the artifact folds the load).
+        self._k_recipe = compile_qsa_compress(
+            dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=q.block_size, has_seq_lens=self.seq_lens_present, table_dtype=self.dtype
+        )
+        pos = torch.arange(s, dtype=torch.int64, device=dev).repeat(b)  # [T]: row s of every batch entry sits at position s
+        counts = torch.minimum(torch.div(pos + 1, q.block_size, rounding_mode="floor"), torch.full_like(pos, top_k))
+        const = dict(counts=counts.to(torch.int32).contiguous())
+        if not self.selects:
+            j = torch.arange(top_k, dtype=torch.int64, device=dev)
+            ids = torch.where(j[None, :] < counts[:, None], j[None, :].expand(t, top_k), torch.full((t, top_k), -1, dtype=torch.int64, device=dev))
+            const["identity_ids"] = ids.to(torch.int32).contiguous()
+            self._const = const
+            return
+        # The query norm + RoPE: pool = 1, batch = token, block = head; no per-batch lengths (every token's queries are normed).
+        self._q_recipe = compile_qsa_compress(dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=1, has_seq_lens=False, table_dtype=self.dtype)
+        from cudnn.deepseek_sparse_attention.indexer_forward import compress_topk_cand_buffer_size_thd
+
+        cu_q = (torch.arange(b + 1, dtype=torch.int64, device=dev) * s).to(torch.int32)
+        cu_k = (torch.arange(b + 1, dtype=torch.int64, device=dev) * self.n_blocks).to(torch.int32)
+        offsets, total = compress_topk_cand_buffer_size_thd(cu_q, cu_k, q.block_size, None)  # one plan-time host read
+        if total != self.cand_floats:
+            raise RuntimeError(
+                f"{self.name}: the scorer's compact-logits scratch is {total} floats by its sizing helper but {self.cand_floats} by the block's "
+                f"closed form (B={b}, S={s}, block_size={q.block_size}) -- the two derivations drifted; the workspace would be mis-sized"
+            )
+        const.update(cu_seqlens_q=cu_q, cand_batch_offsets=offsets)
+        self._const = const
+        # Warm the scorer GEMM and the radix top-k at the REAL (B, S, n_blocks): their compile keys carry the shape, so a smaller
+        # warm-up would leave a compile on the execute path.  Temporaries of the slot sizes, freed after one synchronous run.
+        qi = torch.zeros(t, q.index_heads, q.index_head_dim, dtype=self.dtype, device=dev)
+        kbar = torch.zeros(b, self.n_blocks, q.index_head_dim, dtype=self.dtype, device=dev)
+        ids = torch.empty(t, top_k, dtype=torch.int32, device=dev)
+        scores = torch.empty(t, top_k, dtype=torch.float32, device=dev)
+        cand = torch.empty(self.cand_floats, dtype=torch.float32, device=dev)
+        self._select(qi, kbar, ids, scores, cand, stream=torch.cuda.current_stream(dev).cuda_stream)
+        torch.cuda.synchronize(dev)
+        del qi, kbar, ids, scores, cand
+
+    def _select(self, qi: torch.Tensor, kbar: torch.Tensor, ids: torch.Tensor, scores: torch.Tensor, cand: torch.Tensor, *, stream: int) -> torch.Tensor:
+        """The scorer + top-k on the block's stream, every buffer preallocated (the CUDA-graph form of :func:`qsa_select`)."""
+        from .qsa_select import qsa_select
+
+        q = self.geom.qsa
+        return qsa_select(
+            qi,
+            kbar,
+            self._const["cu_seqlens_q"],
+            top_k=q.top_k,
+            block_size=q.block_size,
+            max_seqlen_q=self.seq_len,
+            deterministic=True,
+            block_ids_out=ids,
+            scores_out=scores,
+            cand_buffer=cand,
+            cand_batch_offsets=self._const["cand_batch_offsets"],
+            stream=cuda.CUstream(int(stream)),
+        )["block_ids"]
+
+    def views(self, workspace: torch.Tensor, lay: "_Intermediates") -> Optional[dict]:
+        """The five indexer slots as typed views of the workspace; ``None`` below the identity bound (nothing reserved)."""
+        if not self.selects:
+            return None
+        q, b, t = self.geom.qsa, self.batch, self.batch * self.seq_len
+        return dict(
+            qi=_view(workspace, lay.ix_q, (t, q.index_heads, q.index_head_dim), self.dtype),
+            kbar=_view(workspace, lay.ix_kbar, (b, self.n_blocks, q.index_head_dim), self.dtype),
+            ids=_view(workspace, lay.ix_ids, (t, q.top_k), torch.int32),
+            scores=_view(workspace, lay.ix_scores, (t, q.top_k), torch.float32),
+            cand=_view(workspace, lay.ix_cand, (self.cand_floats,), torch.float32),
+            ids_sorted=_view(workspace, lay.ix_ids_sorted, (t, q.top_k), torch.int32),
+            sort_idx=_view(workspace, lay.ix_sort_idx, (min(t, _QSA_SORT_ROWS), q.top_k), torch.int64),
+        )
+
+    def execute(
+        self,
+        proj: torch.Tensor,  # [T, n_qkvg] the slab stage (1) wrote; the band's columns are read in place
+        cos: torch.Tensor,  # [B, S, rope_dim] the attention's tables (block starts and token positions alike)
+        sin: torch.Tensor,
+        w_iq_norm: torch.Tensor,  # [index_head_dim] the indexer queries' RMSNorm weight (pre-folded (1 + w))
+        w_ik_norm: torch.Tensor,  # [index_head_dim] the compressed keys' RMSNorm weight
+        *,
+        seq_lens: Optional[torch.Tensor],  # [B] int32 iff declared seq_lens_present
+        workspace: torch.Tensor,
+        lay: "_Intermediates",
+        index_k_compressed: Optional[torch.Tensor] = None,  # [B, >= floor(S / bs), index_head_dim]: the caller's compressed-key cache
+        block_ids_out: Optional[torch.Tensor] = None,  # [T, top_k] int32 (or [B, S, top_k]): the selection, written in place
+        block_lens_out: Optional[torch.Tensor] = None,  # [T] int32 (or [B, S]): the counts
+        current_stream,
+    ) -> torch.Tensor:
+        """Run the indexer and return the ``[T, top_k]`` int32 list stage (4) consumes -- the caller's ``block_ids_out``
+        when given, else the workspace slot, else the plan-time identity list (``S <= identity_bound``).  Every buffer was
+        form-checked by the block; nothing is allocated, nothing is read back."""
+        from .kernels.qsa_compress import run_qsa_compress
+
+        if self._const is None:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        g, q = self.geom, self.geom.qsa
+        b, s, t = self.batch, self.seq_len, self.batch * self.seq_len
+        n, d_i, h_i = g.n_qkvg, q.index_head_dim, q.index_heads
+        stream = int(current_stream)
+        hs = cuda.CUstream(stream)
+        eps = float(q.index_norm_eps)
+        # The raw indexer key: the band's last head, [B, S, D_i] at the slab's token stride (no copy); block j pools rows 4j .. 4j + 3.
+        k_raw = torch.as_strided(proj, (b, s, d_i), (s * n, n, 1), proj.storage_offset() + g.index_k_raw_offset)
+        if index_k_compressed is not None:
+            # The caller's cache: rows [0, floor(S_b / bs)) of every sequence; the rest stays the caller's.
+            run_qsa_compress(self._k_recipe, k_raw, index_k_compressed, w_ik_norm, cos, sin, seq_lens, eps=eps, norm_weight_offset=0.0, stream=stream)
+            self.launches += 1
+        if not self.selects:
+            ids = self._const["identity_ids"]
+            if block_ids_out is not None:
+                dst = block_ids_out.view(t, q.top_k)
+                _cu_check(
+                    cuda.cuMemcpyDtoDAsync(dst.data_ptr(), ids.data_ptr(), ids.numel() * _itemsize(torch.int32), hs)[0], f"{self.name}: identity list copy"
+                )
+                ids = dst
+        else:
+            v = self.views(workspace, lay)
+            if self.seq_lens_present:
+                # Rows past a padded sequence's complete blocks are never written by the compress: zero them, so a padding row
+                # scores 0 there (never stale workspace -- a select over NaN is undefined, over zeros it is the visible set).
+                kb = v["kbar"]
+                _cu_check(cuda.cuMemsetD8Async(kb.data_ptr(), 0, kb.numel() * _itemsize(self.dtype), hs)[0], f"{self.name}: compressed-key slot memset")
+            run_qsa_compress(self._k_recipe, k_raw, v["kbar"], w_ik_norm, cos, sin, seq_lens, eps=eps, norm_weight_offset=0.0, stream=stream)
+            # The queries: pool = 1 over [T, H_i, D_i] (batch = token, block = head), the tables broadcast over the heads.
+            q_raw = torch.as_strided(proj, (t, h_i, d_i), (n, d_i, 1), proj.storage_offset() + g.qkvg_offsets[ProjBlock.INDEX])
+            cos_q = cos.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
+            sin_q = sin.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
+            run_qsa_compress(self._q_recipe, q_raw, v["qi"], w_iq_norm, cos_q, sin_q, None, eps=eps, norm_weight_offset=0.0, stream=stream)
+            self._select(v["qi"], v["kbar"], v["ids"], v["scores"], v["cand"], stream=stream)
+            # The canonical order: the top-k's slot order is unspecified (atomics), the core accumulates in list order, so each
+            # row is sorted descending (ids descending, -1 last) in row windows of _QSA_SORT_ROWS into preallocated outputs --
+            # torch's small-segment sort runs in place on the output, no temporaries (Rule 1), on the block's stream.
+            ids = v["ids_sorted"] if block_ids_out is None else block_ids_out.view(t, q.top_k)
+            with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=proj.device)):
+                for r0 in range(0, t, _QSA_SORT_ROWS):
+                    r1 = min(t, r0 + _QSA_SORT_ROWS)
+                    torch.sort(v["ids"][r0:r1], dim=-1, descending=True, out=(ids[r0:r1], v["sort_idx"][: r1 - r0]))
+            self.launches += 4 + -(-t // _QSA_SORT_ROWS)  # the key compress, the query norm, the scorer GEMM, the radix top-k, the sort windows
+        if block_lens_out is not None:
+            c = self._const["counts"]
+            _cu_check(
+                cuda.cuMemcpyDtoDAsync(block_lens_out.view(t).data_ptr(), c.data_ptr(), c.numel() * _itemsize(torch.int32), hs)[0], f"{self.name}: counts copy"
+            )
+        return ids
+
+
+# ---------------------------------------------------------------------------
 # 6. The public API
 # ---------------------------------------------------------------------------
 
@@ -4738,6 +5122,14 @@ class GatedAttentionBlockFwd(APIBase):
         self._cache_write = (
             _CacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size) if self.paged_kv_page_size else None
         )
+        # (4i) the IN-BLOCK INDEXER -- built only under QsaSpec(index_source="indexer"): the band's queries normed + rotated, the
+        # raw key compressed per block, the scorer's top-k -> the list stage (4) consumes.  Its workspace slots exist only when
+        # the scorer runs (S past the identity bound); below it the stage hands over a plan-time identity list.
+        self._indexer = (
+            _Indexer(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, device=self.device, seq_lens_present=self.seq_lens_present)
+            if (self.qsa is not None and self.qsa.index_source == "indexer")
+            else None
+        )
         # (3g) TRAINING, gate-copy save mode only: ONE strided copy of the slab's
         # GATE band into the compact caller `saved.gate` (the elementwise kernel's
         # has_gate=False arm at h_q heads; the same artifact serves an optional
@@ -4797,6 +5189,7 @@ class GatedAttentionBlockFwd(APIBase):
                 self._quant_kv,
                 self._quant_k,
                 self._quant_v,
+                self._indexer,
                 self._cache_write,
                 self._sdpa,
                 self._gate,
@@ -4870,28 +5263,94 @@ class GatedAttentionBlockFwd(APIBase):
         # The head dim, the block size, the top_k range, the GQA group and the dtype: the RECORD's claims, read, not transcribed.
         _check_qsa_geometry_against_record(g, self.dtype)
         if q.index_source == "indexer":
-            raise NotImplementedError(
-                "QsaSpec(index_source='indexer'): the in-block indexer is a follow-up; pass the selection as execute(block_ids=) under " "index_source='caller'"
-            )
+            # The in-block indexer's own rows: the scorer's dtype / head dim / head groups, the packed form (device-free).
+            _check_qsa_indexer_geometry(g, self.dtype, thd=self.thd)
 
-    def _check_qsa_execute_args(self, block_ids, block_lens, h: torch.Tensor) -> None:
+    def _check_qsa_execute_args(
+        self, block_ids, block_lens, h: torch.Tensor, w_iq_norm=None, w_ik_norm=None, index_k_compressed=None, block_ids_out=None, block_lens_out=None
+    ) -> None:
         """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device), never a
-        value and never a sync (Rule 3): a QsaSpec block with caller lists needs ``block_ids``; a dense block refuses
-        them rather than ignoring a list it cannot consume."""
+        value and never a sync (Rule 3): a QsaSpec block with caller lists needs ``block_ids``; one with the in-block
+        indexer needs the indexer's two norm weights, refuses a list and form-checks its optional outputs; a dense block
+        refuses every one of them rather than ignoring a tensor it cannot consume."""
+        indexer_args = [
+            nm
+            for nm, x in (
+                ("w_iq_norm", w_iq_norm),
+                ("w_ik_norm", w_ik_norm),
+                ("index_k_compressed", index_k_compressed),
+                ("block_ids_out", block_ids_out),
+                ("block_lens_out", block_lens_out),
+            )
+            if x is not None
+        ]
         if self.qsa is None:
             if block_ids is not None or block_lens is not None:
                 raise ValueError(
                     "block_ids / block_lens are the index lists of a block-sparse (QsaSpec) block; this block was declared without geometry.qsa "
                     "and attends densely -- a list it cannot consume is refused rather than silently ignored"
                 )
+            if indexer_args:
+                raise ValueError(
+                    f"{', '.join(indexer_args)}: the in-block indexer's inputs and outputs belong to a block declared with "
+                    "geometry.qsa.index_source='indexer'; this block was declared without geometry.qsa and attends densely -- refused rather "
+                    "than silently ignored"
+                )
             return
+        t, top_k = self.batch * self.seq_len, self.qsa.top_k
+        if self.qsa.index_source == "indexer":
+            q = self.qsa
+            if block_ids is not None or block_lens is not None:
+                raise ValueError(
+                    "QsaSpec(index_source='indexer') derives the selection in the block: block_ids / block_lens are refused -- read the block's "
+                    "own list back through block_ids_out / block_lens_out, or declare index_source='caller' to hand one in"
+                )
+            for nm, w in (("w_iq_norm", w_iq_norm), ("w_ik_norm", w_ik_norm)):
+                if w is None:
+                    raise ValueError(
+                        f"QsaSpec(index_source='indexer') needs {nm} at execute: the indexer's [{q.index_head_dim}] RMSNorm weight in the activation "
+                        f"dtype {self.act_dtype} (the pre-folded (1 + w) form the attention's norm weights use)"
+                    )
+                if (
+                    not isinstance(w, torch.Tensor)
+                    or tuple(int(x) for x in w.shape) != (q.index_head_dim,)
+                    or w.dtype != self.act_dtype
+                    or not w.is_contiguous()
+                    or w.device != h.device
+                ):
+                    got = (tuple(w.shape), w.dtype, w.device, w.is_contiguous()) if isinstance(w, torch.Tensor) else type(w).__name__
+                    raise ValueError(f"{nm} must be a contiguous [{q.index_head_dim}] {self.act_dtype} tensor on h's device {h.device}, got {got}")
+            if index_k_compressed is not None:
+                n_blocks = self.seq_len // q.block_size
+                x = index_k_compressed
+                shape = tuple(int(n) for n in x.shape) if isinstance(x, torch.Tensor) else type(x).__name__
+                if not isinstance(x, torch.Tensor) or x.dim() != 3 or shape[0] != self.batch or shape[1] < n_blocks or shape[2] != q.index_head_dim:
+                    raise ValueError(
+                        f"index_k_compressed must be [B={self.batch}, >= {n_blocks} (the complete {q.block_size}-token blocks of S={self.seq_len}), "
+                        f"{q.index_head_dim}] -- the compressed-key cache whose rows [0, floor(S_b / {q.block_size})) the block writes; got {shape}"
+                    )
+                if x.dtype != self.act_dtype or not x.is_contiguous() or x.device != h.device:
+                    raise ValueError(
+                        f"index_k_compressed must be a contiguous {self.act_dtype} tensor on h's device {h.device}, got {x.dtype} on {x.device}, "
+                        f"strides {tuple(x.stride())}"
+                    )
+            if block_ids_out is not None:
+                _check_index_tensor(block_ids_out, "block_ids_out", (t, top_k), (self.batch, self.seq_len, top_k), h.device)
+            if block_lens_out is not None:
+                _check_index_tensor(block_lens_out, "block_lens_out", (t,), (self.batch, self.seq_len), h.device)
+            return
+        if indexer_args:
+            raise ValueError(
+                f"{', '.join(indexer_args)}: the in-block indexer's inputs and outputs belong to a block declared with "
+                "QsaSpec(index_source='indexer'); this block was declared with index_source='caller' and takes the selection as block_ids -- "
+                "refused rather than silently ignored"
+            )
         if block_ids is None:
             raise ValueError(
                 "QsaSpec(index_source='caller') needs block_ids at execute: [T, top_k] int32 (or [B, S, top_k]) -- per query the ids of its "
                 f"selected complete {self.qsa.block_size}-token blocks (block b = tokens [{self.qsa.block_size}b, {self.qsa.block_size}b + "
                 f"{self.qsa.block_size}) of the query's own sequence), the valid prefix then -1 padding"
             )
-        t, top_k = self.batch * self.seq_len, self.qsa.top_k
         _check_index_tensor(
             block_ids,
             "block_ids",
@@ -5185,6 +5644,7 @@ class GatedAttentionBlockFwd(APIBase):
             o_fp4=self.o_fp4,
             want_saved=self.save_for_backward,
             saved_gate_copy=self.saved_gate_copy,
+            qsa_indexer_cand_floats=self._indexer.cand_floats if (self._indexer is not None and self._indexer.selects) else None,
         )
 
     def get_workspace_size(self) -> int:
@@ -5480,6 +5940,17 @@ class GatedAttentionBlockFwd(APIBase):
         kv_lens: Optional[torch.Tensor] = None,  # [B] int32 -- the paged-READ mode's logical KV lengths: a typed decline until that mode lands
         slot_mapping: Optional[torch.Tensor] = None,  # [T] int32 / int64: the flat slot (page * page_size + offset) of every token; negative = no write
         index_k_raw: Optional[torch.Tensor] = None,  # [num_pages, page_size, index_head_dim] activation dtype: the raw indexer key's pool (index band only)
+        # APPENDED (the in-block indexer, geometry.qsa with index_source="indexer"): the indexer's two norm weights (REQUIRED there) and its
+        # three OPTIONAL outputs -- every one of the five REFUSED on a block declared without index_source="indexer".  Form checks only.
+        w_iq_norm: Optional[torch.Tensor] = None,  # [index_head_dim] activation dtype: the indexer queries' RMSNorm weight (pre-folded (1 + w), as w_q_norm)
+        w_ik_norm: Optional[torch.Tensor] = None,  # [index_head_dim] activation dtype: the compressed keys' RMSNorm weight
+        index_k_compressed: Optional[
+            torch.Tensor
+        ] = None,  # [B, >= floor(S / 4), index_head_dim] activation dtype: the compressed-key cache, rows [0, floor(S_b / 4)) written
+        block_ids_out: Optional[
+            torch.Tensor
+        ] = None,  # [T, top_k] int32 (or [B, S, top_k]): the block's own selection, -1 padded (the step-0 list a speculative caller reuses)
+        block_lens_out: Optional[torch.Tensor] = None,  # [T] int32 (or [B, S]): the valid-prefix length of every row of that list
     ) -> None:
         """Launch the five stages in pipeline order.
 
@@ -5528,10 +5999,36 @@ class GatedAttentionBlockFwd(APIBase):
         mode's inputs -- a typed ``NotImplementedError`` until that mode lands.
         Every one of the six is REFUSED on a block declared without the attribute.
         Form checks only; slot VALUES are device data the kernel range-checks.
+
+        ``w_iq_norm`` / ``w_ik_norm`` (appended): REQUIRED under ``geometry.qsa`` with
+        ``index_source="indexer"`` -- the indexer's ``[index_head_dim]`` RMSNorm
+        weights (the pre-folded ``(1 + w)`` form, like ``w_q_norm``); the block then
+        REFUSES ``block_ids`` / ``block_lens`` and derives the selection itself
+        (:class:`_Indexer`: the band's queries normed and rotated per token, the raw
+        key mean-pooled per complete block, normed and rotated at the block start
+        with the attention's own ``cos`` / ``sin``, the scorer's top-k; at
+        ``S <= identity_bound`` no scorer launches and the list is the identity).
+        ``index_k_compressed`` / ``block_ids_out`` / ``block_lens_out`` (appended,
+        optional there): the compressed keys (``[B, >= floor(S / 4), index_head_dim]``,
+        rows ``[0, floor(S_b / 4))`` written -- a cache sized for a longer context
+        keeps the rest; under the identity it is the only indexer launch), the block's
+        own list (``[T, top_k]`` int32, ``-1`` padded: the step-0 list a speculative
+        caller reuses) and its per-row counts ``min(top_k, floor((pos + 1) / 4))``.
+        Every one of the five is REFUSED on a block declared without
+        ``index_source="indexer"``.  Form checks only.
         """
         # Block-sparse attention: the index tensors are a DECLARATION-vs-argument contract and need no plan, so they are
         # checked first and the refusal reads the same on every device (Rule 3: form only, never a value, never a sync).
-        self._check_qsa_execute_args(block_ids, block_lens, h)
+        self._check_qsa_execute_args(
+            block_ids,
+            block_lens,
+            h,
+            w_iq_norm=w_iq_norm,
+            w_ik_norm=w_ik_norm,
+            index_k_compressed=index_k_compressed,
+            block_ids_out=block_ids_out,
+            block_lens_out=block_lens_out,
+        )
         # The paged-cache inputs: the same kind of contract (declared with paged_kv_page_size -> required; without -> refused).
         self._check_cache_write_args(h, k_cache, v_cache, block_table, kv_lens, slot_mapping, index_k_raw)
         if self._ws is None:
@@ -5747,6 +6244,26 @@ class GatedAttentionBlockFwd(APIBase):
         else:
             # (3b) -- exists only to hand the SDPA a compact V.
             self._compact_v.execute(v_src, v_c, current_stream=stream)
+        if self._indexer is not None:
+            # (4i) the IN-BLOCK INDEXER: the slab's fifth band -> the per-query block list stage (4) consumes (the caller's
+            # block_ids_out when given, else the workspace slot, else the plan-time identity list below the bound); the
+            # compress reads the band's raw key in place, the scorer the normed queries and compressed keys in the workspace.
+            # The list carries the derived count as its -1 padding, so stage (4) takes no block_lens.
+            block_ids = self._indexer.execute(
+                proj,
+                cos,
+                sin,
+                w_iq_norm,
+                w_ik_norm,
+                seq_lens=seq_lens,
+                workspace=workspace,
+                lay=ws,
+                index_k_compressed=index_k_compressed,
+                block_ids_out=block_ids_out,
+                block_lens_out=block_lens_out,
+                current_stream=stream,
+            )
+            block_lens = None
         if self._cache_write is not None:
             # (4w) SERVING write-through: the VERY operands stage (4) is about to read -- the post-RoPE K and the V (the
             # slab bands in place, or the compact buffers out of place) -- into the paged pools at slot_mapping, so a
