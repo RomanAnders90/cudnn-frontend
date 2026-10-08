@@ -3908,11 +3908,16 @@ class _SparseSdpa(_Stage):
     :meth:`scratch_workspace_bytes` and is handed back at ``execute(workspace=)``.  A one-sequence packing computes the
     dense ``B = 1`` function bitwise; an empty sequence owns no rows.
 
-    Not here (typed declines at the block's declaration, each naming its feature): ``fuse_gate`` -- the sparse core's
-    epilogue-gate operand is not bound through this stage yet; ``causal_bottom_right`` -- the decode / verify form; the
-    quantized pipelines and training; THD together with the in-block indexer (the scorer reads dense ``[B, S]`` prompts)
-    and THD together with the paged write-through.  Each lands by flipping the record, the adapter AND this stage in the
-    same change; the declaration decline names the record's state so the flip is visible (``thd`` flipped 2026-10-08).
+    ``fuse_gate`` (stage (5) inside this stage's epilogue): the GATE is declared like the other operands -- O's shape at
+    the slab's GATE columns (``gate_token_stride``) or compact -- as the adapter's ``epilogue_gate`` operand, which selects
+    the kernel's gated specialization (``TemplateParams.epilogue_gate``); ``execute(gate=)`` binds the view and the kernel
+    writes ``O * sigmoid(GATE)`` in place of O after its own dead-row select (the LSE is untouched).
+
+    Not here (typed declines at the block's declaration, each naming its feature): ``causal_bottom_right`` -- the decode /
+    verify form; the quantized pipelines and training; THD together with the in-block indexer (the scorer reads dense
+    ``[B, S]`` prompts) and THD together with the paged write-through.  Each lands by flipping the record, the adapter AND
+    this stage in the same change; the declaration decline names the record's state so the flip is visible (``thd`` and
+    ``fuse_gate`` flipped 2026-10-08).
     """
 
     name = "sdpa_sparse"
@@ -3933,6 +3938,7 @@ class _SparseSdpa(_Stage):
         num_sequences: Optional[int] = None,  # THD: B, the length tensor's [B] (or [B+1] prefix-sum) entries
         max_seq_len: Optional[int] = None,  # THD: S_max, the longest sequence the block admits (recorded; the core derives on device)
         cu_seqlens: bool = False,  # THD: seq_lens is [B+1] int32 prefix sums (True) or [B] int32 lengths (False)
+        fuse_gate: bool = False,
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
@@ -3946,7 +3952,11 @@ class _SparseSdpa(_Stage):
         # token_stride != 0 => Q/K/V are column slices of the fused projection, read in place at that stride (the
         # adapter validates the stride contract on the declaration).  0 => the compact buffers.
         self.token_stride = int(token_stride)
-        self.gate_token_stride = int(gate_token_stride)  # carried for the gate arm's block half (the slab's GATE columns)
+        # fuse_gate => the sparse core's epilogue_gate specialization reads GATE (a slab column slice at gate_token_stride; 0 =
+        # compact like O) in the activation dtype and writes O gated in place of O; the gate operand is declared like Q / K / V
+        # (storage-free) and bound at execute.
+        self.fuse_gate = bool(fuse_gate)
+        self.gate_token_stride = int(gate_token_stride)
         # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage; the
         # checks here keep the STAGE honest on its own: the sequence count must be declared (the lengths' extent is a
         # declaration fact the adapter binds exactly), the two length contracts are exclusive, and the record's claim is
@@ -3994,6 +4004,8 @@ class _SparseSdpa(_Stage):
             k=bshd(g.h_kv, ts_kv),
             v=bshd(g.h_kv, ts_kv),
             o=bshd(g.h_q, g.h_q * d),
+            # fuse_gate: GATE in O's shape at the slab's GATE columns (gate_token_stride) or compact -- the adapter's gate operand
+            gate=bshd(g.h_q, self.gate_token_stride or g.h_q * d) if self.fuse_gate else None,
             block_ids=SparseOperandDesc((t, g.qsa.top_k), (g.qsa.top_k, 1), torch.int32, self.device),
             block_lens=SparseOperandDesc((t,), (1,), torch.int32, self.device),
             lse=SparseOperandDesc((b, g.h_q, s), (g.h_q * s, s, 1), torch.float32, self.device) if self.want_lse else None,
@@ -4024,6 +4036,7 @@ class _SparseSdpa(_Stage):
             block_size=g.qsa.block_size,
             scale=g.scale,
             bottom_right=g.causal_bottom_right,
+            epilogue_gate=ops["gate"],
             device_cc=cc,
             # THD: the packed arm -- both length descriptors, the lengths' FORM (a declaration fact: [B] or [B+1]); the
             # metadata workspace is bound per call (the block's engine arm, `execute(workspace=)`).
@@ -4063,7 +4076,7 @@ class _SparseSdpa(_Stage):
         ] = None,  # [B] int32 per-batch visible KV length, iff declared seq_lens_present; THD (REQUIRED): [B] lengths / [B+1] prefix sums
         workspace: Optional[torch.Tensor] = None,  # dense: unused (no GMEM scratch); THD (REQUIRED): the engine arm holding the packed metadata
         current_stream=None,
-        gate: Optional[torch.Tensor] = None,  # refused: no fused gate on the sparse stage
+        gate: Optional[torch.Tensor] = None,  # [B, S, H_q, D] slab slice or compact; fuse_gate only (refused otherwise)
         descale_q: Optional[torch.Tensor] = None,  # refused: the quantized pipelines' operands
         descale_k: Optional[torch.Tensor] = None,
         descale_v: Optional[torch.Tensor] = None,
@@ -4081,7 +4094,9 @@ class _SparseSdpa(_Stage):
         ``workspace`` (REQUIRED) is the engine arm the adapter's packed metadata lands in."""
         if self._impl is None or not self._compiled:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
-        if gate is not None:
+        if self.fuse_gate and gate is None:
+            raise ValueError(f"{self.name}: fuse_gate=True requires the GATE tensor at execute")
+        if not self.fuse_gate and gate is not None:
             raise ValueError(f"{self.name}: gate is the fused epilogue gate's operand; this stage was declared without fuse_gate")
         if any(x is not None for x in (descale_q, descale_k, descale_v, scale_o, sf_q, sf_k, sf_v)):
             raise ValueError(f"{self.name}: descales / scale_o / scale-factor blobs are the quantized pipelines' operands; the sparse core is bf16 / f16")
@@ -4115,6 +4130,7 @@ class _SparseSdpa(_Stage):
             block_ids=block_ids.view(t, g.qsa.top_k),
             block_lens=None if block_lens is None else block_lens.view(t),
             seq_kv_lens=seq_lens,
+            gate=gate,
             **thd_kw,
         )
 
@@ -4849,6 +4865,8 @@ class GatedAttentionBlockFwd(APIBase):
     to the token's OWN sequence) and refuses it otherwise.  Every claim of that core is read off the adapter's capabilities
     record, never transcribed; what the core does not serve is a typed decline at declaration (the in-block indexer and the
     paged write-through under ``thd`` among them).
+    ``fuse_gate=True`` folds stage (5) into the sparse core's epilogue exactly as on the dense block (the GATE slice read in
+    place, O gated after the dead-row select, the LSE untouched; stage (5) is not built).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -5319,6 +5337,7 @@ class GatedAttentionBlockFwd(APIBase):
                 num_sequences=self.num_sequences,
                 max_seq_len=self.max_seq_len,
                 cu_seqlens=self.cu_seqlens,
+                fuse_gate=self.fuse_gate,
             )
         else:
             self._sdpa = _Sdpa(
@@ -5465,15 +5484,11 @@ class GatedAttentionBlockFwd(APIBase):
                 f"QsaSpec with quant={type(quant).__name__}: the sparse core is bf16 / f16; the quantized pipelines (per-tensor FP8, MXFP8, the "
                 "fp4 modes) have no sparse arm"
             )
-        if self.fuse_gate:
+        if self.fuse_gate and not rec.epilogue_gate:
+            # Served while the record claims the arm (it does: the sparse core's epilogue gate, bound through _SparseSdpa);
+            # the decline stays reachable for a record that retires it.
             raise NotImplementedError(
-                "QsaSpec with fuse_gate=True: the sparse core's epilogue gate is a follow-up ("
-                + (
-                    "the sparse adapter's record declines it"
-                    if not rec.epilogue_gate
-                    else "the kernel carries the arm, this block's sparse stage does not bind the gate operand yet"
-                )
-                + "); stage (5) runs as its own launch (fuse_gate=False)"
+                "QsaSpec with fuse_gate=True: the sparse adapter's record declines the epilogue gate; stage (5) runs as its own launch (fuse_gate=False)"
             )
         if self.fuse_norm_rope and q.index_band:
             tile = _FusedQkvProjection._TILE_N

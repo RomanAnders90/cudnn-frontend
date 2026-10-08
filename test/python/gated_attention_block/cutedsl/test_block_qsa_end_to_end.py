@@ -21,8 +21,10 @@ clamped on device; an empty list attends to its tail only; one block total at S 
 ADVERSARIAL S = 2052 cell (a dominant key planted through ``h`` inside the block the 512-list omits for row 2051 -- within
 budget vs the oracle ON the list, outside it vs the oracle on the FULL set by the plant's margin; both magnitudes reported);
 the write-through twin (a ``QsaSpec`` block with ``paged_kv_page_size`` is bitwise the one without); the workspace of a
-``QsaSpec`` block equal to the dense block's.  ``fuse_gate`` stays a typed decline here until the sparse epilogue-gate arm is
-bound through the block (its cells invert then).
+``QsaSpec`` block equal to the dense block's.  The ``fuse_gate`` axis: the gated block (stage (5) inside the sparse core's
+epilogue) against the oracle AND against the unfused block on the same inputs -- the gated O within ONE rounding of the
+activation dtype per element, the LSE bitwise, the dead entry exactly 0, one launch fewer -- over the geometries, both dtypes,
+the fully fused form (``fuse_norm_rope`` too), compact K / V, ``top_k = 4`` and a padded second entry.
 
 The IN-BLOCK INDEXER (``QsaSpec(index_source="indexer", index_band=True)``): the block derives the selection itself -- the
 band's queries normed + rotated, the raw key compressed per block at the block start, the scorer's top-k -- and the cells run
@@ -172,11 +174,13 @@ def _run(
     pools=None,
     indexer=False,
     indexer_outputs=False,
+    fuse_gate=False,
 ) -> _Cell:
     """Declare, check, compile and run a QsaSpec block ``launches`` times on sentinel-filled outputs; the oracle on the same
     inputs and list.  ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp`` / ``ref`` reuse another cell's.
     ``indexer=True`` declares ``index_source="indexer"`` (the band implied): the block derives the selection and the oracle
-    runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in."""
+    runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in;
+    ``fuse_gate`` folds stage (5) into the sparse core's epilogue (the gated O is then the SDPA's own output in the same slot)."""
     band = index_band or indexer
     qsa = QsaSpec(top_k=top_k, index_band=band, index_source="indexer" if indexer else "caller")
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=band))
@@ -216,8 +220,12 @@ def _run(
         fuse_norm_rope=fuse_norm_rope,
         inplace_qkv=inplace_qkv,
         paged_kv_page_size=paged_kv_page_size,
+        fuse_gate=fuse_gate,
     )
     assert isinstance(blk._sdpa, _SparseSdpa)
+    assert (
+        blk._sdpa.fuse_gate == fuse_gate and (blk._gate is None) == fuse_gate
+    ), "fuse_gate binds the gate through the sparse stage and does not build stage (5)"
     assert blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
@@ -1390,23 +1398,101 @@ def test_thd_qsa_workspace_carries_the_packed_metadata_and_execute_requires_the_
     print(f"\nTHD QsaSpec workspace: {blk.get_workspace_size()} B = carve {lay.total_bytes} + engine arm {_align_up(engine)} (packed metadata {meta_bytes} B)")
 
 
-# ============================================================================ host: what the matrix cannot run yet
-def test_fuse_gate_under_qsa_is_still_the_typed_decline():
-    """The ``fuse_gate`` axis of the matrix waits for the sparse epilogue-gate arm to be bound through the block; until then
-    the declaration declines it naming the feature (this test INVERTS when the arm lands: the matrix gains its gated cells)."""
+# ============================================================================ fuse_gate under QsaSpec: the gated cells
+def test_fuse_gate_under_qsa_declares_the_gated_sparse_stage():
+    """Host: ``fuse_gate=True`` under a ``QsaSpec`` CONSTRUCTS (the sparse core's epilogue-gate arm is bound through the block):
+    the sparse stage carries the gate, stage (5) is not built, and the stage's declared operands include the GATE at the slab's
+    GATE columns (the token stride of the fused projection) -- the inversion of the former typed decline."""
     geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec())
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
-    with pytest.raises(NotImplementedError, match="fuse_gate=True"):
-        GatedAttentionBlockFwd(
-            z(1, 8, geom.d_model),
-            z(geom.n_qkvg, geom.d_model),
-            z(geom.d_head),
-            z(geom.d_head),
-            z(1, 8, 64),
-            z(1, 8, 64),
-            z(geom.d_model, geom.h_q * geom.d_head),
-            z(1, 8, geom.d_model),
-            geom,
-            fuse_gate=True,
-        )
+    blk = GatedAttentionBlockFwd(
+        z(1, 8, geom.d_model),
+        z(geom.n_qkvg, geom.d_model),
+        z(geom.d_head),
+        z(geom.d_head),
+        z(1, 8, 64),
+        z(1, 8, 64),
+        z(geom.d_model, geom.h_q * geom.d_head),
+        z(1, 8, geom.d_model),
+        geom,
+        fuse_gate=True,
+    )
+    assert blk.fuse_gate and isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.fuse_gate and blk._gate is None
+    ops = blk._sdpa._operands()
+    assert ops["gate"] is not None and ops["gate"].shape == (1, 8, geom.h_q, geom.d_head) and ops["gate"].strides[1] == geom.n_qkvg
+    ungated = GatedAttentionBlockFwd(
+        z(1, 8, geom.d_model),
+        z(geom.n_qkvg, geom.d_model),
+        z(geom.d_head),
+        z(geom.d_head),
+        z(1, 8, 64),
+        z(1, 8, 64),
+        z(geom.d_model, geom.h_q * geom.d_head),
+        z(1, 8, geom.d_model),
+        geom,
+    )
+    assert ungated._sdpa._operands()["gate"] is None and ungated._gate is not None
+    assert len(blk._stages) == len(ungated._stages) - 1
+
+
+def _ulp_of(x: torch.Tensor, dtype) -> torch.Tensor:
+    """One unit in the last place of ``dtype`` at |x| (CPU fp32 math; ``torch.log2`` / ``exp2`` are avoided on the device),
+    floored at the dtype's smallest subnormal step so a zero never yields a zero budget."""
+    mant, sub = (7, 2.0**-133) if dtype == torch.bfloat16 else (10, 2.0**-24)
+    ax = x.detach().float().cpu().abs().clamp_min(sub)
+    _, e = torch.frexp(ax)  # ax = m * 2^e, m in [0.5, 1) -> floor(log2 ax) = e - 1
+    return torch.ldexp(torch.ones_like(ax), e - 1 - mant).clamp_min(sub)
+
+
+# (geometry, B, S, dtype, list source, top_k, seq_lens, fuse_norm_rope, inplace_qkv): the fuse_gate axis of the matrix
+_GATED = [
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "full", 512, None, False, None, id="fn24-2-s512-bf16-full-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, F16, "synthetic", 512, None, False, None, id="fn24-2-s512-f16-synthetic-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 2, 512, BF16, "full", 512, (512, 0), False, None, id="fn24-2-s512-b2-dead-entry-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "synthetic", 512, None, True, None, id="fn24-2-s512-fully-fused-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "full", 512, None, False, False, id="fn24-2-s512-compact-kv-gated"),
+    pytest.param(GEOM_TP4, 2, 512, BF16, "synthetic", 512, None, False, None, id="tp4-6-1-s512-b2-gated"),
+    pytest.param(GEOM_397B, 1, 512, BF16, "synthetic", 512, None, False, None, id="g397b-32-2-s512-gqa16-gated"),
+    pytest.param(GEOM_SMALL, 1, 300, BF16, "synthetic", 4, None, False, None, id="small8-2-s300-top4-gated"),
+    pytest.param(GEOM_SMALL, 2, 2052, BF16, "synthetic", 512, (2052, 2015), False, None, id="small8-2-s2052-b2-lens-gated"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv", _GATED)
+def test_fuse_gate_under_qsa_matches_the_oracle_and_the_unfused_block(geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv):
+    """The gated ``QsaSpec`` block (stage (5) inside the sparse core's epilogue) against (a) the oracle on the same list --
+    every standard assertion of the matrix (``isfinite``, no sentinel, dead rows exact, ``cos >= 0.999`` on ``out``, ``atol
+    2e-2`` on the gated O and the LSE, two launches bitwise) -- and (b) the UNFUSED block on the SAME inputs and list:
+    ``gated == unfused-then-gated`` within ONE rounding of the activation dtype per element of the gated O (the unfused
+    pipeline rounds O to bf16 / f16 before stage (5); both use the same approximate tanh), the LSE BITWISE the unfused block's
+    (the gate cannot touch a softmax statistic), the dead entry exactly 0 on both, one launch fewer.  The exact max diff is
+    recorded; the oracle's budget is the dense suites', nothing added."""
+    lens_t = None if seq_lens is None else _i32(list(seq_lens))
+    kw = dict(dtype=dtype, top_k=top_k, index_source=source, seq_lens=lens_t, fuse_norm_rope=fuse_norm_rope, inplace_qkv=inplace_qkv, seed=seq_len + batch + 7)
+    c_f = _run(geom_kw, batch, seq_len, fuse_gate=True, **kw)
+    label = f"gated {geom_kw['h_q']}/{geom_kw['h_kv']} B={batch} S={seq_len} {dtype} {source} top_k={top_k}"
+    mags = _check(c_f, label)
+    c_u = _run(geom_kw, batch, seq_len, fuse_gate=False, inp=c_f.inp, ref=c_f.ref, **kw)
+    assert len(c_f.blk._stages) == len(c_u.blk._stages) - 1, "fuse_gate removes stage (5)'s launch"
+    out_f, lse_f, o_f = c_f.runs[0]
+    out_u, lse_u, o_u = c_u.runs[0]
+    assert lse_f is not None and torch.equal(lse_f, lse_u), "the LSE must be bitwise the unfused block's"
+    dead = c_f.ref.n_visible == 0
+    if dead.any():
+        assert (o_f[dead] == 0).all() and (o_u[dead] == 0).all() and (out_f[dead] == 0).all(), "the dead entry gates to exactly 0 on both pipelines"
+    d = (o_f.float() - o_u.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(o_f.float().abs(), o_u.float().abs()), dtype)
+    max_d, max_ulp, n_off = float(d.max()), float(ulps.max()), int((d > 0).sum())
+    assert (
+        max_ulp <= 1.0
+    ), f"{label}: gated vs unfused-then-gated O {max_ulp:.3f} ulp at the element's magnitude (max|d| {max_d:.3e}); the budget is one rounding"
+    assert max_d <= ATOL
+    cos_out = _cos(out_f, out_u)
+    d_out = float((out_f.float() - out_u.float()).abs().max())
+    assert cos_out > COS_OUT
+    print(
+        f"{label}: vs unfused block max|d O_gated| {max_d:.4e} = {max_ulp:.3f} ulp ({n_off} of {d.numel()} elements differ), "
+        f"out cos {cos_out:.6f} max|d out| {d_out:.4e}; vs oracle cos {mags['cos']:.6f} |dO| {mags['d_o']:.4e} |dLSE| {mags['d_lse']:.2e}; dead rows {int(dead.sum())}"
+    )

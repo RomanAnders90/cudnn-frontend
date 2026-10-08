@@ -255,15 +255,18 @@ Every claim of the sparse core -- the dtypes, the head dim, the block size, the 
 not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.sparse_gqa_sm107.SPARSE_CAPABILITIES`), which the
 adapter's own `check_support` enforces; the block transcribes none of it. Typed declines at declaration, naming the feature:
 `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
-`fuse_gate` (the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch), `fuse_norm_rope` together with
-`index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them -- the unfused projection serves
-the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd` together with
-`paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under `index_source="indexer"`
-also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
-(4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0
-wheel), named with the installed version, before the kernel module is imported. Under `index_source="indexer"` the floor is
-checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose package imports its kernels, so a
-too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the stage's `check_support`).
+`fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them --
+the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd`
+together with `paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under
+`index_source="indexer"` also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the
+scorer's packed head groups (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target
+needs (the public 4.8.0 wheel), named with the installed version, before the kernel module is imported. Under
+`index_source="indexer"` the floor is checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose
+package imports its kernels, so a too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the
+stage's `check_support`).  `fuse_gate=True` is served: the sparse core stages each query's GATE slice (the slab's GATE columns,
+read in place) into its epilogue and writes `O * sigmoid(GATE)` in place of O after its dead-row select, so stage (5) disappears
+exactly as on the dense block; the gated O differs from the unfused block's by at most one rounding of the activation dtype (the
+unfused path rounds O to bf16 / f16 before the gate), the LSE is bitwise the same.
 
 ### Serving: index lists and paged KV
 

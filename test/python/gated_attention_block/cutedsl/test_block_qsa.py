@@ -307,7 +307,7 @@ _UNIT_QUANT = QuantSpec(descale_h=1.0, descale_w_qkvg=1.0, descale_w_o=1.0, scal
 _DECLINES = [
     pytest.param({}, QsaSpec(), dict(save_for_backward=True), torch.bfloat16, NotImplementedError, "save_for_backward=True", id="training"),
     pytest.param({}, QsaSpec(), dict(quant=_UNIT_QUANT), _E4M3, NotImplementedError, "quantized pipelines", id="quant"),
-    pytest.param({}, QsaSpec(), dict(fuse_gate=True), torch.bfloat16, NotImplementedError, "fuse_gate=True", id="fuse_gate"),
+    # fuse_gate under QsaSpec is SERVED (the sparse core's epilogue gate; its accept cells are the end-to-end module's)
     pytest.param({}, QsaSpec(index_band=True), dict(fuse_norm_rope=True), torch.bfloat16, NotImplementedError, "256-column tiles", id="fused_proj_x_band"),
     pytest.param(dict(causal_bottom_right=True), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "causal_bottom_right=True", id="bottom_right"),
     pytest.param({}, QsaSpec(), {}, torch.float32, NotImplementedError, "bf16 / f16", id="dtype"),
@@ -667,18 +667,27 @@ def test_the_api_constants_and_the_block_declines_read_the_sparse_record():
     # top_k: every multiple of 4 in the record's range is served; the API's validator and the record agree on the bounds.
     for top_k in (rec.index_top_k_min, 64, rec.index_top_k_max):
         _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(top_k=top_k)), torch.bfloat16)
-    # The arm declines of the declaration read the record's state: an arm the record claims AND the stage binds CONSTRUCTS
-    # (THD, since 2026-10-08); an arm the record does not claim declines naming the record; a claimed arm the stage does not
-    # bind yet names that instead.
+    # The arm declines of the declaration follow the record's state AND the block's own binding: an arm the record claims
+    # and the block binds CONSTRUCTS the block (the fused epilogue gate and THD, both since 2026-10-08); an arm the record
+    # claims but the block does not bind yet is refused naming the BLOCK's state, never the record's; an arm the record
+    # declines is refused naming the record.
+    block_binds = {"epilogue_gate", "thd"}  # the arms the block binds through its sparse stage
     for blk_kw, geom_kw, field in (
         (dict(thd=True, num_sequences=1, max_seq_len=8), {}, "thd"),
         (dict(fuse_gate=True), {}, "epilogue_gate"),
         ({}, dict(causal_bottom_right=True), "bottom_right"),
     ):
         geom = GatedAttentionBlockGeometry(**{**_SMALL_D256, **geom_kw}, qsa=QsaSpec())
-        if field == "thd" and rec.thd:
-            blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
-            assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd
+        if getattr(rec, field) and field in block_binds:
+            with _no_host_sync():
+                blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
+            assert isinstance(blk._sdpa, _SparseSdpa), field
+            if field == "epilogue_gate":
+                assert (
+                    blk.fuse_gate and blk._sdpa.fuse_gate and blk._gate is None
+                ), "fuse_gate under QsaSpec binds the gate through the sparse stage; stage (5) is not built"
+            if field == "thd":
+                assert blk._sdpa.thd, "thd under QsaSpec binds the packed sequences through the sparse stage"
             continue
         with pytest.raises(NotImplementedError) as e:
             GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
@@ -742,7 +751,8 @@ def test_adapter_accept_decline_set_equals_the_record():
             seq_kv_lens=SparseOperandDesc((2,), (1,), torch.int32),
         ),
         "paged_kv": paged,
-        "epilogue_gate": dict(epilogue_gate=object()),
+        # the gate is an OPERAND: O-shaped in Q's dtype (here a slab-strided column slice, token stride 13312)
+        "epilogue_gate": dict(epilogue_gate=SparseOperandDesc((1, 64, 24, 256), (64 * 13312, 13312, 256, 1), torch.bfloat16)),
         "split_kv": dict(split_kv=2),
         "bottom_right": dict(bottom_right=True),
         "sink": dict(sink=object()),
