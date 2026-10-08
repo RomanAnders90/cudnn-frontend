@@ -67,6 +67,46 @@ def test_compressed_indexer_rejects_unsupported_qhead_group_before_launch():
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=47)
+@pytest.mark.parametrize("layout", ["bshd", "thd"])
+def test_DSA_compressed_indexer_forward_q_tail_past_the_last_complete_block(layout):
+    """A query may be up to ratio - 1 tokens longer than ratio * seqlen_k (its trailing tokens have not completed
+    a compressed block); one more token is a geometry mismatch and is refused before any launch."""
+    _require_sm100()
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+
+    device = torch.device("cuda")
+    s_k, ratio, h_q, d, top_k = 32, 4, 32, 128, 16
+    s_q_ok, s_q_bad = ratio * s_k + ratio - 1, ratio * s_k + ratio
+    for s_q, expect_ok in ((s_q_ok, True), (s_q_bad, False)):
+        q = torch.randn(1, s_q, h_q, d, dtype=torch.bfloat16, device=device)
+        k = torch.randn(1, s_k, 1, d, dtype=torch.bfloat16, device=device)
+        w = torch.ones(1, s_q, h_q, dtype=torch.bfloat16, device=device)
+        kwargs = dict(top_k=top_k, ratio=ratio, topk_indices_global=False, return_softmax=False, deterministic=True)
+        if layout == "thd":
+            cu = lambda n: torch.tensor([0, n], dtype=torch.int32, device=device)  # noqa: E731
+            call = lambda: DSA.indexer_forward_top_k_wrapper(  # noqa: E731
+                q[0], k[0], w[0], cu_seqlens_q=cu(s_q), cu_seqlens_k=cu(s_k), max_seqlen_q=s_q, max_seqlen_k=s_k, **kwargs
+            )
+        else:
+            call = lambda: DSA.indexer_forward_top_k_wrapper(q, k, w, **kwargs)  # noqa: E731
+        if not expect_ok:
+            with pytest.raises(ValueError, match=r"must be <= .*ratio \+ \(ratio - 1\)"):
+                call()
+            continue
+        result = call()
+        torch.cuda.synchronize()
+        dense_ref = ref_indexer_forward(q, k, w, ratio, compute_dtype=torch.float64)
+        indices = result["indices"].view(1, s_q, top_k)
+        check_ref_compressed_topk(dense_ref, indices, result["logits"].view(1, s_q, top_k), top_k, atol=1e-4, rtol=1e-4)
+        # the last ratio - 1 rows all see exactly s_k blocks
+        assert bool((indices[0, -(ratio - 1) :] >= 0).all())
+
+
+@pytest.mark.L0
 def test_indexer_denom_placeholders_use_stable_power_of_two_buckets():
     _require_sm100()
     try:

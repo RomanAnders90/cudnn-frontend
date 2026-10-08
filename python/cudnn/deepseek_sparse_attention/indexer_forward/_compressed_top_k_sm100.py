@@ -37,6 +37,8 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
 )
 
+from ._support import check_q_covered_by_k as _check_q_covered_by_k
+
 
 def _packed_mxfp8_scale_shape(
     *,
@@ -231,8 +233,7 @@ def compress_topk_cand_buffer_size(
     ``microbatch_rows > 0`` raises here too (microbatch + LSE is unsupported)."""
     from ..indexer_top_k.compress_top_k_sm100 import per_batch_floats
 
-    if seqlen_q > seqlen_k * ratio:
-        raise ValueError(f"seqlen_q ({seqlen_q}) must be <= seqlen_k * ratio ({seqlen_k * ratio})")
+    _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
     if q_causal_offsets is not None:
         if not q_causal_offsets.is_cuda or q_causal_offsets.dtype != torch.int32 or q_causal_offsets.ndim != 1 or q_causal_offsets.shape[0] != bs:
             raise ValueError(f"q_causal_offsets must be a 1D CUDA int32 tensor of shape ({bs},)")
@@ -482,8 +483,7 @@ def indexer_fwd_compress_topk(
             )
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
-    if seqlen_q > seqlen_k * ratio:
-        raise ValueError(f"seqlen_q ({seqlen_q}) must be <= seqlen_k * ratio ({seqlen_k * ratio})")
+    _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
     device = q.device
 
     # Per-batch causal offsets (q_causal_offsets, (bs,) int32; default None = 0 = top-left,
@@ -1423,8 +1423,7 @@ def _indexer_fwd_compress_topk_thd(
     lse_buf = None
     if want_lse:
         lse_buf = lse_out if lse_out is not None else torch.empty((total_q,), dtype=torch.float32, device=device)
-    if max_seqlen_q > max_seqlen_k * ratio:
-        raise ValueError(f"max_seqlen_q ({max_seqlen_q}) must be <= max_seqlen_k*ratio " f"({max_seqlen_k * ratio})")
+    _check_q_covered_by_k(int(max_seqlen_q), int(max_seqlen_k), ratio, what_q="max_seqlen_q", what_k="max_seqlen_k")
     if cand_batch_offsets is not None:
         # Structural check (host metadata, no sync): must be the exact tensor the
         # helper produces — int64, contiguous, (bs+1,), on the input device — so

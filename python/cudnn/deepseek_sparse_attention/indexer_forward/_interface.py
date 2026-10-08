@@ -20,6 +20,7 @@ import cutlass.cute as cute
 
 from .indexer_fwd_sm100 import IndexerForwardSm100
 from .indexer_fwd_sm100_mxfp8 import IndexerForwardSm100Mxfp8
+from ._support import check_q_covered_by_k as _check_q_covered_by_k
 from cudnn.deepseek_sparse_attention.utils.compiler import compile_options
 from cudnn.deepseek_sparse_attention.utils.runtime import (
     ceil_div as _ceil_div,
@@ -373,8 +374,7 @@ def indexer_fwd(
         bs, seqlen_q_dim, n_heads_q, head_dim = q.shape
         _, seqlen_k_dim, n_heads_kv, _ = k.shape
         device = q.device
-        if seqlen_q_dim > seqlen_k_dim * ratio:
-            raise ValueError(f"seqlen_q ({seqlen_q_dim}) must be <= seqlen_k * ratio " f"({seqlen_k_dim * ratio})")
+        _check_q_covered_by_k(seqlen_q_dim, seqlen_k_dim, ratio)
         out_shape = (bs, seqlen_q_dim, seqlen_k_dim)
         out_buf_shape = None
 
