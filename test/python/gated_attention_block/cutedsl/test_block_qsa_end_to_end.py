@@ -668,6 +668,45 @@ def _set_vs_topk(in_set: torch.Tensor, scores: torch.Tensor, top_k: int, tol: fl
     return flips, int(differs.any(dim=-1).sum()), float(gap.max())
 
 
+def _indexer_refs_from_slab(c: _Cell) -> tuple:
+    """The fp32 indexer chain on the KERNEL'S OWN slab band (read back from the workspace), the operands the stage normed and
+    compressed: ``(q_ref [B, S, H_i, D_i], kbar_ref [B, floor(S / bs), D_i])`` in fp32 -- the queries RMSNormed (``w_iq_norm``)
+    and rotated at the token's position, the raw key mean-pooled per complete block, RMSNormed (``w_ik_norm``) and rotated at
+    the block start.  The oracle's own GEMM rounds the band differently from the FROST GEMM, so the one-rounding contract of the
+    norm / compress chain is checked against THIS band, never against the oracle's."""
+    geom, inp = c.geom, c.inp
+    q = geom.qsa
+    b, s = inp["h"].shape[:2]
+    t, bs, h_i, d_i = b * s, q.block_size, q.index_heads, q.index_head_dim
+    lay = c.blk._layout()
+    proj = _view(c.ws, lay.proj, (t, geom.n_qkvg), inp["h"].dtype)
+    q_raw = torch.as_strided(proj, (t, h_i, d_i), (geom.n_qkvg, d_i, 1), proj.storage_offset() + geom.qkvg_offsets[4]).float().view(b, s, h_i, d_i)
+    k_raw = index_k_raw_view(proj, geom, b, s)[:, :, 0].float()  # [B, S, D_i]
+    eps = float(q.index_norm_eps)
+    y = q_raw * torch.rsqrt(q_raw.pow(2).mean(-1, keepdim=True) + eps) * inp["w_iq_norm"].float()
+    q_ref = apply_partial_rope(y, inp["cos"].float(), inp["sin"].float(), geom.rope_dim)
+    nb = s // bs
+    pooled = k_raw[:, : nb * bs].reshape(b, nb, bs, d_i).mean(dim=2)
+    kb = pooled * torch.rsqrt(pooled.pow(2).mean(-1, keepdim=True) + eps) * inp["w_ik_norm"].float()
+    kbar_ref = apply_partial_rope(kb[:, :, None, :], inp["cos"][:, 0::bs][:, :nb].float(), inp["sin"][:, 0::bs][:, :nb].float(), geom.rope_dim)[:, :, 0]
+    return q_ref, kbar_ref
+
+
+def _assert_one_rounding(got: torch.Tensor, ref32: torch.Tensor, what: str) -> dict:
+    """``got`` (bf16) against the fp32 chain ``ref32`` on the same inputs: every element within ONE bf16 ulp of the rounded
+    reference, the ulp floored at the fp32 chain's own noise -- ``2^-22 x max(1, row max)`` (a couple of fp32 ulps at the row's
+    largest magnitude: two fp32 chains with another rsqrt and another FMA order land there, and a cancelled RoPE element is
+    small only in the result, not in the error).  Returns the max in ulps (unfloored), the max absolute error and the bitwise
+    fraction."""
+    ref16 = ref32.to(got.dtype).float()
+    d = (got.float() - ref32).abs()
+    floor = 2.0**-22 * ref32.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+    tol = torch.maximum(_bf16_ulp(ref16), floor)
+    worst = float((d / tol).max())
+    assert worst <= 1.0, f"{what}: {worst:.2f} x the one-rounding budget off the fp32 chain (max |d| {float(d.max()):.3e})"
+    return dict(ulps=float((d / _bf16_ulp(ref16)).max()), max_abs=float(d.max()), bitwise=float((got.float() == ref16).float().mean()))
+
+
 def _membership(ids: torch.Tensor, n: int) -> torch.Tensor:
     """``[R, top_k]`` int32 ids (``-1`` = none) -> ``[R, n]`` bool membership."""
     rows = ids.shape[0]
@@ -719,19 +758,10 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     n_blocks = k_c_o.shape[1]
     live = pos[None, :] < lengths[:, None]  # [B, S]: the rows below the KV length, where the oracle and the kernel see the same blocks
     assert torch.equal(lens_o[live].long(), counts[live]), f"{label}: the oracle's counts disagree on live rows"
-    # (d) the operands: the kernel's qi / kbar vs the once-rounded fp32 chain, one bf16 ulp
     qi_k = ix["qi"].view(b, s, h_i, d_i)
     kbar_k = ix["kbar"]
-    x = c.ref.index_q_raw.float()
-    y = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + float(q.index_norm_eps)) * inp["w_iq_norm"].float()
-    q_o = apply_partial_rope(y, inp["cos"].float(), inp["sin"].float(), geom.rope_dim)
-    d_q = (qi_k.float() - q_o).abs() / _bf16_ulp(q_o)
-    assert float(d_q.max()) <= 1.0, f"{label}: an indexer query is {float(d_q.max()):.2f} bf16 ulps off the fp32 chain"
     nb_live = torch.div(lengths, bs, rounding_mode="floor")  # complete blocks per sequence
     blk_live = torch.arange(n_blocks, device=dev)[None, :] < nb_live[:, None]  # [B, NB]
-    d_k = ((kbar_k.float() - k_c_o.float()).abs() / _bf16_ulp(k_c_o))[blk_live]
-    assert float(d_k.max()) <= 1.0, f"{label}: a compressed key is {float(d_k.max()):.2f} bf16 ulps off the fp32 chain"
-    m.update(ulp_q=float(d_q.max()), ulp_k=float(d_k.max()))
     # the kernel's own scores (fp64 from its bf16 operands) under the position rule the scorer applied
     s_k = torch.relu(torch.einsum("bshd,bjd->bshj", qi_k.double(), kbar_k.double())).sum(2) / math.sqrt(d_i)
     limit = torch.arange(n_blocks, device=dev)[None, None, :] < torch.div(pos + 1, bs, rounding_mode="floor")[None, :, None]
@@ -775,8 +805,19 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     print(
         f"\n{label}: {n_live} live rows; vs the kernel's own operands {fl_a} flips ({rows_a} rows, gap {gap_a:.2e} <= {_TIE_TOL}); "
         f"vs the fp32-operand oracle {fl_b} flips ({rows_b} rows, {m['agree_oracle']:.3f} % rows exact, gap {gap_b:.3e} <= tol {tol_o:.3e}); "
-        f"vs the HF-rounding oracle {fl_c} flips ({rows_c} rows, gap {gap_c:.3e} <= tol {tol_hf:.3e}); qi {m['ulp_q']:.2f} / kbar {m['ulp_k']:.2f} ulp; "
+        f"vs the HF-rounding oracle {fl_c} flips ({rows_c} rows, gap {gap_c:.3e} <= tol {tol_hf:.3e}); "
         f"{int(pad.sum())} padding rows, {extra} ids past their range"
+    )
+    # (d) the operands: the kernel's qi / kbar against the fp32 chain on ITS OWN slab band (the FROST GEMM's rounding of the band
+    # differs from the oracle's GEMM), one bf16 rounding; the distance to the ORACLE's compressed keys is reported as a magnitude.
+    q_ref, kbar_ref = _indexer_refs_from_slab(c)
+    mq = _assert_one_rounding(qi_k, q_ref, f"{label}: the indexer queries")
+    mk = _assert_one_rounding(kbar_k[blk_live], kbar_ref[blk_live], f"{label}: the compressed keys")
+    d_oracle = float((kbar_k.float() - k_c_o.float()).abs()[blk_live].max())
+    m.update(q_ulps=mq["ulps"], q_bitwise=mq["bitwise"], k_ulps=mk["ulps"], k_bitwise=mk["bitwise"], k_vs_oracle_gemm=d_oracle)
+    print(
+        f"{label}: operands vs the fp32 chain on the kernel's band -- qi max {mq['ulps']:.2f} ulp ({100 * mq['bitwise']:.3f} % bitwise, max |d| {mq['max_abs']:.2e}), "
+        f"kbar max {mk['ulps']:.2f} ulp ({100 * mk['bitwise']:.3f} % bitwise, max |d| {mk['max_abs']:.2e}); kbar vs the oracle's GEMM + chain max |d| {d_oracle:.2e}"
     )
     return m
 
@@ -900,11 +941,15 @@ def test_indexer_identity_below_the_bound_launches_only_a_requested_cache_compre
         ref_geom,
         seq_lens=lens_t,
     )
+    _, kbar_ref = _indexer_refs_from_slab(with_cache)
     kb = with_cache.ix["kbar_out"]
     for bi, ln in enumerate((2051, 1500)):
         nb = ln // BS
-        d = ((kb[bi, :nb].float() - k_c[bi, :nb].float()).abs() / _bf16_ulp(k_c[bi, :nb])).max().item()
-        assert d <= 1.0, f"entry {bi}: {d:.2f} ulps"
+        mk = _assert_one_rounding(kb[bi, :nb], kbar_ref[bi, :nb], f"entry {bi}: the cached compressed keys")
+        d_o = float((kb[bi, :nb].float() - k_c[bi, :nb].float()).abs().max())
+        print(
+            f"entry {bi}: cache vs the chain on the kernel's band max {mk['ulps']:.2f} ulp ({100 * mk['bitwise']:.2f} % bitwise); vs the oracle's GEMM + chain max |d| {d_o:.2e}"
+        )
         assert torch.isnan(kb[bi, nb:].float()).all()
     assert torch.equal(with_cache.ix["ids_out"].view(B, S, -1), plain.ix["kernel_ids"]) and torch.equal(
         with_cache.ix["lens_out"].view(B, S), plain.ix["kernel_lens"]
