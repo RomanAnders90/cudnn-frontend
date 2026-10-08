@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import (
     QKVG_TILE_ALIGN,
     GatedAttentionBlockGeometry,
@@ -232,6 +233,12 @@ def test_qwen38_family_fitted_norm_tile_rows(geom, n_qkvg, widths, offsets, gqa_
     the CTA's 4 warps): 12 at 24/2, 12/1 and 24/4, 16 at 64/4 -- and NONE at 6/1, where the typed verdict names the
     LDG kernel as the one that serves the geometry (so ``impl="auto"`` resolves to it instead of raising)."""
     from cudnn.gated_attention_block.api import _QK_NORM_ROPE_THREADS, _QkNormRope
+
+    # The kernel module imports the CuTe DSL at top level: below FROST's DSL floor these five cells SKIP with the
+    # version-naming message (never fail), while the rest of this module stays DSL-free and runs everywhere.
+    requirement_error = cutedsl_requirement_error("the TMA norm kernel's shape validator (kernels.qk_norm_rope_tma)")
+    if requirement_error:
+        pytest.skip(requirement_error)
     from cudnn.gated_attention_block.kernels.qk_norm_rope_tma import validate_shape
 
     stage = _QkNormRope(geom, batch=1, seq_len=2, dtype=torch.bfloat16, want_rstd=False)
@@ -418,6 +425,23 @@ def test_qkvg_from_hf_equals_build_fused_qkvg_weight_per_head_bitwise():
     assert torch.equal(w_qkvg, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head"))
 
 
+def test_per_head_split_takes_a_non_contiguous_q_proj_weight():
+    """A column-sliced shard or a transposed view of ``q_proj.weight`` is a legitimate load-time input: the per-head
+    ``view(H_q, 2*D, d_model)`` only SPLITS the row axis, which is stride-agnostic (a split dimension inherits the
+    parent's stride; only a MERGE across non-contiguous dimensions would need ``.reshape``), so neither form needs
+    ``.contiguous()`` first and both give the contiguous result bitwise -- through the assembler and through the loader."""
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    ref = build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head")
+    transposed = w_qg.t().contiguous().t()  # strides (1, rows)
+    sliced = torch.cat([w_qg, w_qg], dim=1)[:, : g.d_model]  # a column slice of a wider tensor
+    w_n = torch.zeros(g.d_head)
+    for w in (transposed, sliced):
+        assert not w.is_contiguous() and torch.equal(w, w_qg)
+        assert torch.equal(build_fused_qkvg_weight(w, w_k, w_v, g, q_gate_layout="per_head"), ref)
+        assert torch.equal(qkvg_from_hf(w, w_k, w_v, w_n, w_n, g, act_dtype=torch.float32)[0], ref)
+
+
 @pytest.mark.parametrize("offset", [0.0, 1.0])
 def test_qkvg_from_hf_norm_form_is_derived_from_the_geometry(offset):
     """fp32, both offsets: the block's multiply by the handed weight equals the model's ``(1 + w)`` RMSNorm bitwise
@@ -464,11 +488,11 @@ def test_qkvg_from_hf_rejects():
 
 
 def test_build_fused_qkvg_weight_warns_when_q_gate_layout_is_omitted():
-    """The omitted layout still means "flat" (no caller changes behaviour) but is announced; an explicit layout and
-    the HF loader are silent."""
+    """The omitted layout still means "flat" (no caller changes behaviour) but is announced with a ``FutureWarning``;
+    an explicit layout and the HF loader are silent."""
     g = GEOM_SMALL
     w_qg, w_k, w_v = _small_hf_weights(g)
-    with pytest.warns(DeprecationWarning, match="q_gate_layout"):
+    with pytest.warns(FutureWarning, match="q_gate_layout"):
         implicit = build_fused_qkvg_weight(w_qg, w_k, w_v, g)
     assert torch.equal(implicit, build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat"))
     with warnings.catch_warnings():
@@ -476,6 +500,31 @@ def test_build_fused_qkvg_weight_warns_when_q_gate_layout_is_omitted():
         build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="flat")
         build_fused_qkvg_weight(w_qg, w_k, w_v, g, q_gate_layout="per_head")
         qkvg_from_hf(w_qg, w_k, w_v, torch.zeros(g.d_head), torch.zeros(g.d_head), g)
+
+
+def test_omitted_q_gate_layout_warning_is_shown_under_pythons_default_filters():
+    """The announcement has to reach a model loader that lives in a LIBRARY module -- a serving stack's model file is
+    never ``__main__``. CPython's default filter set shows a ``DeprecationWarning`` only when ``__main__`` is the
+    caller and silences every other one, so the omission is announced with a ``FutureWarning``, the deprecation
+    category meant for end users and shown under the defaults. Re-created in-process: the default filters, the call
+    from this (non-``__main__``) module, exactly one warning recorded -- and a ``DeprecationWarning`` emitted beside it
+    is dropped, which is what the record would have been had the warning kept that category."""
+    g = GEOM_SMALL
+    w_qg, w_k, w_v = _small_hf_weights(g)
+    assert __name__ != "__main__"
+    with warnings.catch_warnings(record=True) as recorded:
+        warnings.resetwarnings()
+        # CPython's defaults: default::DeprecationWarning:__main__, ignore::DeprecationWarning, ignore::PendingDeprecationWarning,
+        # ignore::ImportWarning, ignore::ResourceWarning; every other category takes the "default" (show once) action.
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=PendingDeprecationWarning)
+        warnings.filterwarnings("ignore", category=ImportWarning)
+        warnings.filterwarnings("ignore", category=ResourceWarning)
+        warnings.filterwarnings("default", category=DeprecationWarning, module="__main__")
+        build_fused_qkvg_weight(w_qg, w_k, w_v, g)
+        warnings.warn("a DeprecationWarning from a library module is dropped by the same filters", DeprecationWarning, stacklevel=1)
+    assert [w.category for w in recorded] == [FutureWarning]
+    assert "q_gate_layout" in str(recorded[0].message)
 
 
 def test_rounding_of_a_zero_centered_norm_weight_handed_in_as_one_plus_w():

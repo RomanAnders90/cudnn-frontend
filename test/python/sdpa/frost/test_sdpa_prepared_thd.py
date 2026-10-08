@@ -1374,12 +1374,12 @@ def test_thd_output_row_stride_above_int32_reaches_device_descriptors(d):
 def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window, ql, splits, monkeypatch, packed):
     """Prepared and standalone launches bind fresh pools/tables without Python admission."""
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
-    if cga == 1 and splits == 1 and arch != "sm107":
-        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
+    if cga == 1 and splits == 1 and arch != "sm107" and not (torch.cuda.get_device_capability() == (10, 0) and ql > 1):
+        pytest.skip("The unsplit D128 cga1 paged prefill leg requires SM100 Q>1 or SM107")
     if d == 64 and arch == "sm107":
         pytest.skip("Native D64 paged split is qualified on SM100/SM103")
     if d == 256 and splits > 1 and arch != "sm107":
-        pytest.skip("Paged D256 packed split is qualified on SM107")
+        pytest.skip("Paged D256 split and PackGQA are qualified on SM107")
     from test_sdpa_fwd_paged_sm100 import _pools
 
     b, h, hk, page, pages = 2, 8, 2, 16, 5
@@ -1516,14 +1516,14 @@ def test_native_paged_thd_capture_and_rebind(hnd, dtype, d, cga, causal, window,
 
 @requires_blackwell
 @requires_dsl
-@pytest.mark.parametrize("d", [64, 96, 128, 200, 256])
+@pytest.mark.parametrize("d,b", [(64, 3), (96, 3), (128, 3), (200, 3), (256, 3), (96, 1), (128, 1)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
+def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, b, dtype):
     """Every public policy covers the same live rows, including empty sequences/KV."""
     rubin = torch.cuda.get_device_capability() == (10, 7)
     if rubin and d not in (128, 256):
         pytest.skip("Only D128/D256 half flavors admit LPT on SM107")
-    b, hq, hk, qcap, kcap = 3, 16, 2, 1025, 2305
+    hq, hk, qcap, kcap = 16, 2, 1025, 2305
     io_type = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
     g, t = _thd_graph(b, qcap, kcap, hq, hk, d, dtype=io_type, arch="sm107" if rubin else "sm100")
     engine, knobs = g.get_engine_and_knobs_at_index(g._plan_index)
@@ -1545,7 +1545,12 @@ def test_thd_scheduler_policies_replay_changed_ragged_metadata(d, dtype):
         workspaces.append(ws)
         captures.append(graph)
     try:
-        for ql, kl in (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793])):
+        lengths = (
+            (([513, 0, 1025], [769, 0, 2049]), ([0, 513, 1025], [0, 0, 1793]))
+            if b > 1
+            else (([qcap], [kcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [kcap]))
+        )
+        for ql, kl in lengths:
             cq, ck = [0, *accumulate(ql)], [0, *accumulate(kl)]
             for name, values in (
                 ("cu_q", cq),
@@ -1912,8 +1917,8 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
     rubin = cc == (10, 7)
     if cc not in ((10, 0), (10, 3), (10, 7)) or (rubin and d == 64):
         pytest.skip("Paged LPT requires a qualified SM100/SM103/SM107 flavor")
-    if cga == 1 and not rubin:
-        pytest.skip("The unsplit D128 cga1 paged prefill leg is qualified on SM107")
+    if cga == 1 and cc not in ((10, 0), (10, 7)):
+        pytest.skip("The unsplit D128 cga1 paged prefill leg requires SM100 Q>1 or SM107")
     arch = "sm107" if rubin else "sm100"
     b, h, hk, qcap, kcap = 3, 8, 1, 1025, 2304
     dt = cudnn.data_type.HALF if dtype == torch.float16 else cudnn.data_type.BFLOAT16
@@ -2026,9 +2031,14 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d128_split", "HN", True, 3),
         ("d128_split_gqa", "NH", False, 2),
         ("d128_split_gqa", "HN", True, 3),
+        ("d128_prefill_b1_default_cga_gqa", "HN", True, 1),
+        ("d128_prefill_b1_gqa16_gqa", "HN", True, 1),
+        ("d128_prefill_gqa", "padded", False, 1),
         ("d128_split_b1", "HN", False, 4),
         ("d128_split_b1_gqa", "NH", True, 3),
         ("d128_gqa8_split_gqa", "HN", True, 3),
+        ("d128_gqa16_split_gqa", "NH", False, 3),
+        ("d128_gqa16_split_gqa", "HN", True, 4),
         ("d128_mha_split", "NH", False, 3),
         ("d64_split", "NH", False, 4),
         ("d64_split", "HN", True, 3),
@@ -2045,16 +2055,23 @@ def test_thd_lpt_paged_capture_changes_full_and_prefix_lengths(hnd, dtype, page,
         ("d256_split_default_cga", "HN", True, 3),
         ("d256_split_b1", "HN", False, 4),
         ("d256_split_b1", "NH", True, 3),
+        ("d256_packed_gqa", "NH", False, 1),
+        ("d256_gqa8_packed_gqa", "HN", True, 1),
+        ("d256_gqa8_packed_b1_gqa", "NH", True, 1),
+        ("d256_packed_b1_gqa", "HN", False, 1),
+        ("d256_packed_gqa", "padded", False, 1),
     ],
 )
 def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, stats_layout, stats_log2, splits):
-    """Paged split preserves O/Stats under changed lengths and retained captures."""
+    """Explicit paged split/packing preserves O/Stats under changed lengths and retained captures."""
     import inspect
 
     from test_sdpa_fwd_paged_sm100 import _pools
 
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip("Live-length scheduler is admitted on SM100, SM103 and SM107")
+    if geometry.startswith("d128_prefill") and "_default_cga" not in geometry and torch.cuda.get_device_capability() == (10, 3):
+        pytest.skip("The single-CTA unsplit paged prefill extension is not qualified on SM103")
     arch = "sm107" if torch.cuda.get_device_capability() == (10, 7) else "sm100"
     b, h, hk, d, qcap, kcap = (1 if "_b1" in geometry else 3), 8, 2, 128, 1025, 2304
     if geometry.startswith("d64"):
@@ -2063,9 +2080,11 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         d = 64
     if geometry.startswith("d256"):
         if arch != "sm107":
-            pytest.skip("Paged D256 packed split is qualified on SM107")
+            pytest.skip("Paged D256 split and PackGQA are qualified on SM107")
         d = 256
-    if "_gqa8_" in geometry:
+    if "_gqa16_" in geometry:
+        h, hk = 16, 1
+    elif "_gqa8_" in geometry:
         h, hk = 32, 4
     elif "_mha_" in geometry:
         hk = h
@@ -2077,6 +2096,8 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
     bufs = dict(q=q, k=k, v=v, o=torch.empty_like(q), lse=torch.empty(b * qcap + spare, h, device=DEV))
     if stats_layout == "HN":
         bufs["lse"] = torch.empty(h, b * qcap + 17, device=DEV)
+    if stats_layout == "padded":
+        bufs["lse"] = torch.empty(b, h, qcap, device=DEV)
     lse_tokens = bufs["lse"].T if stats_layout == "HN" else bufs["lse"]
     bufs.update(
         cu_q=torch.arange(b + 1, device=DEV, dtype=torch.int32) * qcap,
@@ -2111,9 +2132,11 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         paged_attention_max_seq_len_kv=kcap,
     )
     t["o"].set_output(True).set_dim([b, h, qcap, d]).set_stride([qcap * h * d, d, h * d, 1]).set_ragged_offset(t["off_q"])
-    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_stride(
-        [qcap * h, 1, h, 1] if stats_layout == "NH" else [bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]
-    ).set_data_type(cudnn.data_type.FLOAT).set_ragged_offset(t["off_lse"])
+    t["lse"].set_output(True).set_dim([b, h, qcap, 1]).set_data_type(cudnn.data_type.FLOAT)
+    if stats_layout == "padded":
+        t["lse"].set_stride([*bufs["lse"].stride(), 1])
+    else:
+        t["lse"].set_stride([qcap * h, 1, h, 1] if stats_layout == "NH" else [bufs["lse"].numel(), lse_tokens.stride(1), 1, 1]).set_ragged_offset(t["off_lse"])
     kwargs = {}
     if stats_layout == "HN":
         # The effective Stats geometry includes the extra per-head capacity.
@@ -2144,9 +2167,13 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         api = inspect.getclosurevars(_plan(g)._compiled.default_stream).nonlocals["api"]
         workspace_bytes = g.get_workspace_size()
         spec = _plan(g)._prepared.spec
-        assert spec.native is not None and spec.split_workspace.splits == splits
-        assert api.packed_thd_split and api._thd_spec.split_workspace == spec.split_workspace
-        assert api.template_params().thd_batch_one == (b == 1)
+        assert spec.native is not None
+        if splits > 1:
+            assert spec.split_workspace.splits == splits
+            assert api.packed_thd_split and api._thd_spec.split_workspace == spec.split_workspace
+            assert api.template_params().thd_batch_one == (b == 1)
+        else:
+            assert spec.split_workspace is None and not api.packed_thd_split
         assert workspace_bytes == spec.scratch_bytes == api.scratch_workspace_bytes()
         ws = torch.empty(max(workspace_bytes, 1), device=DEV, dtype=torch.uint8)
         pack = {t[n]: x for n, x in bufs.items()}
@@ -2173,8 +2200,9 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
                 current_stream=cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream),
             )
 
-        with pytest.raises(ValueError, match="caller-owned workspace"):
-            standalone(None)
+        if splits > 1:
+            with pytest.raises(ValueError, match="caller-owned workspace"):
+                standalone(None)
         with pytest.raises(ValueError, match="requires a .* workspace"):
             standalone(ws[:-1])
         standalone(ws)
@@ -2186,7 +2214,7 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
         lengths = (
             (([1025, 513, 0], [1025, 2049, 0]), ([0, 1025, 513], [0, 1025, 0]), ([257, 0, 1025], [769, 0, 1025]))
             if b > 1
-            else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]))
+            else (([qcap], [qcap]), ([257], [769]), ([1], [1]), ([128], [0]), ([0], [kcap]), ([qcap], [qcap]))
         )
         for ql, kl in lengths:
             cq = [0, *accumulate(ql)]
@@ -2213,11 +2241,17 @@ def test_paged_thd_split_capture_lengths_and_stats(hnd, dtype, page, geometry, s
                 for _ in range(256 if cq[-1] <= 1 else 1):
                     graph.replay()
                 torch.cuda.synchronize()
-                got_o, got_s = bufs["o"][: cq[-1]], lse_tokens[: cq[-1]]
+                got_o = bufs["o"][: cq[-1]]
+                if stats_layout == "padded":
+                    got_s = torch.cat([bufs["lse"][i, :, :nq].T for i, nq in enumerate(ql)])
+                    for i, nq in enumerate(ql):
+                        assert torch.isneginf(bufs["lse"][i, :, nq:]).all()
+                else:
+                    got_s = lse_tokens[: cq[-1]]
+                    assert torch.isnan(lse_tokens[cq[-1] :]).all()
                 torch.testing.assert_close(got_o.float(), ref_o.float(), atol=1.2e-2, rtol=1.2e-2)
                 torch.testing.assert_close(got_s, ref_s.float(), atol=1e-3, rtol=1e-3)
                 assert torch.isnan(bufs["o"][cq[-1] :]).all()
-                assert torch.isnan(lse_tokens[cq[-1] :]).all()
                 if natural is None:
                     natural = got_o.clone(), got_s.clone()
                 else:

@@ -59,24 +59,35 @@ SM100 f16/bf16 row (B200; SM103 runs the same thresholds, not re-measured there)
   B4 Q2k/KV16k; a 32k endpoint at 16/2 uses HND/page128. Independent B2/B3 full/chunk and
   irregular-length controls confirm the bounded interpolation below. This is a cuDNN route improvement, not a uniform win over
   FA4/TRTLLM. Keep unmeasured graph features and larger declarations backend-first.
-- paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8:
-  prepared single-CTA split plans cover bounded short-query/long-cache work.
-  The shared split rule below owns the measured shape/layout limits; no-Stats
-  graphs lead the backend only when that rule actually selects splitting.
+- paged THD, exact d128 BF16, B1..4 with 4..64 query heads and integral GQA1/2/4/8/16:
+  prepared single-CTA split plans cover Q64..1024 and KV2K..32K, with or without
+  packed Stats. The shared split rule below owns the measured shape/layout
+  limits; graphs lead the backend only when that rule selects splitting.
 - nonpaged THD, exact d192/v128 BF16 with equal Q/KV head counts: the shared
   nonpaged split rule bounds the measured short-query/long-cache shard. Its
   single-CTA split leads the backend with or without packed Stats. Exact
   d128/v128 BF16 Blackwell prefixes without Stats reuse this first-wave rule
   for integral GQA1/2/4/8 and fixed graphs (B200, released cuDNN 9.27).
   The existing order remains when there is no first-wave split to use.
+- nonpaged THD, d128 half, bottom-right causal GQA4/8/16 without window, sink or right band (the
+  groups whose first plan is packed): unsplit
+  FROST leads at KV > 512 with b * h_q * s_q >= 110 query rows per SM, or Q >= 256 at KV >= 1024 (B200,
+  cuDNN 9.27, 2026-10-08: 90 qualifying cases, 0.44-1.00 warm, median 0.89; one cold 1.10 at warm 0.99;
+  a 68-SM SM100: 19 of 31 small launches lead at 0.40-0.95, none slower; B300: 48 leads at 0.25-0.95).
+  Smaller launches lost up to 1.54x; GQA1/2 and non-causal graphs (unpacked) keep the backend first.
 
 SM120 f16/bf16 row (RTX PRO 6000, 188 SMs): 0.16-0.69 on every model and phase, with two measured
 exceptions: ``s_q == 1`` at b = 1 loses 1.13-1.85 on every head dim (fewer than 8 KV units), and the
 d512 row with a 128-wide GQA group (DeepSeek-V4 "pro", 128 query heads over one KV head) loses
 5-10x at every batch; sliding-window dense squares (gpt_oss 2k x 2k, 8k x 8k) are 1.28-1.48 -> TRAIL
 on those three, LEAD everywhere else.
-The small-batch d512 head-count shortcut was measured only at 128k KV on SM120 too;
-restrict it to that domain as a conservative policy. No new SM120 timing is claimed.
+Re-measured 2026-10-08 against public cuDNN 9.27.0.42 (same part, CUDA-graph replay, 399 cases incl. a
+random hold-out): prefill and ``2 <= s_q <= 16`` still lead (prefill median 0.42, decode-shaped
+0.02-0.45 for d64/d128/d256), but ``s_q == 1`` changed: d64/d128 decode is backend-first at every
+batch (FROST 0.96-3.5x), query groups FROST cannot pack (5, 6, 12) re-read K/V per head (1.5-5.6x),
+and d256 needs 12 KV units -> TRAIL outside those (mean regret over the 399 cases 8.5% -> 2.2%). The
+hold-out informed these bounds, so it is no longer out-of-sample. The d512 one-KV-head shortcut keeps its 128k bound: 32/1 heads won 0.29-0.75 from
+6k KV here but ran 1.31x slower at 6k on an RTX 5090.
 
 SM90 f16/bf16 row (H100 SXM; d512 only, the row floors its envelope at 256): prefill 0.22-0.40 and
 ``2 <= s_q <= 16`` 0.02-0.63 on every cell. There is no split-KV on SM90, so ``s_q == 1`` wins only
@@ -99,10 +110,54 @@ the 72-case random hold-out that found it).
 
 SM107 half uses the shared paged/nonpaged native THD split selectors and the
 measured packed-GQA paged prefill contract. Selected native splits retain
-priority; other eligible graphs retain the backend first. Quantized Rubin rows
-remain opt-in. Qualification and timing evidence are maintained internally.
+priority; other eligible graphs retain the backend first. The per-tensor FP8
+Rubin row remains opt-in. Qualification and timing evidence are maintained internally.
 
-Rows with no measurement (SM80, mxfp8) keep the historical order (LEAD); they are still
+SM107 MXFP8 row (``sdpa_fwd_prefill_sm107_mxfp8``, offered by default since 2026-10): LEAD on exact
+cc 10.7 for every graph the row admits -- dense BSHD, exact d128 / d192x128 / d256 / d512, E4M3 / E5M2
+in, half / FP8 / block-scaled O, every mask, sink, Stats on or off, ``s_q >= 1`` on the prefill bodies.
+A qualification verdict, not a per-shard timing one: the backend's cc 10.7 MXFP8 engines are not a
+qualified alternative. (1) Their Amax_O is wrong on dense MXFP8 graphs (``BACKEND_AMAX_O_ISSUE`` in
+test/python/sdpa/fp8.py, cuDNN 9.26.0.51). (2) Their planner crashes the process (SIGSEGV inside the
+C++ plan creation -- the ``create_execution_plans`` heuristics query and the explicit
+``create_execution_plan(engine_id, knobs)`` engine-config path alike -- after lowering, validate and
+build_operation_graph completed) while planning any single-query MXFP8 graph without a sink token: dense
+BSHD and BHSD and THD, Stats on or off, every O dtype, E4M3 and E5M2, causal or not, KV 128 / 2048 / 4096,
+batch 1 / 2 / 4 -- every d128 contract of the detector's 21-contract matrix, measured on a 216-SM cc 10.7
+board with cuDNN 9.26.0.51 and 9.27.0.28 (2026-10-08); a sink makes them plan, and d192x128 / d256 / d512
+and paged pools decline cleanly there; on cuDNN 9.28.0 (the cc 10.7 CI lane) the heuristics plan every
+contract but building the backend's BHSD single-query plan kills the process instead, so no build is clean yet;
+``sdpa/fwd/backend_guard.py`` keeps the backend out of planning on that domain on every known build (the
+detector re-measures the whole matrix through plan, check_support and build on every run of that lane), and
+an explicit backend pin there is a typed decline. (3) Their d256 and d512
+MXFP8 plans are offered but fail to build on both engines (NVRTC
+``CUDNN_STATUS_INTERNAL_ERROR_COMPILATION_FAILED``, same board, 9.26.0.51 and 9.27.0.28), so without
+this row those two flavors have no provider on cc 10.7. Timing is evidence, not the criterion -- measured
+2026-10-08 on that board (cuDNN 9.26.0.51; every plan of the flag-less [A, FALLBACK] list on a fresh graph,
+CUDA-graph replay, 7 interleaved rounds of 50 replays after an L2 flush, SM clock 2364-2424 MHz unless
+noted, median us; the harness numerics checks passed on every FROST plan and on every backend plan except
+where Amax_O is named):
+  B2 H8/2 S4096 d128 dense, bf16 O ........ FROST 49.6 vs eng16 49.0 (1.01x)
+  B2 H8/2 S4096 d128 causal ............... FROST 37.6 (LPT_L2; LPT 35.6) vs eng16 30.0 (1.25x)
+  B2 H8/2 S4096 d128 Stats, e4m3 O ........ FROST 52.2 vs eng16 50.5 (1.03x)
+  B2 H8/2 S4096 d192x128 causal, sink ..... FROST 38.2 vs eng16 31.1 (1.23x)
+  B1 H16/4 S8192 d256 causal .............. FROST 125.0; neither backend plan builds (defect 3)
+  B2 H8/8 S4096 d512 dense ................ FROST 92.1; neither backend plan builds (defect 3)
+  B4 H8/2 S_q 1 KV2048 d128 ............... FROST 16.1; the backend is not consulted (defect 2)
+  B4 H8/2 S_q 1 KV2048 d128, sink ......... FROST 16.0 vs eng3 20.0 (0.80x; eng3 reports Amax_O = 0, defect 1), eng16 16.8
+  B64 H8/2 S_q 1 KV4096 d128, sink ........ FROST 113.3 vs eng3 81.5 / eng16 70.1 (1.39x / 1.62x)
+  B128 H32/8 S_q 1 KV2048 d128, sink ...... FROST 766.8 vs eng3 423.3 / eng16 375.8 (1.81x; board at 2256 MHz and falling)
+  B64 H8/2 S_q 8 KV4096 d128 .............. FROST 114.2 vs eng3 81.6 / eng16 69.9 (1.40x / 1.63x)
+  B64 H8/2 S_q 8 KV4096 d128 causal-BR, sink  FROST 129.3 (NATURAL 122.5) vs eng16 91.7 (1.41x)
+Prefill shapes sit at parity to 1.25x of the backend's pick; decode-shaped graphs (S_q <= 8 at large batch)
+run the row's 512-row 2-CTA prefill tile with 1..8 live rows and trail the backend's decode-shaped engines
+by 1.4-1.8x where those plan at all (with a sink token; without one the backend's planner crashes). The
+lead stays a qualification verdict (FROST-first; the backend's plans carry defects 1-3): the gap is a
+kernel follow-up -- an MXFP8 decode tile for cc 10.7, recorded in SUPPORT_MATRIX_TRACKER.md's gaps table
+-- not a backend-relative placement rule. Devices other than exact cc 10.7 (10.8-11.9 are in the row's
+arch range) TRAIL until measured.
+
+Rows with no measurement (SM80, SM100 mxfp8) keep the historical order (LEAD); they are still
 opt-in, so the order is only observable with ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1``.
 """
 
@@ -132,6 +187,12 @@ D512_PREFILL_MIN_Q_ROWS = 4096  # d512 prefill below a 2k cache: b * h_q * s_q f
 # chunked prefill (a chunk attending to a longer cache), by launch size in 128-row Q tiles (b * h_q * ceil(s_q / 128)):
 CHUNKED_MAX_Q_TILES = 128  # <= 128 tiles wins from a 4k cache (0.30-0.89, d64-d256); 256 tiles loses 1.02-1.07 for d64/d128
 CHUNKED_MIN_KV_TOKENS = 4096
+THD_PACKED_MIN_KV_TOKENS = 512  # exclusive: unsplit packed THD at KV 512 measured 1.0-1.54x the backend
+# Small unsplit packed launches lose to the backend (KV 576-1024 below ~110 query rows per SM: up to
+# 1.43x on B200 and a 68-SM SM100); 8192 rows lost on B200 (148 SMs) and won 0.71-0.89 on 68 SMs.
+THD_PACKED_MIN_Q_ROWS_PER_SM = 110  # b * h_q * s_q per SM
+THD_PACKED_LONG_Q = 256  # ... except long sequences: Q256 KV1024 at 4096-8192 rows ran 0.79-0.81
+THD_PACKED_LONG_Q_MIN_KV = 1024
 CHUNKED_SQUARE_MIN_KV_TOKENS = 32768  # s_q == s_kv at <= 128 tiles: kept from the 2026-09-18 bound, not re-measured
 
 # B200 paged THD prefill shard; conservative bounds on graph declarations.
@@ -144,6 +205,7 @@ PAGED_D256_PREFILL_MAX_BATCH = 4
 
 # SM120 f16/bf16 thresholds.
 SM120_SQ1_MIN_KV_UNITS = 8  # s_q == 1: b * h_kv below this (b = 1) loses 1.13-1.85 on every head dim
+SM120_SQ1_D256_MIN_KV_UNITS = 12  # s_q == 1, d256: 8 units at 2k KV lost 1.55x; 12+ ran 0.74-1.04 (cuDNN 9.27)
 SM120_SQ1_MAX_GQA_GROUP = 64  # s_q == 1, d512: a 128-wide query group over one KV head loses 5-10x at every batch
 
 # SM90 f16/bf16 thresholds.
@@ -166,11 +228,14 @@ def place(spec, facts) -> str:
 
     Keyed by the row's name: the SM100, SM120 and SM90 f16/bf16 rows and the SM100 FP8 row each use
     their measured shard table. The SM107 half row leads for a selected native THD split
-    or qualified packed paged prefill. Every unmeasured row (SM80,
-    mxfp8) keeps the historical order -- those stay opt-in, so the order is only
+    or qualified packed paged prefill; the SM107 MXFP8 row leads on exact cc 10.7 for every graph it
+    admits (a qualification verdict, module docstring). Every unmeasured row (SM80, SM100 mxfp8, the
+    fp8 rows of SM107 / SM120) keeps the historical order -- those stay opt-in, so the order is only
     observable with the flag set, which ranks ours first anyway."""
     if spec.name == "sdpa_fwd_prefill_sm107":
         return _place_sm107_f16(spec.capabilities, facts)
+    if spec.name == "sdpa_fwd_prefill_sm107_mxfp8":
+        return _place_sm107_mxfp8(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm100":
         return _place_sm100_f16(spec.capabilities, facts)
     if spec.name == "sdpa_fwd_prefill_sm120":
@@ -219,6 +284,17 @@ def _place_sm107_f16(caps: Capabilities, facts) -> str:
     return TRAIL
 
 
+def _place_sm107_mxfp8(caps: Capabilities, facts) -> str:
+    """LEAD on exact cc 10.7 for every graph the row admits; TRAIL on any other device.
+
+    A qualification verdict, not a per-shard timing one (module docstring, "SM107 MXFP8 row"): the
+    backend's cc 10.7 MXFP8 engines are not a qualified alternative.  Eligibility stays with
+    ``engines.mismatch`` (dense BSHD, exact native head dims; THD / paged / split / PackGQA decline
+    there) -- nothing is admitted here.  The row's arch range reaches cc 11.9 (``sm_hi``); any part other
+    than the one it was qualified on trails, as the half row does."""
+    return LEAD if facts.device_cc == (10, 7) else TRAIL
+
+
 def _place_sm100_fp8(caps: Capabilities, facts) -> str:
     # Measured: dense per-tensor E4M3, O E4M3 + Amax_O, no sink / window / block-scaled O.
     if facts.thd or facts.has_paged_kv or facts.window_left is not None or facts.has_sink or facts.o_block_scale:
@@ -261,7 +337,11 @@ def _place_sm120_f16(caps: Capabilities, facts) -> str:
                 return TRAIL
             # one KV head: the b = 1, >=32-query-head win (0.44-0.85) was measured at 128k KV only.
             return LEAD if units >= SM120_SQ1_MIN_KV_UNITS or (facts.h_q >= SQ1_MQA_MIN_Q_HEADS and facts.s_kv >= SQ1_MQA_MIN_KV_TOKENS) else TRAIL
-        return LEAD if units >= SM120_SQ1_MIN_KV_UNITS else TRAIL
+        group = facts.h_q // max(facts.h_kv, 1)
+        if _selected_d_shape(caps, facts) in ((64, 64), (128, 128)) or group & (group - 1):
+            return TRAIL  # d64/d128 and unpackable groups (5, 6, 12): 0.96-3.5x and 1.5-5.6x on cuDNN 9.27
+        need = SM120_SQ1_D256_MIN_KV_UNITS if _selected_d_shape(caps, facts) == (256, 256) else SM120_SQ1_MIN_KV_UNITS
+        return LEAD if units >= need else TRAIL
     if facts.window_left is not None and facts.s_q == facts.s_kv:
         return TRAIL
     return LEAD
@@ -287,7 +367,7 @@ def _in_paged_d256_prefill_domain(facts) -> bool:
 
 
 def _place_sm100_f16(caps: Capabilities, facts) -> str:
-    from .heuristics import nonpaged_thd_split_choice, paged_thd_split_choice
+    from .heuristics import _prefer_thd_pack_gqa, nonpaged_thd_split_choice, paged_thd_split_choice
 
     # The prepared single-CTA split removes the underfilled paged D128
     # launch. Placement and the concrete split share one bounded rule.
@@ -322,6 +402,21 @@ def _place_sm100_f16(caps: Capabilities, facts) -> str:
     # prefill-shaped
     if _in_paged_d256_prefill_domain(facts):
         return LEAD
+    if (
+        facts.thd
+        and not facts.has_paged_kv
+        # Measured domain only: a 32-token window ran 2.7x slower packed.
+        and facts.bottom_right
+        and facts.window_left is None
+        and not (facts.has_sink or facts.right_band_widening)
+        and facts.s_kv > THD_PACKED_MIN_KV_TOKENS
+        and (
+            facts.b * facts.h_q * facts.s_q >= THD_PACKED_MIN_Q_ROWS_PER_SM * (facts.device_sm_count or 148)
+            or (facts.s_q >= THD_PACKED_LONG_Q and facts.s_kv >= THD_PACKED_LONG_Q_MIN_KV)
+        )
+        and _prefer_thd_pack_gqa(caps, facts)
+    ):
+        return LEAD  # unsplit packed causal GQA4/8/16
     if facts.thd or facts.has_paged_kv or facts.window_left is not None:
         return TRAIL
     if flavor == (512, 512):  # exact or envelope-served (d320-d448: 0.32-0.65)

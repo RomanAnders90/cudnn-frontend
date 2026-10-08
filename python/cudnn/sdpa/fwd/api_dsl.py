@@ -55,6 +55,7 @@ from cudnn.sdpa.fwd.config_sm107 import decode_d256_q_tile as _decode_d256_q_til
 from cudnn.sdpa.fwd.config_sm100 import (
     supports_thd_split,
     supports_paged_prefill_cga1,
+    supports_paged_d256_pack_gqa,
     _PAGED_KV_FLAVORS as _SM100_PAGED_KV_FLAVORS,
     TemplateParams as Sm100TemplateParams,
     SM100_THD_PACK_GQA_SHAPES,
@@ -1650,6 +1651,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             thd=self.thd,
             paged=self.paged,
             split_kv=self.split_kv,
+            max_q=int(s_qo),
         )
         # An unsplit Rubin paged request uses the prefill template even at
         # one query token; the split decode leg belongs to the SM100 family.
@@ -1793,6 +1795,15 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                 self.thd
                 and not self.thd_decode_leg
                 and not (self.packed_thd_split and int(d_qk) in (64, 128))
+                and not supports_paged_d256_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                )
                 and not (
                     (self._device_cc != (10, 7) or self.paged)
                     and not self._fp8
@@ -1800,7 +1811,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
                     and (self.cga in (None, 2) or paged_prefill_cga1)
                     and self.split_kv == 1
                 ),
-                "THD PackGQA requires half D128 cga2 unsplit or cga1 split; Rubin paged KV also admits cga1 unsplit",
+                "THD PackGQA requires half D128 cga2 unsplit/cga1 split, Rubin paged D128 cga1 unsplit, or Rubin paged D256 cga2 unsplit",
             )
             # Partial PackGQA (the largest divisor of the group that divides the
             # tile) is wired in the pre-Rubin d128 / d256 f16 kernels only; every
@@ -1819,8 +1830,20 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # packed d256 request past its route is the typed decline engines.mismatch gives (not the prefill
             # tiles' divisibility rule, which would name tile_m for a 24/2 group the tile serves at S_q <= 4).
             self._not_implemented_error_if(
-                self._device_cc == (10, 7) and not self._fp8 and self.flavor == (256, 256) and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin half PackGQA at D256 is wired on the decode tile only (a decode-shaped graph: S_q x G packed rows within its routed envelope; the d256 prefill kernel runs unpacked)",
+                self._device_cc == (10, 7)
+                and not self._fp8
+                and self.flavor == (256, 256)
+                and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv))
+                and not supports_paged_d256_pack_gqa(
+                    (int(d_qk), int(d_v)),
+                    device_cc=self._device_cc,
+                    fp8=self._fp8,
+                    thd=self.thd,
+                    paged=self.paged,
+                    cga=self.cga,
+                    split_kv=self.split_kv,
+                ),
+                "Rubin half PackGQA at D256 is wired on the decode tile (a decode-shaped dense graph: S_q x G packed rows within its routed envelope) and on the paged half THD prefill (CGA2, unsplit) only; the dense d256 prefill kernel runs unpacked",
             )
             self._value_error_if(
                 not pack_gqa_supported(int(h_qo), int(h_kv), partial=_partial)
@@ -1970,9 +1993,9 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # (d256_decode_tile_selected); the paged PREFILL pipeline keeps its THD-only scope.
             self._not_implemented_error_if(
                 self._device_cc == (10, 7)
-                and (self._fp8 or not self.thd or self.has_sink or self.flavor not in ((128, 128), (256, 256)))
+                and (self._fp8 or not self.thd or self.flavor not in ((128, 128), (256, 256)))
                 and not self._decode_q_tile_for(int(s_qo), int(h_qo), int(h_kv)),
-                "Rubin paged KV requires half D128/D256 THD without an attention sink, or a decode-shaped half D256 graph (the decode tile)",
+                "Rubin paged KV requires half D128/D256 THD queries (quantized pools and dense half queries are not wired on cc 10.7), or a decode-shaped half D256 graph (the decode tile)",
             )
             self._not_implemented_error_if(
                 self._fp8 and self.thd,
@@ -2255,6 +2278,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # scale, so every derived scale_softmax_log2 (= scale_softmax * log2 e) is pinned to exactly 1.0 here,
             # at the one place the adapter's scale is resolved.
             self.scale_softmax = 1.0 / math.log2(math.e)
+        # A negative scale is served by negating S in BMM1 and running at |scale| (#1435).
+        self._score_negated = self.scale_softmax < 0
 
         self.batch_size = int(b)
         self.s_q_max = int(s_qo)
@@ -2462,6 +2487,7 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             exp2_fma_split=exp2_fma_split,
             softmax_f16=self.softmax_precision == _cudnn_dtype.HALF,
             softmax_scale_prefolded=self.softmax_scale_prefolded,
+            negate_scores=self._score_negated,
             paged_kv=self.paged,
             page_size=self.paged_page_size,
             pv_bf16=self.pv_bf16,
@@ -2473,7 +2499,19 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
             # A gate that rides the split COMBINE (the decode tile, _gate_in_combine) is
             # not the kernel's: the tile has no gate seams and compiles ungated.
             epilogue_gate=self.gate_desc is not None and not self._gate_in_combine(),
-            thd_batch_one=self.packed_thd_split and self.batch_size == 1,
+            thd_batch_one=(
+                self.packed_thd_split
+                or (
+                    self.thd
+                    and not self.thd_decode_leg
+                    and not self._fp8
+                    and self.flavor == (128, 128)
+                    # Qualified prefill variants of the shared template.
+                    # Other variants keep their existing compiled record.
+                    and ((self._device_cc == (10, 0) and self.dtype == torch.bfloat16) or (self._device_cc == (10, 7) and self.paged))
+                )
+            )
+            and self.batch_size == 1,
         )
         if self.flavor == (192, 128):
             from cudnn.sdpa.fwd.heuristics import select_d192_auto_knobs
@@ -3038,6 +3076,8 @@ class SdpaFwdDslSm100(SdpaFwdDsl):
         )
         scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
         self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
+        self._value_error_if((scale_val < 0) != self._score_negated, "attn_scale sign must match the compiled plan's (#1435)")
+        scale_val = abs(scale_val)
         scale_softmax_log2 = scale_val * math.log2(math.e)
 
         self._value_error_if(
@@ -4320,6 +4360,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         if self.scale_softmax is None:
             self.scale_softmax = 1.0 / math.sqrt(d_q)
         self._not_implemented_error_if(self.scale_softmax == 0, _ZERO_SCALE_UNSUPPORTED)
+        # A negative scale is served by negating Q in the kernel and running at |scale| (#1435).
+        self._score_negated = self.scale_softmax < 0
 
         self._value_error_if(
             self.sched_policy is not None and self.sched_policy not in (SCHED_NATURAL, SCHED_LPT, SCHED_LPT_L2),
@@ -4419,6 +4461,7 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
             kv_tile=self.kv_tile,
             pack_gqa=self.pack_gqa,
             split_kv=self.split_kv,
+            negate_scores=self._score_negated,
         )
         self._k_mod = _load_sm120_kernel_module(self.flavor, params, fp8=self._fp8)
         self._dense_spec = self._thd_spec = None
@@ -4525,6 +4568,8 @@ class SdpaFwdDslSm120(SdpaFwdDsl):
         )
         scale_val = self.scale_softmax if scale_softmax is None else float(scale_softmax)
         self._value_error_if(scale_val == 0, _ZERO_SCALE_UNSUPPORTED)
+        self._value_error_if((scale_val < 0) != self._score_negated, "attn_scale sign must match the compiled plan's (#1435)")
+        scale_val = abs(scale_val)
         if getattr(self, "_staged_spec", None) is not None:
             from .prepared_staged_forward import execute as execute_staged
 

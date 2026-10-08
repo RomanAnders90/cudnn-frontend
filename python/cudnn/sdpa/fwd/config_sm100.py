@@ -239,6 +239,9 @@ class TemplateParams:
     # api_dsl.D512_2X2 is the call-time switch that sets it (default True since 2026-10-06; False = the
     # role-split A/B arm).
     mma_2x2: bool = False
+    # attn_scale < 0: BMM1 negates Q (tcgen05 a_negate), so the kernel's raw-score max, masks and exp2 run on -S at
+    # |attn_scale| (#1435). APPEND-ONLY, default False.
+    negate_scores: bool = False
     # Index-list (block-sparse) attention on the cc 10.7 d256 f16/bf16 line (sm107/sparse_d256_f16.py,
     # config_sm107.make_cfg_d256_sparse): the query attends the keys of its caller-selected 4-token blocks plus the open
     # tail block of its visible range, under the causal mask.  These four are DECLARATION attributes (the selection IS the
@@ -302,9 +305,15 @@ def supports_thd_split(d_shape, *, device_cc, fp8, thd, paged, max_q, padded_sta
     )
 
 
-def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv):
+def supports_paged_prefill_cga1(d_shape, *, device_cc, fp8, thd, paged, split_kv, max_q):
     """The shared two-slab D128 prefill body, distinct from its split/decode tile."""
-    return device_cc == (10, 7) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+    # SM100 Q=1 keeps the existing ragged-Q decode/combine contract.
+    return (device_cc == (10, 7) or (device_cc == (10, 0) and max_q > 1)) and d_shape == (128, 128) and not fp8 and thd and paged and split_kv == 1
+
+
+def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, split_kv):
+    """The shared D256 packed-head path is qualified on paged Rubin THD only."""
+    return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
@@ -409,17 +418,20 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         raise ValueError(f"{flavor}: qh_per_kh ({k.qh_per_kh}) must be >= 1")
     if k.pack_gqa:
         if k.thd_varlen and not (
-            (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and not fp8 and k.split_kv > 1)
-            or (
-                flavor == "d128"
-                and not fp8
-                and (
-                    ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
-                    or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+            not fp8
+            and (
+                (flavor == "d64" and k.decode_tile and k.cta_mma == 1 and k.paged_kv and k.split_kv > 1)
+                or (
+                    flavor == "d128"
+                    and (
+                        ((k.cta_mma == 2 or (k.cta_mma == 1 and k.paged_kv)) and k.split_kv == 1)
+                        or (k.cta_mma == 1 and k.split_kv > 1 and k.single_q_head_dim == 128)
+                    )
                 )
+                or (flavor == "d256" and k.paged_kv and k.cta_mma == 2 and k.split_kv == 1)
             )
         ):
-            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, or paged half d64 cga1 split")
+            raise ValueError(f"{flavor}: THD PackGQA requires half d128 cga2 unsplit/cga1 split, paged half d64 cga1 split, or paged half d256 cga2 unsplit")
     if k.ragged_q:
         # The decode tile's ragged-Q leg (sm100/decode_d128_f16.py): dense grid
         # over the declared batch, Q rows at the ragged offsets, final O / Stats
