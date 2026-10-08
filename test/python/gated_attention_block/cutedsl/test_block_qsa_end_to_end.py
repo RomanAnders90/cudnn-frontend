@@ -21,8 +21,10 @@ clamped on device; an empty list attends to its tail only; one block total at S 
 ADVERSARIAL S = 2052 cell (a dominant key planted through ``h`` inside the block the 512-list omits for row 2051 -- within
 budget vs the oracle ON the list, outside it vs the oracle on the FULL set by the plant's margin; both magnitudes reported);
 the write-through twin (a ``QsaSpec`` block with ``paged_kv_page_size`` is bitwise the one without); the workspace of a
-``QsaSpec`` block equal to the dense block's.  ``fuse_gate`` stays a typed decline here until the sparse epilogue-gate arm is
-bound through the block (its cells invert then).
+``QsaSpec`` block equal to the dense block's.  The ``fuse_gate`` axis: the gated block (stage (5) inside the sparse core's
+epilogue) against the oracle AND against the unfused block on the same inputs -- the gated O within ONE rounding of the
+activation dtype per element, the LSE bitwise, the dead entry exactly 0, one launch fewer -- over the geometries, both dtypes,
+the fully fused form (``fuse_norm_rope`` too), compact K / V, ``top_k = 4`` and a padded second entry.
 
 The IN-BLOCK INDEXER (``QsaSpec(index_source="indexer", index_band=True)``): the block derives the selection itself -- the
 band's queries normed + rotated, the raw key compressed per block at the block start, the scorer's top-k -- and the cells run
@@ -172,11 +174,13 @@ def _run(
     pools=None,
     indexer=False,
     indexer_outputs=False,
+    fuse_gate=False,
 ) -> _Cell:
     """Declare, check, compile and run a QsaSpec block ``launches`` times on sentinel-filled outputs; the oracle on the same
     inputs and list.  ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp`` / ``ref`` reuse another cell's.
     ``indexer=True`` declares ``index_source="indexer"`` (the band implied): the block derives the selection and the oracle
-    runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in."""
+    runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in;
+    ``fuse_gate`` folds stage (5) into the sparse core's epilogue (the gated O is then the SDPA's own output in the same slot)."""
     band = index_band or indexer
     qsa = QsaSpec(top_k=top_k, index_band=band, index_source="indexer" if indexer else "caller")
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=band))
@@ -216,8 +220,12 @@ def _run(
         fuse_norm_rope=fuse_norm_rope,
         inplace_qkv=inplace_qkv,
         paged_kv_page_size=paged_kv_page_size,
+        fuse_gate=fuse_gate,
     )
     assert isinstance(blk._sdpa, _SparseSdpa)
+    assert (
+        blk._sdpa.fuse_gate == fuse_gate and (blk._gate is None) == fuse_gate
+    ), "fuse_gate binds the gate through the sparse stage and does not build stage (5)"
     assert blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
@@ -1085,12 +1093,14 @@ def _run_thd(
     lists=None,
     inp=None,
     refs=True,
+    fuse_gate=False,
 ) -> _ThdCell:
     """Declare, check, compile and run a PACKED (``thd=True``) ``QsaSpec`` block ``launches`` times on sentinel-filled outputs
     and the per-sequence QSA oracle on the same inputs and lists.  ``lens`` is the packing (ints, zero-length sequences
     allowed; ``max_seq_len`` defaults to the longest); ``cu`` hands the ``[B+1]`` prefix sums over instead of the ``[B]``
     lengths, ``rank2`` the ``[T, .]`` input spelling; ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp``
-    reuses another cell's ``(inputs, meta)``; ``refs=False`` skips the oracle (the bitwise pins)."""
+    reuses another cell's ``(inputs, meta)``; ``refs=False`` skips the oracle (the bitwise pins); ``fuse_gate`` (appended) folds
+    stage (5) into the sparse core's epilogue on the packed GATE slice (the gated O is then the SDPA's own output in the same slot)."""
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=index_band))
     geom = GatedAttentionBlockGeometry(**geom_kw, qsa=QsaSpec(top_k=top_k, index_band=index_band))
     if inp is None:
@@ -1146,8 +1156,12 @@ def _run_thd(
         num_sequences=meta["b"],
         max_seq_len=meta["max_seq_len"],
         cu_seqlens=cu,
+        fuse_gate=fuse_gate,
     )
     assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and (blk.batch, blk.seq_len) == (1, t)
+    assert (
+        blk._sdpa.fuse_gate == fuse_gate and (blk._gate is None) == fuse_gate
+    ), "fuse_gate binds the gate through the packed sparse stage and does not build stage (5)"
     assert blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
@@ -1390,14 +1404,144 @@ def test_thd_qsa_workspace_carries_the_packed_metadata_and_execute_requires_the_
     print(f"\nTHD QsaSpec workspace: {blk.get_workspace_size()} B = carve {lay.total_bytes} + engine arm {_align_up(engine)} (packed metadata {meta_bytes} B)")
 
 
-# ============================================================================ host: what the matrix cannot run yet
-def test_fuse_gate_under_qsa_is_still_the_typed_decline():
-    """The ``fuse_gate`` axis of the matrix waits for the sparse epilogue-gate arm to be bound through the block; until then
-    the declaration declines it naming the feature (this test INVERTS when the arm lands: the matrix gains its gated cells)."""
+# ============================================================================ fuse_gate under QsaSpec: the gated cells
+def test_fuse_gate_under_qsa_declares_the_gated_sparse_stage():
+    """Host: ``fuse_gate=True`` under a ``QsaSpec`` CONSTRUCTS (the sparse core's epilogue-gate arm is bound through the block):
+    the sparse stage carries the gate, stage (5) is not built, and the stage's declared operands include the GATE at the slab's
+    GATE columns (the token stride of the fused projection) -- the inversion of the former typed decline."""
     geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec())
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
-    with pytest.raises(NotImplementedError, match="fuse_gate=True"):
+    blk = GatedAttentionBlockFwd(
+        z(1, 8, geom.d_model),
+        z(geom.n_qkvg, geom.d_model),
+        z(geom.d_head),
+        z(geom.d_head),
+        z(1, 8, 64),
+        z(1, 8, 64),
+        z(geom.d_model, geom.h_q * geom.d_head),
+        z(1, 8, geom.d_model),
+        geom,
+        fuse_gate=True,
+    )
+    assert blk.fuse_gate and isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.fuse_gate and blk._gate is None
+    ops = blk._sdpa._operands()
+    assert ops["gate"] is not None and ops["gate"].shape == (1, 8, geom.h_q, geom.d_head) and ops["gate"].strides[1] == geom.n_qkvg
+    ungated = GatedAttentionBlockFwd(
+        z(1, 8, geom.d_model),
+        z(geom.n_qkvg, geom.d_model),
+        z(geom.d_head),
+        z(geom.d_head),
+        z(1, 8, 64),
+        z(1, 8, 64),
+        z(geom.d_model, geom.h_q * geom.d_head),
+        z(1, 8, geom.d_model),
+        geom,
+    )
+    assert ungated._sdpa._operands()["gate"] is None and ungated._gate is not None
+    assert len(blk._stages) == len(ungated._stages) - 1
+
+
+def _ulp_of(x: torch.Tensor, dtype) -> torch.Tensor:
+    """One unit in the last place of ``dtype`` at |x| (CPU fp32 math; ``torch.log2`` / ``exp2`` are avoided on the device),
+    floored at the dtype's smallest subnormal step so a zero never yields a zero budget."""
+    mant, sub = (7, 2.0**-133) if dtype == torch.bfloat16 else (10, 2.0**-24)
+    ax = x.detach().float().cpu().abs().clamp_min(sub)
+    _, e = torch.frexp(ax)  # ax = m * 2^e, m in [0.5, 1) -> floor(log2 ax) = e - 1
+    return torch.ldexp(torch.ones_like(ax), e - 1 - mant).clamp_min(sub)
+
+
+# (geometry, B, S, dtype, list source, top_k, seq_lens, fuse_norm_rope, inplace_qkv): the fuse_gate axis of the matrix
+_GATED = [
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "full", 512, None, False, None, id="fn24-2-s512-bf16-full-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, F16, "synthetic", 512, None, False, None, id="fn24-2-s512-f16-synthetic-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 2, 512, BF16, "full", 512, (512, 0), False, None, id="fn24-2-s512-b2-dead-entry-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "synthetic", 512, None, True, None, id="fn24-2-s512-fully-fused-gated"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 512, BF16, "full", 512, None, False, False, id="fn24-2-s512-compact-kv-gated"),
+    pytest.param(GEOM_TP4, 2, 512, BF16, "synthetic", 512, None, False, None, id="tp4-6-1-s512-b2-gated"),
+    pytest.param(GEOM_397B, 1, 512, BF16, "synthetic", 512, None, False, None, id="g397b-32-2-s512-gqa16-gated"),
+    pytest.param(GEOM_SMALL, 1, 300, BF16, "synthetic", 4, None, False, None, id="small8-2-s300-top4-gated"),
+    pytest.param(GEOM_SMALL, 2, 2052, BF16, "synthetic", 512, (2052, 2015), False, None, id="small8-2-s2052-b2-lens-gated"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv", _GATED)
+def test_fuse_gate_under_qsa_matches_the_oracle_and_the_unfused_block(geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv):
+    """The gated ``QsaSpec`` block (stage (5) inside the sparse core's epilogue) against (a) the oracle on the same list --
+    every standard assertion of the matrix (``isfinite``, no sentinel, dead rows exact, ``cos >= 0.999`` on ``out``, ``atol
+    2e-2`` on the gated O and the LSE, two launches bitwise) -- and (b) the UNFUSED block on the SAME inputs and list:
+    ``gated == unfused-then-gated`` within ONE rounding of the activation dtype per element of the gated O (the unfused
+    pipeline rounds O to bf16 / f16 before stage (5); both use the same approximate tanh), the LSE BITWISE the unfused block's
+    (the gate cannot touch a softmax statistic), the dead entry exactly 0 on both, one launch fewer.  The exact max diff is
+    recorded; the oracle's budget is the dense suites', nothing added."""
+    lens_t = None if seq_lens is None else _i32(list(seq_lens))
+    kw = dict(dtype=dtype, top_k=top_k, index_source=source, seq_lens=lens_t, fuse_norm_rope=fuse_norm_rope, inplace_qkv=inplace_qkv, seed=seq_len + batch + 7)
+    c_f = _run(geom_kw, batch, seq_len, fuse_gate=True, **kw)
+    label = f"gated {geom_kw['h_q']}/{geom_kw['h_kv']} B={batch} S={seq_len} {dtype} {source} top_k={top_k}"
+    mags = _check(c_f, label)
+    c_u = _run(geom_kw, batch, seq_len, fuse_gate=False, inp=c_f.inp, ref=c_f.ref, **kw)
+    assert len(c_f.blk._stages) == len(c_u.blk._stages) - 1, "fuse_gate removes stage (5)'s launch"
+    out_f, lse_f, o_f = c_f.runs[0]
+    out_u, lse_u, o_u = c_u.runs[0]
+    assert lse_f is not None and torch.equal(lse_f, lse_u), "the LSE must be bitwise the unfused block's"
+    dead = c_f.ref.n_visible == 0
+    if dead.any():
+        assert (o_f[dead] == 0).all() and (o_u[dead] == 0).all() and (out_f[dead] == 0).all(), "the dead entry gates to exactly 0 on both pipelines"
+    d = (o_f.float() - o_u.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(o_f.float().abs(), o_u.float().abs()), dtype)
+    max_d, max_ulp, n_off = float(d.max()), float(ulps.max()), int((d > 0).sum())
+    assert (
+        max_ulp <= 1.0
+    ), f"{label}: gated vs unfused-then-gated O {max_ulp:.3f} ulp at the element's magnitude (max|d| {max_d:.3e}); the budget is one rounding"
+    assert max_d <= ATOL
+    cos_out = _cos(out_f, out_u)
+    d_out = float((out_f.float() - out_u.float()).abs().max())
+    assert cos_out > COS_OUT
+    print(
+        f"{label}: vs unfused block max|d O_gated| {max_d:.4e} = {max_ulp:.3f} ulp ({n_off} of {d.numel()} elements differ), "
+        f"out cos {cos_out:.6f} max|d out| {d_out:.4e}; vs oracle cos {mags['cos']:.6f} |dO| {mags['d_o']:.4e} |dLSE| {mags['d_lse']:.2e}; dead rows {int(dead.sum())}"
+    )
+
+
+# ============================================================================ fuse_gate x THD under QsaSpec: the gated packed cells
+def test_fuse_gate_with_thd_under_qsa_declares_the_gated_packed_sparse_stage():
+    """Host: ``thd=True`` together with ``fuse_gate=True`` under a ``QsaSpec`` CONSTRUCTS -- the sparse core's epilogue gate composes
+    with its packed arm (the GATE is the packed ``[1, T, H_q, D]`` slab slice like O), so the dense pipeline's 'no THD gate
+    descriptor' decline is the dense SDPA's alone and keeps firing there: the sparse stage carries both arms, stage (5) is not
+    built, the declared GATE operand is the slab slice at the fused projection's token stride beside the packed lengths."""
+    geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec())
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
+    args = lambda g: (
+        z(1, 8, g.d_model),
+        z(g.n_qkvg, g.d_model),
+        z(g.d_head),
+        z(g.d_head),
+        z(1, 8, 64),
+        z(1, 8, 64),
+        z(g.d_model, g.h_q * g.d_head),
+        z(1, 8, g.d_model),
+    )  # noqa: E731
+    blk = GatedAttentionBlockFwd(*args(geom), geom, thd=True, num_sequences=2, max_seq_len=8, fuse_gate=True)
+    assert blk.fuse_gate and blk.thd and isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.fuse_gate and blk._sdpa.thd and blk._gate is None
+    ops = blk._sdpa._operands()
+    assert ops["gate"] is not None and ops["gate"].shape == (1, 8, geom.h_q, geom.d_head) and ops["gate"].strides[1] == geom.n_qkvg
+    assert ops["seq_q_lens"] is not None and ops["seq_q_lens"].shape == (2,)
+    dense = GatedAttentionBlockGeometry(**GEOM_SMALL)
+    with pytest.raises(NotImplementedError, match="no THD gate descriptor"):
+        GatedAttentionBlockFwd(*args(dense), dense, thd=True, num_sequences=2, max_seq_len=8, fuse_gate=True)
+
+
+def test_fuse_gate_with_bottom_right_under_qsa_is_the_decode_modes_typed_decline():
+    """Host: the gate x decode-form composition through the BLOCK is the block's bottom-right decline -- the sparse decode mode
+    (bottom-right positions, the per-sequence list, split-KV) is the standalone adapter's today (it serves the gate on the decode
+    form: fused when unsplit, in the combine under a split), not routed by the block's sparse stage; ``fuse_gate=True`` leaves the
+    decline and its wording (the kernel carries the arm) unchanged."""
+    geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(), causal_bottom_right=True)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
+    with pytest.raises(NotImplementedError, match="bottom-right diagonal") as e:
         GatedAttentionBlockFwd(
             z(1, 8, geom.d_model),
             z(geom.n_qkvg, geom.d_model),
@@ -1410,3 +1554,54 @@ def test_fuse_gate_under_qsa_is_still_the_typed_decline():
             geom,
             fuse_gate=True,
         )
+    assert "the kernel carries the arm" in str(e.value) and "sparse adapter's record declines" not in str(e.value)
+
+
+# (geometry, packing, dtype, list source, top_k, cu_seqlens, fuse_norm_rope, inplace_qkv): the fuse_gate axis of the THD matrix
+_GATED_THD = [
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], BF16, "full", 512, False, False, None, id="fn24-2-three-seqs-bf16-full-gated"),
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], F16, "synthetic", 512, False, False, None, id="fn24-2-three-seqs-f16-synthetic-gated"),
+    pytest.param(GEOM_SMALL, [300, 0, 200], BF16, "synthetic", 512, True, False, None, id="small8-2-empty-middle-cu-gated"),
+    pytest.param(GEOM_FLASH_NEXT, [300, 128, 200], BF16, "synthetic", 512, False, True, None, id="fn24-2-fully-fused-gated"),
+    pytest.param(GEOM_SMALL, [5, 300, 128], BF16, "full", 512, False, False, False, id="small8-2-five-token-compact-kv-gated"),
+    pytest.param(GEOM_TP4, [300, 128, 200], BF16, "synthetic", 4, False, False, None, id="tp4-6-1-top4-gated"),
+    pytest.param(GEOM_397B, [300, 128, 200], BF16, "synthetic", 512, False, False, None, id="g397b-32-2-gqa16-gated"),
+    pytest.param(GEOM_SMALL, [4097, 13, 2051], BF16, "synthetic", 512, False, False, None, id="small8-2-tails-4097-13-2051-gated"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, lens, dtype, source, top_k, cu, fuse_norm_rope, inplace_qkv", _GATED_THD)
+def test_fuse_gate_under_thd_qsa_matches_the_per_sequence_oracle_and_the_unfused_packed_block(
+    request, geom_kw, lens, dtype, source, top_k, cu, fuse_norm_rope, inplace_qkv
+):
+    """The gated PACKED ``QsaSpec`` block (``thd=True, fuse_gate=True``: stage (5) inside the sparse core's epilogue on the packed
+    GATE slice) against (a) every sequence's own oracle (``_check_thd``: ``cos(out) > 0.999``, the gated O and the LSE within
+    ``atol 2e-2``, two launches bitwise, no sentinel) and (b) the UNFUSED packed block on the SAME inputs and lists:
+    ``gated == unfused-then-gated`` within ONE rounding of the activation dtype per element of the gated O (the unfused pipeline
+    rounds O to bf16 / f16 before stage (5); both use the same approximate tanh), the LSE BITWISE the unfused block's, an empty
+    sequence owns no rows on both, one launch fewer.  The exact max diff is recorded; the budgets are the THD suite's, nothing
+    added."""
+    kw = dict(dtype=dtype, top_k=top_k, source=source, cu=cu, fuse_norm_rope=fuse_norm_rope, inplace_qkv=inplace_qkv, seed=sum(lens) + 11)
+    label = request.node.callspec.id
+    c_f = _run_thd(geom_kw, lens, fuse_gate=True, **kw)
+    mags = _check_thd(c_f, label)
+    c_u = _run_thd(geom_kw, lens, fuse_gate=False, inp=(c_f.inp, c_f.meta), lists=(c_f.ids, c_f.lens), refs=False, **kw)
+    assert len(c_f.blk._stages) == len(c_u.blk._stages) - 1, "fuse_gate removes stage (5)'s launch"
+    (out_f, lse_f, o_f), (out_u, lse_u, o_u) = c_f.runs[0], c_u.runs[0]
+    assert lse_f is not None and torch.equal(lse_f, lse_u), "the LSE must be bitwise the unfused packed block's"
+    d = (o_f.float() - o_u.float()).abs()
+    ulps = d.cpu() / _ulp_of(torch.maximum(o_f.float().abs(), o_u.float().abs()), dtype)
+    max_d, max_ulp, n_off = float(d.max()), float(ulps.max()), int((d > 0).sum())
+    assert (
+        max_ulp <= 1.0
+    ), f"{label}: gated vs unfused-then-gated O {max_ulp:.3f} ulp at the element's magnitude (max|d| {max_d:.3e}); the budget is one rounding"
+    assert max_d <= ATOL
+    cos_out = _cos(out_f, out_u)
+    d_out = float((out_f.float() - out_u.float()).abs().max())
+    assert cos_out > COS_OUT
+    print(
+        f"{label}: vs unfused packed block max|d O_gated| {max_d:.4e} = {max_ulp:.3f} ulp ({n_off} of {d.numel()} elements differ), "
+        f"out cos {cos_out:.6f} max|d out| {d_out:.4e}; vs oracle cos {mags['cos']:.6f} |dO| {mags['d_o']:.4e} |dLSE| {mags['d_lse']:.2e}; "
+        f"{mags['seqs']} live sequences of {len(lens)}"
+    )

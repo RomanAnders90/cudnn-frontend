@@ -243,8 +243,10 @@ Served today:
   rule and the open tail are per sequence, positions restarting at every sequence like the RoPE tables). `get_workspace_size()`
   grows by the packed SDPA's small metadata scratch. A one-sequence packing is bitwise the dense `B = 1, S = T` sparse block;
   an empty sequence owns no rows. Validated on Rubin per sequence against the per-sequence fp32 QSA oracle (bf16 and f16).
-  Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) and the paged write-through -- both typed
-  declines naming the feature.
+  `fuse_gate=True` composes with `thd=True` (the sparse core's epilogue gate on the packed `[1, T, H_q, D]` GATE slice, read in
+  place like O; validated on Rubin: the gated packed block within one rounding of the activation dtype of the unfused packed
+  block on O, the LSE bitwise). Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) and the paged
+  write-through -- both typed declines naming the feature.
 - the in-block indexer: a block declared `QsaSpec(index_source="indexer", index_band=True)` derives the selection itself from
   the band -- `execute(..., w_iq_norm=, w_ik_norm=)` instead of `block_ids=` -- and hands it back through the optional
   `block_ids_out` / `block_lens_out` / `index_k_compressed`; the contract is "The in-block indexer" in the serving section
@@ -255,15 +257,18 @@ Every claim of the sparse core -- the dtypes, the head dim, the block size, the 
 not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.sparse_gqa_sm107.SPARSE_CAPABILITIES`), which the
 adapter's own `check_support` enforces; the block transcribes none of it. Typed declines at declaration, naming the feature:
 `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
-`fuse_gate` (the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch), `fuse_norm_rope` together with
-`index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them -- the unfused projection serves
-the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd` together with
-`paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under `index_source="indexer"`
-also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
-(4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0
-wheel), named with the installed version, before the kernel module is imported. Under `index_source="indexer"` the floor is
-checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose package imports its kernels, so a
-too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the stage's `check_support`).
+`fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them --
+the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd`
+together with `paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under
+`index_source="indexer"` also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the
+scorer's packed head groups (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target
+needs (the public 4.8.0 wheel), named with the installed version, before the kernel module is imported. Under
+`index_source="indexer"` the floor is checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose
+package imports its kernels, so a too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the
+stage's `check_support`).  `fuse_gate=True` is served: the sparse core stages each query's GATE slice (the slab's GATE columns,
+read in place) into its epilogue and writes `O * sigmoid(GATE)` in place of O after its dead-row select, so stage (5) disappears
+exactly as on the dense block; the gated O differs from the unfused block's by at most one rounding of the activation dtype (the
+unfused path rounds O to bf16 / f16 before the gate), the LSE is bitwise the same.
 
 ### Serving: index lists and paged KV
 
@@ -671,10 +676,11 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   fp16 inference in place: the projection fork norms and rotates per token with the per-token tables), block-sparse
   attention (`QsaSpec` with caller lists: the sparse core's packed arm, `block_ids` numbered per sequence -- "Sparse
   attention (QSA)" above). Declined, typed:
-  `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
-  stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
-  quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
-  pipelines, the in-block indexer and the paged write-through under `QsaSpec`.
+  `fuse_gate` on the dense pipeline (the dense SDPA's epilogue gate has no THD gate descriptor; stage (5) runs as its own
+  launch -- under `QsaSpec` the sparse core's gate composes with the packed arm, "Sparse attention (QSA)" above), MXFP8 and
+  the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale quantize writes one scale-factor atom per (sequence,
+  head, 128-row tile) of a padded grid), the fully fused quantized pipelines, the in-block indexer and the paged write-through
+  under `QsaSpec`.
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
