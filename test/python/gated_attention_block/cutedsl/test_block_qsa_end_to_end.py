@@ -6,7 +6,7 @@
 Every Rubin cell (``requires_rubin``) declares a block with ``GatedAttentionBlockGeometry(qsa=QsaSpec(...))``, checks, compiles
 and runs it TWICE on sentinel-filled outputs, and compares ``out``, the gated O (the workspace slot stage (5) wrote in place)
 and the LSE against ``gated_attention_block_qsa_reference`` run on the SAME inputs and the SAME block list: ``isfinite`` and
-"no sentinel survived" BEFORE any cosine, ``cos >= 0.999`` on ``out`` (the end-to-end suite's bar), ``atol 2e-2`` on the gated
+"no sentinel survived" BEFORE any cosine, ``cos > 0.999`` on ``out`` (the end-to-end suite's bar), ``atol 2e-2`` on the gated
 O and the LSE (the SDPA stage test's bar), a dead row (``seq_lens[b] == 0``, or an empty list with no open tail) EXACTLY
 ``out = 0`` / ``O = 0`` / ``LSE = -inf``, and the two launches bitwise.  Tolerances are the dense suites', none added.
 
@@ -231,7 +231,7 @@ def _check(c: _Cell, label: str) -> dict:
         assert d_lse <= ATOL, f"{label}: LSE off the oracle by {d_lse} (budget {ATOL})"
     if dead.any():
         assert (o[dead] == 0).all() and (out[dead] == 0).all(), f"{label}: a dead row's O and out must be exactly 0"
-    assert cos >= COS_OUT, f"{label}: cos(out) {cos} < {COS_OUT}"
+    assert cos > COS_OUT, f"{label}: cos(out) {cos} <= {COS_OUT}"
     assert d_o <= ATOL, f"{label}: gated O off the oracle by {d_o} (budget {ATOL})"
     c.mags = dict(cos=cos, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
     print(f"\n{label}: cos(out) {cos:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}")
@@ -316,7 +316,7 @@ def test_qsa_block_matches_the_oracle(
         cos_d = _cos(c.runs[0][0], dense_ref.out)
         d_lse = float((c.runs[0][1] - dense_ref.lse).abs().max()) if return_lse else 0.0
         print(f"identity vs the dense oracle: cos(out) {cos_d:.6f} max|d LSE| {d_lse:.2e}")
-        assert cos_d >= COS_OUT and d_lse <= ATOL
+        assert cos_d > COS_OUT and d_lse <= ATOL
 
 
 # ============================================================================ the degenerate rows (the shrunk geometry)
@@ -475,7 +475,7 @@ def test_adversarial_s2052_planted_key_in_the_omitted_block():
     d_o_below = float((o[0, below].float() - ref_full.o_gated[0, below].float()).abs().max())
     d_lse_below = float((lse[0, :, below] - ref_full.lse[0, :, below]).abs().max())
     print(f"rows < 2051 vs the FULL-set oracle: cos(out) {cos_below:.6f} max|d O_gated| {d_o_below:.4e} max|d LSE| {d_lse_below:.2e}")
-    assert cos_below >= COS_OUT and d_o_below <= ATOL and d_lse_below <= ATOL
+    assert cos_below > COS_OUT and d_o_below <= ATOL and d_lse_below <= ATOL
     report = []
     for hq, tok in plants:
         ok, full_h = o[0, row, hq].float(), ref_full.o_gated[0, row, hq].float()

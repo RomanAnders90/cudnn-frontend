@@ -40,7 +40,8 @@ two launches bitwise:
   within the budget vs the oracle; the typed declines of the paged form (``page_size`` not a multiple of 4, a missing table or
   length, the table / page size on a dense declaration, every malformed pool stride).
 
-Tolerances are the dense suite's (atol 2e-2 on O and LSE), none added.
+Tolerances: atol 2e-2 on O and LSE, no rtol -- the sparse module's own budget, TIGHTER than the dense sm107 suite's O bar (atol
+5e-2 / rtol 3e-2) and equal to its LSE atol; nothing widened, nothing added.
 """
 
 import hashlib
@@ -60,7 +61,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _ORACLE_DIR = os.path.join(os.path.dirname(os.path.dirname(_HERE)), "gated_attention_block", "cutedsl")
 D = 256
 BS = 4  # tokens per selectable block
-ATOL = 2e-2  # the SDPA stage budget of the dense suite -- never widened here
+ATOL = 2e-2  # on O and LSE, no rtol: tighter than the dense sm107 suite's O budget (atol 5e-2 / rtol 3e-2) -- never widened here
 # A directory holding ``layer03_S<S>_block_ids.pt`` (+ ``.sha256`` sidecars): the recorded block-id lists of the released
 # checkpoint's first QSA layer over one 32K-token text.  Unset -> the real-list cells skip.
 INDEX_LISTS_ENV = "CUDNN_FROST_QSA_INDEX_LISTS_DIR"
@@ -532,7 +533,7 @@ def test_visible_weights_match_the_oracle_rule_on_canonical_lists():
     w = _visible_weights(dup, lens[0], pos, S, S, top_k)
     assert torch.equal(w[rows][:, :BS], torch.full((int(rows.sum()), BS), 2, dtype=torch.long))
     assert torch.equal(w > 0, oracle.qsa_visible_mask(dup, lens[0], pos, S, S, BS, top_k=top_k))
-    # the open block listed IN PLACE of the last complete block (a contract violation the host validator rejects; an entry
+    # the open block listed IN PLACE of the last complete block (a contract violation the test-side detector rejects; an entry
     # appended past the derived count would never be read): its tail keys weigh 2, the replaced block's keys 0
     opn = ids[0].clone()
     has_open = (pos + 1) % BS != 0
@@ -946,10 +947,14 @@ def test_a_future_block_in_the_list_contributes_nothing():
 @requires_rubin
 @pytest.mark.parametrize("which", ["duplicate-id", "open-block-listed"])
 def test_duplicates_count_twice_the_documented_contract(which):
-    """The documented contract for a list the host validator rejects: an id listed twice is attended twice (the softmax over
-    the multiset), and the open block listed in place of a complete block duplicates the appended tail (its keys <= the
-    position count twice; its future keys stay masked; an entry appended PAST the derived count is never read).  Pinned
-    against the multiplicity reference; the distance to the idempotent set oracle is reported, not asserted."""
+    """The documented contract for a list the test tree's detector rejects (``block_ids_contract_violations``; the library's
+    host check is FORM-only and never reads a list): an id listed twice is attended twice (the softmax over the multiset),
+    and the open block listed in place of a complete block duplicates the appended tail (its keys <= the position count
+    twice; its future keys stay masked; an entry appended PAST the derived count is never read).  Pinned against the
+    multiplicity reference; the distance to the idempotent set oracle is reported, not asserted.  The counted-twice reading
+    is the documented contract; should the idempotent set reading ever be adopted, these two cells flip to the set oracle
+    together with the kernel's side of it (a ``blk < floor(n_vis / 4)`` test per entry for the listed open block; a dedupe of
+    a repeated id, on the host or in the kernel -- a mask term cannot deduplicate) -- never one without the other."""
     oracle = _oracle()
     B, S, H, KH, top_k = 1, 300, 24, 2, 64
     dtype = torch.bfloat16

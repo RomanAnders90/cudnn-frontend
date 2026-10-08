@@ -1013,6 +1013,7 @@ red (2026-09-08).
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, including unpacked split; decode-shaped dense Q on the decode tile, sink, PackGQA and split includedᵈʳ | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or notᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
+| Index-list sparse attention (`QsaSpec`: per-query lists of 4-token KV blocks + the open tail; frontend-only -- the gated attention block's sparse stage and the standalone adapter, no graph form; the `SM107 d256 index-list sparse forward` section below) | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense BSHD, or paged K / V pools through the standalone adapter; per-batch KV lengths; GQA group 1..16; `top_k` 4..512) | ❌ | ❌ |  ❌  |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
@@ -2103,7 +2104,10 @@ use the same declared envelope; other requests retain their existing policy.
 Frontend-only (the gated attention block's sparse stage — `GatedAttentionBlockGeometry(qsa=QsaSpec(...))` routes stage (4) to
 it and `execute(block_ids=, block_lens=)` carries the list — and the standalone adapter
 `python/cudnn/sdpa/fwd/sparse_gqa_sm107.py`), no graph form: no `sdpa` node carries a block-index list, so there is NO engine
-row and NO manifest slot — an `EngineSpec` whose `lower` cannot run would break the engine contract.  The kernel's claims live
+row and NO manifest slot — an `EngineSpec` whose `lower` cannot run would break the engine contract.  A future graph port
+carries `QsaSpec` as a `python_only_attrs` attribute of the `sdpa` node (AGENTS Rule 9: one FE graph contract for the backend and
+FROST, and a SET numerics-changing attribute makes the node backend-unlowerable), so no backend plan can ever serve such a graph
+densely.  The kernel's claims live
 in the adapter's frozen `SparseCapabilities` record, spelled in the `Capabilities` vocabulary where a field exists, and its
 `check_support` is the enforcement point (the CuTe DSL `sm_107a` gate first, then every field as a typed decline); the block
 reads the same record for its own declines (dtypes, head dim, block size, `top_k`, the GQA group) and transcribes nothing.
