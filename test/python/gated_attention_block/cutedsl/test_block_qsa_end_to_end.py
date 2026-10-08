@@ -849,9 +849,14 @@ def test_indexer_block_matches_the_two_stage_oracle(request, geom_kw, batch, seq
     m1 = _indexer_two_stage(c, label)
     pos = torch.arange(seq_len, device="cuda").expand(batch, seq_len).reshape(-1)
     kv = torch.full((batch * seq_len,), seq_len, dtype=torch.long, device="cuda") if lens_t is None else lens_t.long().repeat_interleave(seq_len)
-    bad = block_ids_contract_violations(c.ids.reshape(batch * seq_len, -1), pos, kv, block_size=BS, block_lens=c.lens.reshape(-1), top_k=c.geom.qsa.top_k)
-    if lens_t is None:
-        assert bad == [], bad  # the kernel's list is contract-clean on every row; a padded row may list blocks past its range (masked)
+    # The list contract on every LIVE row, padded cells included (a padding row -- at or past its sequence's KV length -- may list
+    # blocks past its range: the core masks them, and _indexer_two_stage counts those ids and compares the row's visible blocks).
+    live = pos < kv
+    assert int(live.sum()) == (batch * seq_len if lens_t is None else int(lens_t.long().clamp(max=seq_len).sum()))
+    bad = block_ids_contract_violations(
+        c.ids.reshape(batch * seq_len, -1)[live], pos[live], kv[live], block_size=BS, block_lens=c.lens.reshape(-1)[live], top_k=c.geom.qsa.top_k
+    )
+    assert bad == [], bad  # the kernel's list is contract-clean on every live row
     m2 = _check(c, label)
     if m1["identity"]:
         caller = _run(
