@@ -1008,8 +1008,8 @@ red (2026-09-08).
 | Attention sink (at `S_q == 1`: ❔ — see SM100 ˢ) | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |  ❌  |
 | Base-2 stats (`stats_use_log2`) | ❔ | ❔ | ❔ | ❔ | ❔ | — |  —  |
 | GQA / MQA (`H_q ≠ H_kv`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |  ✅  |
-| **Decode tile** (f16/bf16, dense Q, `S_q · G ≤ 16` packed rows, dense or paged) | ❌ (d128 prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | ✅ᵈʳ **native** (`sm107/decode_d256_f16.py`, swap-AB; whole-group PackGQA + dense / paged split-KV) | ❌ (prefill tile) | — |  —  |
-| PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ✅ on the decode tile only (`pack_gqa_d_shapes` ∋ (256, 256): the WHOLE group, `S_q · G ≤ 16`, dense or paged, whatever `tile_m` -- 24/2 packs 12 live rows + 4 zero tail rows; the d256 prefill kernel runs unpacked and a packed graph past the tile is a typed decline)ᵈʳ | ❌ | — |  —  |
+| **Decode tile** (f16/bf16, dense Q, `S_q · G` packed rows within the Rubin route: ≤ 16 on the 16-column tile, (16, 32] on the 32-column tile, a packed MTP step of up to two token units of itᵐᵗᵖ; dense or paged) | ❌ (d128 prefill tile) | ❌ (prefill tile) | ❌ (prefill tile) | ✅ᵈʳ **native** (`sm107/decode_d256_f16.py`, swap-AB; whole-group PackGQA + dense / paged split-KV; the 32-column tile in token units for MTP `S_q ≤ 4`ᵐᵗᵖ) | ❌ (prefill tile) | — |  —  |
+| PackGQA | fp8 only | fp8; half paged THD / nonpaged split THD | ❌ | ✅ on the decode tile only (`pack_gqa_d_shapes` ∋ (256, 256): the WHOLE group within the Rubin route -- `S_q · G ≤ 16` on the 16-column tile (24/2 packs 12 live rows + 4 zero tail rows), (16, 32] and a packed MTP step of up to two token units on the 32-column tile (24/2 at `S_q = 4`: two units of 2 tokens × 12 heads)ᵐᵗᵖ -- dense or paged, whatever `tile_m`; the d256 prefill kernel runs unpacked and a packed graph past the route is a typed decline)ᵈʳ | ❌ | — |  —  |
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, including unpacked split; decode-shaped dense Q on the decode tile, sink, PackGQA and split includedᵈʳ | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or notᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
@@ -1027,10 +1027,13 @@ against the 320 KiB usable carveout (the tile's 209 / 226 KiB at N_Q = 16 / 32 f
 STANDARD 227 KiB carveout, so no oversized-SMEM launch and no L1 shrink) and the 256 KiB
 version-0 tcgen05 descriptor window (`DESC_VERSION` derived from the layout: 0, every
 MMA-operand slab starts below it); `SPIN_RING_WAITS = False` until the tile's own A/B.
-Routed exactly as on SM100 (`SdpaFwdDslSm100._decode_q_tile`, `engines.d256_decode_tile_selected`,
-`config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS`): f16/bf16 (256, 256) graphs with dense (non-THD)
-queries whose `S_q · G` packed rows fit 16, without the pre-folded scale (the d256 prefill kernel
-keeps it) -- and a graph WITH the fused epilogue gate only through a SPLIT (`split_kv >= 2`): the
+Routed by the Rubin route (`SdpaFwdDslSm100._decode_q_tile`, `engines.d256_decode_tile_selected`
+through `engines.decode_d256_q_tile_for_row`, `config_sm107.decode_d256_q_tile` -- the SM100 rule
+`config_sm100.D256_DECODE_ROUTED_MAX_Q_ROWS` widened on cc 10.7, footnote ᵐᵗᵖ): f16/bf16 (256, 256)
+graphs with dense (non-THD) queries whose `S_q · G` packed rows fit 16 (one unit of the 16-column
+tile, as on SM100), or fit the 32-column tile in one unit (rows in (16, 32]), or -- a PACKED group
+only -- in two token units of it (the MTP step: 24/2 at `S_q = 3` / `4`), without the pre-folded
+scale (the d256 prefill kernel keeps it) -- and a graph WITH the fused epilogue gate only through a SPLIT (`split_kv >= 2`): the
 tile has no gate seams, so the gate moves into the split combine (below); unsplit, the gated
 graph keeps the d256 prefill kernel's fused epilogue. Served on it: dense padded / unpadded and PAGED caches
 (page 16 / 32 / 64 / 128, NHD / HND — the row's paged THD-only scope is lifted for exactly this
@@ -1041,9 +1044,9 @@ replay under the D2H detector. **PackGQA and split-KV, as on SM100**: the row's
 the 16-row Q tile (`HEADS_PER_TILE = QH_PER_KH`; 24/2 = 12 live rows + 4 zero tail rows per
 (batch, KV head) unit, one CTA instead of twelve), dense or paged, whatever `tile_m` (the
 prefill tiles' divisibility rule does not apply; the d256 prefill kernel runs unpacked, so a
-packed d256 graph the tile does not serve -- 32 rows at 32/2 `S_q = 2` -- is a typed decline,
-and that MTP shape rides the tile UNPACKED, two live rows per unit, since no Rubin d256
-kernel can pack it) -- and the decode tile's dense (unpadded) / paged split-KV through
+packed d256 graph past the route -- 24/2 at `S_q = 5`, a third token unit -- is a typed decline;
+the 32-row MTP shape, 32/2 at `S_q = 2`, that used to ride the tile UNPACKED now packs on the
+32-column tile in one unit, ᵐᵗᵖ) -- and the decode tile's dense (unpadded) / paged split-KV through
 `choose_decode_tile_split_kv` (fp32 partials into the split-major workspace, the shared
 `sm100/split_combine`; the eager-safe choice leads, the captured caller's optimum follows,
 `is_cuda_graph_replay_expected=True` swaps them; a padded dense cache and a sink keep the
@@ -1082,8 +1085,39 @@ tanh), and BITWISE where the arithmetic is identical: `sigmoid(+1e4) = 1` (the u
 `sigmoid(0) = 1/2` (the ungated O halved), `sigmoid(-1e4) = 0` (exactly 0), LSE bitwise the ungated
 one in every case; the gate reaches the combine through a per-launch binding (the native dense
 binder knows no gate on a split and calls the combine with a fixed frame), captured and replayed
-under the D2H detector. `S_q · G` in (16, 32] (the 32-column tile, compiled, unrouted as on
-SM100), THD queries and the quantized families stay on the prefill tiles.
+under the D2H detector. Past the route (ᵐᵗᵖ: a third token unit, an unpacked step above 32
+tokens, a group wider than the tile), THD queries and the quantized families stay on the prefill
+tiles.
+
+ᵐᵗᵖ **The MTP form on the Rubin decode tile: the 32-column tile in TOKEN UNITS
+(`config_sm107.decode_d256_q_tile`, `D256_DECODE_ROUTED_MAX_Q_ROWS = 32`,
+`D256_DECODE_ROUTED_MAX_TOKEN_UNITS = 2`).** The body of both decode twins gained a token-unit
+axis (`Q_TOKEN_UNITS`): a unit covers one Q box of `Q_BOX_TOKENS = N_Q // HEADS_PER_TILE`
+consecutive tokens, the host entry derives `ceil(S_q / Q_BOX_TOKENS)` units per (head group,
+batch, split) from the runtime `S_q` and widens the grid's x axis by them, and every token
+coordinate (the Q box, the causal / window mask, the O / LSE rows, the padded-Q trim) is offset by
+the unit's first token -- the barrier table, the SMEM table and the per-unit pipeline are
+unchanged (the axis moves rows between CTAs, it never changes the arithmetic). On cc 10.7 the
+adapter routes: `S_q · G ≤ 16` -> the 16-column tile in one unit (as before); rows in (16, 32] ->
+the 32-column tile in one unit (32/2 at `S_q = 2`, 24/2 at `S_q = 2` with 24 live + 8 tail rows,
+an unpacked / MHA step of 17-32 tokens); a PACKED group with `ceil(S_q / (32 // G)) = 2` -> two
+token units of the 32-column tile (24/2 at `S_q = 3` / `4`: 2 tokens × 12 heads per unit, the KV
+range streamed once per unit = 2x the bytes of a single stream); anything past that (a third
+unit, an unpacked step above 32 tokens, `G > 32`) -> the d256 prefill kernel, a packed request
+there a typed decline. The decode split model counts the token units as streams
+(`units = B × head groups × units`, the 32-column tile's per-tile cost fit on B200 -- a cc 10.7
+refit is the heuristics owner's). The SM100 line is untouched (`config_sm100.decode_d256_q_tile`
+with its defaults is the former rule verbatim; its 32-column tile stays unrouted). Evidence on
+cc 10.7 (204 SMs, `test_sdpa_fwd_decode_d256_sm107.py`): the 24/2 steps `S_q = 2 / 3 / 4` over
+dense padded and paged caches, bottom-right, with per-batch Q lengths below `S_q` (the trim across
+units), the split forms at the token-unit geometry, the 32/2 step at `S_q = 2`; **two token units
+== four single-token units of the 16-column tile == the unpacked form BITWISE** (O and LSE), **paged
+== dense bitwise** across the units; the token-unit axis driven at the template level too (two
+units of the 32-column tile, four of the 16-column one, a half-filled second unit at `S_q = 3`,
+unsplit and split 2). The measured form (Rubin cc 10.7, 212 SMs, lock 2376, the MTP table of
+the dense-decode PR): the two-unit 32-column form against the prefill body, the pre-route lead
+(the tile unpacked) and the single-token-unit 16-column form at `B` in {1, 4, 32}, `S_q` in {2, 4},
+the vLLM / SGLang recipe shape (`B = 4`, `next_n = 4`) among the cells.
 
 ᵇ **d=256 backward (`sdpa_bwd_sm107` f16/bf16, `sdpa_bwd_sm107_fp8` per-tensor
 FP8 E4M3; `python/cudnn/sdpa/bwd/api_dsl_sm107.py`, kernels
@@ -1407,7 +1441,7 @@ python-natively and lowered with the mul output bound as the kernel's O — the
 virtual `O_v` / `s` are never bound or materialised. Served **exactly** at
 (256, 256) (not through the head-dim envelope), dense only (no THD), unsplit,
 non-PackGQA, non-paged -- with ONE exception on the f16/bf16 row: a decode-shaped
-graph (`S_q · G ≤ 16` packed rows) whose plan SPLITS rides the d256 decode tile, which
+graph (`S_q · G` packed rows within the Rubin route, footnote ᵐᵗᵖ) whose plan SPLITS rides the d256 decode tile, which
 applies the gate in its split COMBINE (dense or paged, packed or not; the same
 one-rounding arithmetic -- footnote ᵈʳ); the padding mask (`seq_len_kv`) composes. `O_v`, `G` and
 the final O must be DECLARED (dim + stride, BSHD) — the classic C++
@@ -1910,7 +1944,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | MXFP8 backward outside SM100/SM103 d = 256 and SM107 d = 256 (`sdpa_bwd_sm107_mxfp8`, ᵐˣ) | every arch |
 | THD / ragged backward | SM120, the SM107 d512 row (ᵇ³) and the SM100/SM103 MXFP8 and f16/bf16 d256 (ᵇ²) rows (the SM100/SM103 f16/bf16 d512 row serves it — see ʰ; the SM107 f16/bf16 and per-tensor FP8 rows — see ᵇ; the SM107 MXFP8 row — see ᵐˣ; SM80 — see ᵏ) |
 | THD forward | SM80 |
-| **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV) is the only Rubin decode tile today |
+| **Decode tile on the Rubin line outside the d256 f16/bf16 flavor** | **SM107** — d128 / d192×d128 / d512 decode and every fp8 / mxfp8 decode run their flavor's prefill kernel; the d256 f16/bf16 decode tile (ᵈʳ: whole-group PackGQA, dense / paged split-KV, the MTP step in token units of the 32-column tile ᵐᵗᵖ) is the only Rubin decode tile today |
 | **Native d=64 (GPT-OSS) forward kernel** | **SM107** — served via the d128 envelope at ~2× MMA cost. SM100/SM103 is native (⁷) for f16/bf16 (prefill, decode (ᵈ⁶⁴), paged and split-KV), per-tensor FP8 (prefill, paged, split-KV; cga1) and MXFP8 (dense / unsplit / unpaged; cga1) |
 | Decode tile outside the d128 / d256 f16/bf16 flavors | SM100, SM103 — dense/paged d192×128 and d512 decode and every fp8 / mxfp8 decode have no dedicated decode tile: each runs its flavor's prefill kernel at that flavor's own CGA width (f16 d512 and the quantized d128 flavors at `TILE_CGA_M=2`; per-tensor FP8 d256 and SM100 MXFP8 d256 / d512 are cga1 kernels; d192×128 selects 1 or 2 by shape). Nonpaged, unpacked D192 THD can select the shared single-Q pipeline described below. Unsplit THD queries on the d128 f16/bf16 flavor keep its prefill pipeline (`TILE_CGA_M=2`) too (ᵈᵗ); exact D128 split THD can use the single-CTA path; d256 f16/bf16 graphs the adapter does not route onto the d256 decode tile (THD, or more packed Q rows than it routes, ᵈ) run the d256 prefill tile |
 | **d192×d128 paged decode tile** | SM100, SM103 — paged (192, 128) is served (ᵖ) but at `S_q ≤ 8` runs the prefill tile. Measured on B200 (`S_q = 1`, `b = 32`, page 16, bf16, mixed `S_kv ≤ 4096`, default plan): 32/32 MHA **788.7 µs on the prefill tile vs 476.9 µs on the backend**; 32/8 GQA 275.8 vs 199.6 µs. Follow-up: a d192×d128 decode tile behind `TILE_CGA_M=1`, as ᵈᵗ is for d128 |
@@ -1918,7 +1952,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 | d=64 quantized THD; d=64 MXFP8 paged / split-KV | SM100/SM103 (`thd_d_shapes` of both quantized rows, the MXFP8 row's `paged_d_shapes` / `split_d_shapes`, mirrored by `check_support`); every d=64 MXFP8 graph on SM107 (exact-shape gates) |
 | Bias forward | SM90, SM100, SM107, SM120 |
 | Dropout, ALiBi, `block_mask`, `score_mod` | every arch, both passes |
-| Paged KV cache | SM107 serves half THD D128/D256 without sink, plus decode-shaped dense-Q half d256 graphs (`S_q · G ≤ 16`, sink included) on the d256 decode tile (ᵈʳ); otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 / d512, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the FP8 d512 flavor, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
+| Paged KV cache | SM107 serves half THD D128/D256 without sink, plus decode-shaped dense-Q half d256 graphs (`S_q · G` within the Rubin route ᵐᵗᵖ: ≤ 16, the 32-column tile, a packed MTP step of two token units; sink included) on the d256 decode tile (ᵈʳ); otherwise every arch except SM100/SM103 forward on f16/bf16 d128 / d192×d128 / d256 / d512, per-tensor FP8 d128 and MXFP8 on every native flavor (see ᵖ); the FP8 d512 flavor, MXFP8 pools with unreordered SF or page_size < 128, THD queries over MXFP8 pools, packed (ragged-offset) block tables everywhere (THD queries over f16/bf16 pools ARE served — see ᵖ); THD queries and the attention sink over FP8 pools, a block-scaled O (`sf_o`) over FP8 and MXFP8 pools |
 | Fused epilogue gate (`O * sigmoid(G)` tail) | every arch and flavor except SM107 d256 f16/bf16, per-tensor FP8 and MXFP8, exact (256, 256), dense / unsplit / non-PackGQA / non-paged -- plus, f16/bf16 only, the d256 decode tile's split (`S_q · G ≤ 16` packed rows, split_kv ≥ 2), whose combine applies the gate over a dense or paged cache, packed or not (see the SM107 table, ᵈʳ) |
 | PackGQA of a group sharing no factor with the 128-row tile (G = 3, 5, 7, …), and partial packing outside the SM100/SM103 f16/bf16 d128 / d256 kernels | every arch — such groups run unpacked (see ᵐ); the d192×d128 / d512 f16 and the fp8 / mxfp8 kernels pack the whole group only |
 | Attention sink + split-KV (sink-aware `split_combine`) | every arch — a sink graph runs unsplit; at `S_q == 1` over a long KV that is one cluster per (batch, KV head) (see ˢ) |
