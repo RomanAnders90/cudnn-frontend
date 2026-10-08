@@ -614,8 +614,9 @@ def test_write_through_on_the_other_bf16_pipelines(pipeline):
 
 @requires_rubin
 def test_raw_indexer_key_pool_at_flash_next():
-    """The band geometry declines at its sparse stage (the sparse core has not landed), so the three stages that serve
-    the write-through -- the unfused projection over the five-band slab, norm + RoPE, the cache write -- run through the
+    """The band geometry is served end to end (the sparse stage accepts ``QsaSpec(index_band=True)``; its numerics are
+    ``test_block_qsa_end_to_end.py``'s), so the block's ``check_support`` passes, and the three stages that serve the
+    write-through -- the unfused projection over the five-band slab, norm + RoPE, the cache write -- run through the
     block's own stage objects: the raw indexer key's pool is bitwise ``index_k_raw_view`` at every slot, the K / V pools
     bitwise the post-RoPE bands, and the pre-norm raw key is untouched by norm + RoPE."""
     geom = GatedAttentionBlockGeometry(**_FLASH_NEXT, qsa=QsaSpec(index_band=True))
@@ -632,8 +633,7 @@ def test_raw_indexer_key_pool_at_flash_next():
     stream = torch.cuda.current_stream().cuda_stream
     blk = GatedAttentionBlockFwd(h, w_qkvg, wn, wn, cos, sin, w_o, out, geom, paged_kv_page_size=ps)
     assert isinstance(blk._sdpa, _SparseSdpa) and blk._cache_write.index_band
-    with pytest.raises(NotImplementedError, match="sparse attention core"):
-        blk.check_support()
+    assert blk.check_support()  # the sparse stage serves the band geometry on Rubin; the write-through stages below run on their own
     for st in (blk._proj, blk._norm_rope, blk._cache_write):
         st.check_support()
         st.compile()
