@@ -360,7 +360,7 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
     REFUSES ``block_ids`` / ``block_lens``, form-checks the three optional outputs, and a caller-list or a dense block refuses
     every one of the five; off Rubin ``check_support`` names the scorer's device family.  Form only, no plan, no launch."""
     from cudnn.deepseek_sparse_attention.indexer_forward import compress_topk_cand_buffer_size_thd
-    from cudnn.gated_attention_block.api import _Indexer, _qsa_cand_floats
+    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _Indexer, _qsa_cand_floats, _qsa_indexer_slots
 
     spec = QsaSpec(index_source="indexer", index_band=True)
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=spec)
@@ -378,21 +378,19 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
             else:
                 e, t = _itemsize(torch.bfloat16), b * s
                 assert ix.cand_floats == _qsa_cand_floats(b, s, spec.block_size) > 0
-                assert (lay.ix_q, lay.ix_kbar, lay.ix_ids, lay.ix_scores, lay.ix_cand) == tuple(
-                    lay_c.total_bytes + off
-                    for off in (
-                        0,
-                        _align_up(t * spec.index_heads * spec.index_head_dim * e),
-                        _align_up(t * spec.index_heads * spec.index_head_dim * e) + _align_up(b * (s // 4) * spec.index_head_dim * e),
-                        _align_up(t * spec.index_heads * spec.index_head_dim * e)
-                        + _align_up(b * (s // 4) * spec.index_head_dim * e)
-                        + _align_up(t * spec.top_k * 4),
-                        _align_up(t * spec.index_heads * spec.index_head_dim * e)
-                        + _align_up(b * (s // 4) * spec.index_head_dim * e)
-                        + 2 * _align_up(t * spec.top_k * 4),
-                    )
+                # the slots in the stage's own order, each 256-B aligned, appended after the caller-list block's carve; the names and
+                # byte counts are the stage's (the layout pins the arithmetic: order, alignment, the total)
+                slots = _qsa_indexer_slots(geom, b, s, e, ix.cand_floats)
+                assert [nm for nm, _ in slots] == ["ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand", "ix_ids_sorted", "ix_sort_idx"]
+                assert (
+                    dict(slots)["ix_q"] == t * spec.index_heads * spec.index_head_dim * e and dict(slots)["ix_kbar"] == b * (s // 4) * spec.index_head_dim * e
                 )
-                assert lay.total_bytes == lay.ix_cand + _align_up(ix.cand_floats * 4)
+                assert dict(slots)["ix_ids"] == dict(slots)["ix_ids_sorted"] == t * spec.top_k * 4 and dict(slots)["ix_cand"] == ix.cand_floats * 4
+                acc = lay_c.total_bytes
+                for nm, nbytes in slots:
+                    assert getattr(lay, nm) == acc, nm
+                    acc += _align_up(nbytes)
+                assert lay.total_bytes == acc
     if torch.cuda.is_available():
         # the scratch's closed form against the DSA helper that sizes it on device (a drift would mis-size the workspace)
         for b, s in ((1, 2052), (2, 2300), (3, 4097)):
@@ -450,6 +448,27 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
         for ex_kw in (dict(w_iq_norm=w), dict(block_ids_out=i32(b * s, 512)), dict(index_k_compressed=kb(2))):
             with pytest.raises(ValueError, match="declared without geometry.qsa"):
                 blk_d.execute(*args_d, ws, **ex_kw)
+    if torch.cuda.is_available():
+        # the canonical row sort the stage runs after the top-k: torch's small-segment sort into PREALLOCATED outputs, descending
+        # (the -1 padding last), equal to torch's own result, and no allocation retained across the call (Rule 1's observable)
+        rows, top_k = 4096 + 7, spec.top_k
+        g = torch.Generator(device="cuda").manual_seed(3)
+        raw = torch.randperm(4 * top_k, device="cuda", generator=g)[:top_k].to(torch.int32).repeat(rows, 1)
+        raw[:, 300:] = -1
+        dst = torch.empty_like(raw)
+        scratch = torch.empty(_QSA_SORT_ROWS, top_k, dtype=torch.int64, device="cuda")
+        torch.cuda.synchronize()
+        before = torch.cuda.memory_allocated()
+        for r0 in range(0, rows, _QSA_SORT_ROWS):
+            r1 = min(rows, r0 + _QSA_SORT_ROWS)
+            torch.sort(raw[r0:r1], dim=-1, descending=True, out=(dst[r0:r1], scratch[: r1 - r0]))
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == before
+        assert (
+            torch.equal(dst, torch.sort(raw, dim=-1, descending=True).values)
+            and bool((dst[:, 300:] == -1).all())
+            and bool((dst[:, :299] > dst[:, 1:300]).all())
+        )
     if torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) != (10, 7):
         # off Rubin the indexer stage declines first (it precedes the sparse SDPA): the scorer's device family, by name
         with pytest.raises(NotImplementedError, match=r"cc 10\.x"):

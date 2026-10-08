@@ -704,7 +704,7 @@ def _assert_one_rounding(got: torch.Tensor, ref32: torch.Tensor, what: str) -> d
     tol = torch.maximum(_bf16_ulp(ref16), floor)
     worst = float((d / tol).max())
     assert worst <= 1.0, f"{what}: {worst:.2f} x the one-rounding budget off the fp32 chain (max |d| {float(d.max()):.3e})"
-    return dict(ulps=float((d / _bf16_ulp(ref16)).max()), max_abs=float(d.max()), bitwise=float((got.float() == ref16).float().mean()))
+    return dict(ulps=worst, max_abs=float(d.max()), bitwise=float((got.float() == ref16).float().mean()))
 
 
 def _membership(ids: torch.Tensor, n: int) -> torch.Tensor:
@@ -741,12 +741,15 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     if not ix["selects"]:
         j = torch.arange(top_k, device=dev, dtype=torch.int32).expand(b, s, top_k)
         assert torch.equal(torch.where(valid, k_ids, torch.full_like(k_ids, -1)), torch.where(valid, j, torch.full_like(j, -1))), f"{label}: not the identity"
-        assert ix["launches"] == n_exec * (
-            1 if "kbar_out" in ix else 0
+        assert ix["launches"] == n_exec * c.blk._indexer.launches_per_execute(
+            "kbar_out" in ix
         ), f"{label}: {ix['launches']} indexer launches over {n_exec} executes below the identity bound"
         print(f"\n{label}: the identity list (S <= {q.identity_bound}), {ix['launches']} indexer launch(es) over {n_exec} executes")
         return m
-    assert ix["launches"] == n_exec * (4 + (1 if "kbar_out" in ix else 0)), f"{label}: {ix['launches']} launches over {n_exec} executes"
+    assert ix["launches"] == n_exec * c.blk._indexer.launches_per_execute("kbar_out" in ix), f"{label}: {ix['launches']} launches over {n_exec} executes"
+    # the canonical order: the selected ids strictly descending, the -1 padding last (the top-k's own slot order is unspecified)
+    diffs = (k_ids[..., :-1] - k_ids[..., 1:]).masked_fill(~valid[..., 1:], 1)
+    assert bool((diffs > 0).all()), f"{label}: a row's list is not in descending order"
     ref_geom = RefQsaGeometry(**{k: getattr(geom, k) for k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}, qsa=RefQsaSpec(top_k=top_k, index_band=True))
     spec = ref_geom.qsa
     oracle = {}
@@ -816,8 +819,8 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     d_oracle = float((kbar_k.float() - k_c_o.float()).abs()[blk_live].max())
     m.update(q_ulps=mq["ulps"], q_bitwise=mq["bitwise"], k_ulps=mk["ulps"], k_bitwise=mk["bitwise"], k_vs_oracle_gemm=d_oracle)
     print(
-        f"{label}: operands vs the fp32 chain on the kernel's band -- qi max {mq['ulps']:.2f} ulp ({100 * mq['bitwise']:.3f} % bitwise, max |d| {mq['max_abs']:.2e}), "
-        f"kbar max {mk['ulps']:.2f} ulp ({100 * mk['bitwise']:.3f} % bitwise, max |d| {mk['max_abs']:.2e}); kbar vs the oracle's GEMM + chain max |d| {d_oracle:.2e}"
+        f"{label}: operands vs the fp32 chain on the kernel's band -- qi max {mq['ulps']:.2f} x the one-rounding budget ({100 * mq['bitwise']:.3f} % bitwise, max |d| {mq['max_abs']:.2e}), "
+        f"kbar max {mk['ulps']:.2f} x ({100 * mk['bitwise']:.3f} % bitwise, max |d| {mk['max_abs']:.2e}); kbar vs the oracle's GEMM + chain max |d| {d_oracle:.2e}"
     )
     return m
 
@@ -926,7 +929,7 @@ def test_indexer_identity_below_the_bound_launches_only_a_requested_cache_compre
     )
     assert torch.equal(_bits(plain.runs[0][0]), _bits(caller.runs[0][0])) and plain.blk.get_workspace_size() == caller.blk.get_workspace_size()
     with_cache = _run(geom_kw, B, S, indexer=True, indexer_outputs=True, seq_lens=lens_t, inp=plain.inp, ref=plain.ref)
-    assert with_cache.ix["launches"] == len(with_cache.runs)  # one launch per execute: the cache compress
+    assert with_cache.ix["launches"] == len(with_cache.runs) * with_cache.blk._indexer.launches_per_execute(True)  # the cache compress only
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(index_band=True))
     _, _, _, _, k_c = qsa_indexer_reference(
         plain.inp["h"],
@@ -948,7 +951,7 @@ def test_indexer_identity_below_the_bound_launches_only_a_requested_cache_compre
         mk = _assert_one_rounding(kb[bi, :nb], kbar_ref[bi, :nb], f"entry {bi}: the cached compressed keys")
         d_o = float((kb[bi, :nb].float() - k_c[bi, :nb].float()).abs().max())
         print(
-            f"entry {bi}: cache vs the chain on the kernel's band max {mk['ulps']:.2f} ulp ({100 * mk['bitwise']:.2f} % bitwise); vs the oracle's GEMM + chain max |d| {d_o:.2e}"
+            f"entry {bi}: cache vs the chain on the kernel's band max {mk['ulps']:.2f} x the budget ({100 * mk['bitwise']:.2f} % bitwise); vs the oracle's GEMM + chain max |d| {d_o:.2e}"
         )
         assert torch.isnan(kb[bi, nb:].float()).all()
     assert torch.equal(with_cache.ix["ids_out"].view(B, S, -1), plain.ix["kernel_ids"]) and torch.equal(

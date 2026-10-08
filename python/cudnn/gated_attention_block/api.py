@@ -1213,9 +1213,11 @@ class _Intermediates:
     # the scorer's compact-logits scratch -- :func:`_qsa_indexer_slots`.  Every layout without the indexer is byte-identical.
     ix_q: int = -1  # [T, index_heads, index_head_dim] activation dtype
     ix_kbar: int = -1  # [B, floor(S / block_size), index_head_dim] activation dtype
-    ix_ids: int = -1  # [T, top_k] int32
+    ix_ids: int = -1  # [T, top_k] int32: the top-k's output (its slot order unspecified)
     ix_scores: int = -1  # [T, top_k] fp32
     ix_cand: int = -1  # [cand_floats] fp32
+    ix_ids_sorted: int = -1  # [T, top_k] int32: the canonical list the sparse core consumes (ids descending, then -1)
+    ix_sort_idx: int = -1  # [min(T, _QSA_SORT_ROWS), top_k] int64: the row sort's index output, reused per row window
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -1469,6 +1471,8 @@ def _plan_workspace(
         ix_ids=offsets.get("ix_ids", -1),
         ix_scores=offsets.get("ix_scores", -1),
         ix_cand=offsets.get("ix_cand", -1),
+        ix_ids_sorted=offsets.get("ix_ids_sorted", -1),
+        ix_sort_idx=offsets.get("ix_sort_idx", -1),
     )
 
 
@@ -1523,7 +1527,14 @@ def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int
         ("ix_ids", t * q.top_k * _itemsize(torch.int32)),
         ("ix_scores", t * q.top_k * _itemsize(torch.float32)),
         ("ix_cand", int(cand_floats) * _itemsize(torch.float32)),
+        ("ix_ids_sorted", t * q.top_k * _itemsize(torch.int32)),
+        ("ix_sort_idx", min(t, _QSA_SORT_ROWS) * q.top_k * _itemsize(torch.int64)),
     ]
+
+
+_QSA_SORT_ROWS = 4096
+"""Rows per launch of the in-block indexer's canonical row sort: bounds the int64 index scratch the sort writes (16 MiB at
+``top_k = 512``) at the price of ``ceil(T / 4096)`` launches."""
 
 
 # ---------------------------------------------------------------------------
@@ -4331,7 +4342,7 @@ class _Indexer(_Stage):
     """(4i) The in-block indexer of a block-sparse (``QsaSpec``) block declared with ``index_source="indexer"``: the
     per-query selection stage (4) consumes, derived from the slab's fifth band instead of handed in by the caller.
 
-    **Three launches, no kernel of its own.**
+    **Four launches (plus one per 4096 rows past the first), no kernel of its own.**
 
     1. The indexer QUERIES -- the band's ``index_heads`` x ``index_head_dim`` query columns of every token, RMSNormed
        (``w_iq_norm``, ``index_norm_eps``) and partially rotated at the token's position -- through the block-compress
@@ -4345,9 +4356,13 @@ class _Indexer(_Stage):
        as well (its rows at or past a sequence's complete blocks are never written: a cache sized for a longer context
        keeps them).
     3. The SELECTION -- :func:`qsa_select` (the indexer scorer ``sum_h relu(q_h . kbar_j) / sqrt(D_i)`` over the blocks
-       below ``floor((pos + 1) / bs)`` + the fused radix top-k, ties to the smaller id) into ``ix_ids`` / ``ix_scores``
-       or the caller's ``block_ids_out``: ``[T, top_k]`` int32, the ``min(top_k, floor((pos + 1) / bs))`` selected ids
-       then ``-1`` -- exactly the count rule the sparse core derives, so stage (4) needs no ``block_lens``.
+       below ``floor((pos + 1) / bs)`` + the fused radix top-k, ties to the smaller id) into ``ix_ids`` / ``ix_scores``:
+       ``[T, top_k]`` int32, the ``min(top_k, floor((pos + 1) / bs))`` selected ids then ``-1`` -- exactly the count rule
+       the sparse core derives, so stage (4) needs no ``block_lens``.  The top-k's SET is reproducible but its slot order
+       is not (the radix pass assigns slots with atomics), and the core accumulates in list order, so
+    4. the CANONICAL ORDER -- each row sorted descending (the selected ids descending, the ``-1`` padding last; a
+       row-windowed ``torch.sort`` into preallocated workspace slots, no temporaries) into ``ix_ids_sorted`` or the
+       caller's ``block_ids_out``: two executes of the block are bitwise, and the list a caller gets back is canonical.
 
     **The RoPE tables are the attention's own** ``cos`` / ``sin`` ``[B, S, rope_dim]``: the key compress reads row
     ``bs * j`` for block ``j`` (every block start is a position of the prefill), the query norm reads row ``pos``.  No
@@ -4398,6 +4413,13 @@ class _Indexer(_Stage):
         self._q_recipe = self._k_recipe = None
         self._const = None  # plan-time device constants (compile): counts [T]; identity_ids [T, top_k] | cu_seqlens_q [B+1], cand_batch_offsets [B+1]
         self.launches = 0  # launches issued so far (a test pin of the short-circuit; the block never reads it)
+
+    def launches_per_execute(self, cache: bool) -> int:
+        """Launches one ``execute`` issues: the cache compress iff a caller passes ``index_k_compressed``; past the identity
+        bound also the key compress, the query norm, the scorer GEMM, the radix top-k and the row sort's windows."""
+        if not self.selects:
+            return 1 if cache else 0
+        return (1 if cache else 0) + 4 + -(-(self.batch * self.seq_len) // _QSA_SORT_ROWS)
 
     def check_support(self) -> None:
         """The scorer's contract (device-free, re-run so the stage is honest on its own), the CuTe DSL floor / target
@@ -4495,6 +4517,8 @@ class _Indexer(_Stage):
             ids=_view(workspace, lay.ix_ids, (t, q.top_k), torch.int32),
             scores=_view(workspace, lay.ix_scores, (t, q.top_k), torch.float32),
             cand=_view(workspace, lay.ix_cand, (self.cand_floats,), torch.float32),
+            ids_sorted=_view(workspace, lay.ix_ids_sorted, (t, q.top_k), torch.int32),
+            sort_idx=_view(workspace, lay.ix_sort_idx, (min(t, _QSA_SORT_ROWS), q.top_k), torch.int64),
         )
 
     def execute(
@@ -4553,9 +4577,16 @@ class _Indexer(_Stage):
             cos_q = cos.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
             sin_q = sin.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
             run_qsa_compress(self._q_recipe, q_raw, v["qi"], w_iq_norm, cos_q, sin_q, None, eps=eps, norm_weight_offset=0.0, stream=stream)
-            ids = v["ids"] if block_ids_out is None else block_ids_out.view(t, q.top_k)
-            self._select(v["qi"], v["kbar"], ids, v["scores"], v["cand"], stream=stream)
-            self.launches += 4  # the key compress, the query norm, the scorer GEMM, the radix top-k
+            self._select(v["qi"], v["kbar"], v["ids"], v["scores"], v["cand"], stream=stream)
+            # The canonical order: the top-k's slot order is unspecified (atomics), the core accumulates in list order, so each
+            # row is sorted descending (ids descending, -1 last) in row windows of _QSA_SORT_ROWS into preallocated outputs --
+            # torch's small-segment sort runs in place on the output, no temporaries (Rule 1), on the block's stream.
+            ids = v["ids_sorted"] if block_ids_out is None else block_ids_out.view(t, q.top_k)
+            with torch.cuda.stream(torch.cuda.ExternalStream(stream, device=proj.device)):
+                for r0 in range(0, t, _QSA_SORT_ROWS):
+                    r1 = min(t, r0 + _QSA_SORT_ROWS)
+                    torch.sort(v["ids"][r0:r1], dim=-1, descending=True, out=(ids[r0:r1], v["sort_idx"][: r1 - r0]))
+            self.launches += 4 + -(-t // _QSA_SORT_ROWS)  # the key compress, the query norm, the scorer GEMM, the radix top-k, the sort windows
         if block_lens_out is not None:
             c = self._const["counts"]
             _cu_check(

@@ -331,15 +331,17 @@ COMPRESSED KEYS -- the band's raw key head mean-pooled in fp32 per complete 4-to
 rotated at the block START position `4j`, one rounding -- the same kernel over the slab's raw-key slice; (3) the
 SELECTION -- the indexer scorer `sum_h relu(q_h . kbar_j) / sqrt(index_head_dim)` over the blocks below
 `floor((pos + 1) / 4)` and the fused radix top-k (ties to the smaller id) -- `cudnn.gated_attention_block.qsa_select`, the
-DSA compressed-logits path, so the dense `[T, n_blocks]` score tensor is never materialized. The list it produces is
-`[T, top_k]` int32 with exactly the derived count `min(top_k, floor((pos + 1) / 4))` of valid ids then `-1`, so the sparse
-core takes it without `block_lens`.
+DSA compressed-logits path, so the dense `[T, n_blocks]` score tensor is never materialized; (4) the CANONICAL ORDER -- the
+top-k's set is reproducible but its slot order is not, and the core accumulates in list order, so each row is sorted (the
+selected ids descending, the `-1` padding last) before the core: two executes of the block are bitwise, and the list a caller
+gets back is canonical. The list is `[T, top_k]` int32 with exactly the derived count `min(top_k, floor((pos + 1) / 4))` of
+valid ids then `-1`, so the sparse core takes it without `block_lens`.
 
 | the stack hands in / gets back | form | meaning |
 |---|---|---|
 | `w_iq_norm`, `w_ik_norm` | `[index_head_dim]` activation dtype, contiguous; REQUIRED | the indexer's two RMSNorm weights in the pre-folded `(1 + w)` form the attention's `w_q_norm` / `w_k_norm` use (the loader's convention) |
 | `block_ids` / `block_lens` | -- | REFUSED: the block derives the selection |
-| `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous; optional | the block's OWN selection, written in place by the top-k (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
+| `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous; optional | the block's OWN selection in canonical order (ids descending, then `-1`), written in place (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
 | `block_lens_out` | int32 `[T]` or `[B, S_q]`, contiguous; optional | the valid-prefix length of every row of that list, `min(top_k, floor((pos + 1) / 4))` -- the position rule, padding rows included |
 | `index_k_compressed` | activation dtype `[B, >= floor(S / 4), index_head_dim]`, contiguous; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
 
@@ -362,8 +364,9 @@ zero-filled (its rows past a sequence's blocks are the caller's); a padding row'
 which attention never reads.
 
 **What it costs.** Past the bound the workspace grows by the indexer's queries (`T x index_heads x index_head_dim x 2` B),
-the compressed keys (`B x S / 4 x index_head_dim x 2` B), the list and its scores (`T x top_k x 8` B) and the scorer's
-compact-logits scratch, `~ B x S^2 / 8` fp32 (512 MiB per 32K-token sequence): the price of one launch pair that never
+the compressed keys (`B x S / 4 x index_head_dim x 2` B), the list, its sorted copy and its scores (`T x top_k x 12` B), the
+row sort's index scratch and the scorer's compact-logits scratch, `~ B x S^2 / 8` fp32 (512 MiB per 32K-token sequence):
+the price of one launch pair that never
 materializes the dense score tensor; a row-windowed selection bounds it and is the lever for longer prompts.
 `compile()` warms the scorer and the top-k at the real shape (their compile keys carry it), so `execute` compiles nothing
 and allocates nothing.
