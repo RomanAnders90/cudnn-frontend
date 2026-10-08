@@ -792,14 +792,19 @@ S_q = S_kv = 384, H = 4, 384 flattened batch rows; a 212-SM cc 10.7 node at the
 Measured facts from the knob sweep of the same arms over the grid (bf16, D = 32
 and 64, S_q = S_kv = S in {128, 256, 384, 512, 768, 1024} plus the padding leg
 {200, 217, 300, 450, 600}, H = 4, B x S flattened rows with B = 1 and 4, the bias
-batch-broadcast; a 212-SM cc 10.7 node at the 2376 MHz lock, 100 x 3 graph-replay
-rounds, a control twin per process within 0.25 %, 35 processes / 648 cells, EVERY
-ratio same-process; at S <= 256 the graph replay is launch-bound on the host
-(replay / CUPTI 1.2-1.6), so those ratios read the kernel-only CUPTI time):
+batch-broadcast; a 212-SM cc 10.7 node at the 2376 MHz lock -- the sampled busy
+median 2364 MHz on 32 of 35 processes, 2316-2352 MHz on three d64 processes
+whose absolute times are lower bounds; 100 x 3 graph-replay rounds, a control
+twin per process within 0.25 % on 31 of 35 processes and up to 1.0 % on the
+launch-bound small-S processes, 648 cells, EVERY ratio same-process; at S <= 256
+the graph replay is launch-bound on the host (replay / CUPTI 1.2-1.6), so those
+ratios read the kernel-only CUPTI time):
 
-- `TILE_N 64` for every graph with BOTH a bias and a bool `kv_mask` -- 48 of 48
-  cell sets, +9..+44 % (d32 B = 1: +21 / +30 / +13 / +18 / +13 % at S 128 / 256 /
-  384 / 512 / 768, 0 % at 1024; B = 4 +43..+9 %; d64 +22..+44 % at every S).
+- `TILE_N 64` for every graph with BOTH a bias and a bool `kv_mask` -- 26 of 27
+  (D, B, S) sets, +9..+55 %, one tie at d32 S 1024 B = 1 (d32 B = 1: +21 / +30 /
+  +13 / +18 / +13 % at S 128 / 256 / 384 / 512 / 768, 0 % at 1024; B = 4
+  +9..+55 %, the top end the kernel-only time at S 128; d64 +22..+44 % at every
+  S).
   Where the knob-less pick is the one-batch-entry streamed ring (d32 S >= 512)
   the best form is the PAIR item's resident block at TILE_N 64 (`n_chunk 8`:
   169 -> 144 us at 512, 487 -> 429 at 768) -- the form pick is coupled to the
