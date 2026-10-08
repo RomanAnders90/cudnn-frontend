@@ -16,6 +16,10 @@ What is pinned, and why each matters to a kernel test downstream:
 * the indexer reference: the identity below the bound, one dropped block at 2052, the tie-break, the score formula
   against a hand computation of the HF arithmetic, and ``hf_rounding`` changing rounding only.
 * ``make_qsa_inputs``: every list source satisfies the block-id contract; the dense draws are bitwise the dense block's.
+* the degenerate rows of the block oracle (positions 0..2, an empty list with a tail, a ``-1`` in the middle, a row with
+  no visible key, one block total, ``B x H_kv > 1`` with one block, the ``S % 4`` tails) checked on the OUTPUT and
+  against an independent fp64 per-row attention; the packed (THD) variant bitwise the per-sequence dense-oracle loop,
+  empty sequences included; the S = 32768 / 24-head memory cell of the oracle on this host.
 """
 
 import dataclasses
@@ -40,12 +44,20 @@ from gated_block_qsa_reference import (  # noqa: E402
     dense_geometry,
     full_block_ids,
     gated_attention_block_qsa_reference,
+    gated_attention_block_qsa_reference_packed,
     make_qsa_inputs,
     qsa_indexer_reference,
     qsa_visible_mask,
     random_block_ids,
 )
-from gated_block_reference import gated_attention_block_reference, make_inputs  # noqa: E402
+from gated_block_reference import (  # noqa: E402
+    compare_packed,
+    gated_attention_block_reference,
+    gated_attention_block_reference_packed,
+    make_inputs,
+    make_packed_inputs,
+    sequence_slices,
+)
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 G = GEOMETRY_QSA_SMALL
@@ -512,3 +524,247 @@ class TestInputs:
     def test_unknown_source_is_refused(self):
         with pytest.raises(ValueError, match="index_source"):
             make_qsa_inputs(G, 1, 8, device=DEV, index_source="real")
+
+
+# ---------------------------------------------------------------------------
+# Degenerate rows of the block oracle, checked on the output and against an independent fp64 row attention
+# ---------------------------------------------------------------------------
+
+
+def _row_attention_fp64(ref, b, t, visible, geom):
+    """fp64 attention of query row ``(b, t)`` over the key indices ``visible`` from the oracle's own post-norm / post-RoPE
+    ``q`` / ``k`` / ``v`` -> ``(O [H_q, D], LSE [H_q])``; an empty ``visible`` gives ``O = 0``, ``LSE = -inf``.  No shared
+    helper with the oracle: a direct softmax per head in double precision."""
+    hq, rep = geom.h_q, geom.h_q // geom.h_kv
+    q = ref.q[b, t].double()  # [H_q, D]
+    if len(visible) == 0:
+        return torch.zeros_like(q), torch.full((hq,), float("-inf"), dtype=torch.float64, device=q.device)
+    idx = torch.as_tensor(visible, device=q.device)
+    k = ref.k[b, idx].double()  # [n, H_kv, D]
+    v = ref.v[b, idx].double()
+    o = torch.empty_like(q)
+    lse = torch.empty(hq, dtype=torch.float64, device=q.device)
+    for h in range(hq):
+        sc = (k[:, h // rep] @ q[h]) * geom.scale  # [n]
+        m = sc.max()
+        pexp = torch.exp(sc - m)
+        o[h] = (pexp[:, None] * v[:, h // rep]).sum(0) / pexp.sum()
+        lse[h] = m + torch.log(pexp.sum())
+    return o, lse
+
+
+def _check_row(ref, b, t, visible, geom, *, tag=""):
+    o64, lse64 = _row_attention_fp64(ref, b, t, visible, geom)
+    assert int(ref.n_visible[b, t]) == len(visible), f"{tag} row {t}: n_visible {int(ref.n_visible[b, t])} != {len(visible)}"
+    if ref.o.dtype == torch.float32:
+        torch.testing.assert_close(ref.o[b, t].double(), o64, rtol=1e-5, atol=1e-6, msg=f"{tag} row {t}: O")
+    else:  # the oracle rounds its fp32 O once to the io dtype: within one bf16 ulp of the fp64 row
+        torch.testing.assert_close(ref.o[b, t].double(), o64, rtol=2**-7, atol=1e-5, msg=f"{tag} row {t}: O (one io-dtype rounding)")
+    torch.testing.assert_close(ref.lse[b, :, t].double(), lse64, rtol=1e-5, atol=1e-5, msg=f"{tag} row {t}: LSE")
+
+
+class TestDegenerateRows:
+    """The sdpa-invariants degenerate matrix in QSA vocabulary, each row with the code that handles it (``qsa_visible_mask``)
+    and the OUTPUT asserted directly (``O``, ``LSE``, ``out``), never a diff of two NaNs."""
+
+    def test_positions_0_to_2_attend_to_the_tail_only(self):
+        S = 512
+        inp = make_qsa_inputs(G, 1, S, device=DEV, seed=20, index_source="full")
+        ids = inp["block_ids"].clone()
+        ids[0, :3] = 7  # a valid-looking id on rows that have no complete block yet: never read
+        qsa = _run_qsa(inp, G, block_lens=inp["block_lens"])
+        qsa_junk = gated_attention_block_qsa_reference(
+            inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, block_ids=ids, block_lens=inp["block_lens"]
+        )
+        dense = _run_dense(inp, G)
+        _assert_oracles_equal(qsa_junk, dense)
+        for t in (0, 1, 2):
+            assert int(qsa.n_visible[0, t]) == t + 1
+            _check_row(qsa, 0, t, list(range(t + 1)), G, tag="pos<=2")
+        assert torch.equal(qsa_junk.o, qsa.o) and torch.equal(qsa_junk.lse, qsa.lse)
+
+    def test_empty_list_with_a_tail_attends_to_the_tail_only(self):
+        S = 64
+        inp = make_qsa_inputs(G, 1, S, device=DEV, seed=21, index_source="full")
+        ids = torch.full_like(inp["block_ids"], -1)
+        lens = torch.zeros_like(inp["block_lens"])
+        qsa = gated_attention_block_qsa_reference(
+            inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, block_ids=ids, block_lens=lens
+        )
+        assert torch.isfinite(qsa.out).all()
+        for t in (5, 6, 30, 62):  # (t + 1) % 4 != 0: a 1..3-token tail
+            tail = list(range(4 * ((t + 1) // 4), t + 1))
+            _check_row(qsa, 0, t, tail, G, tag="tail-only")
+            assert torch.isfinite(qsa.lse[0, :, t]).all()
+        for t in (3, 7, 63):  # (t + 1) % 4 == 0 and no listed block: NO visible key -> O = 0, LSE = -inf, out = 0
+            assert int(qsa.n_visible[0, t]) == 0
+            assert torch.equal(qsa.o[0, t], torch.zeros_like(qsa.o[0, t])) and torch.isneginf(qsa.lse[0, :, t]).all()
+            assert torch.equal(qsa.out[0, t], torch.zeros_like(qsa.out[0, t]))
+
+    def test_a_minus_one_in_the_middle_is_the_value_with_that_block_absent(self):
+        S = 64
+        inp = make_qsa_inputs(G, 1, S, device=DEV, seed=22, index_source="full")
+        holed = inp["block_ids"].clone()
+        holed[0, 40:, 3] = -1  # rows 40..63 lose block 3 (tokens 12..15) in the MIDDLE of their valid prefix
+        absent = inp["block_ids"].clone()
+        absent[0, 40:, 3:-1] = inp["block_ids"][0, 40:, 4:]  # the same set written as a valid prefix
+        absent[0, 40:, -1] = -1
+        kw = dict(w_q_norm=inp["w_q_norm"], w_k_norm=inp["w_k_norm"])
+        a = gated_attention_block_qsa_reference(
+            inp["h"], inp["w_qkvg"], kw["w_q_norm"], kw["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, block_ids=holed, block_lens=inp["block_lens"]
+        )
+        lens_absent = (inp["block_lens"] - (torch.arange(S, device=DEV) >= 40).to(torch.int32)[None]).clamp_min(0)
+        b = gated_attention_block_qsa_reference(
+            inp["h"], inp["w_qkvg"], kw["w_q_norm"], kw["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, block_ids=absent, block_lens=lens_absent
+        )
+        for name in ("out", "o", "lse"):
+            assert torch.equal(getattr(a, name), getattr(b, name)), name
+        dense = _run_dense(inp, G)
+        assert _differing_rows(a, dense) == list(range(40, S))  # exactly the rows that lost block 3
+        t = 50
+        visible = [i for i in range(t + 1) if not 12 <= i < 16]
+        _check_row(a, 0, t, visible, G, tag="-1 in the middle")
+
+    def test_one_block_total_and_b_times_h_kv_above_one_with_one_block(self):
+        """S = 4: one complete block for the last row; B = 2 with different lists -- batch 1's row 3 lists nothing and has
+        no tail, so it is a dead ROW inside a live sequence (O = 0, LSE = -inf, out = 0); batch 0 is the dense function."""
+        S = 4
+        inp = make_qsa_inputs(G, 2, S, device=DEV, seed=23, index_source="full")
+        ids = inp["block_ids"].clone()
+        ids[1] = -1
+        lens = inp["block_lens"].clone()
+        lens[1] = 0
+        qsa = gated_attention_block_qsa_reference(
+            inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, block_ids=ids, block_lens=lens
+        )
+        dense = _run_dense(inp, G)
+        for name in ("out", "o", "lse"):
+            assert torch.equal(getattr(qsa, name)[0], getattr(dense, name)[0]), name
+        assert qsa.n_visible[1].tolist() == [1, 2, 3, 0]
+        assert torch.equal(qsa.o[1, 3], torch.zeros_like(qsa.o[1, 3])) and torch.isneginf(qsa.lse[1, :, 3]).all()
+        assert torch.equal(qsa.out[1, 3], torch.zeros_like(qsa.out[1, 3]))
+        for t in (0, 1, 2):
+            assert torch.equal(qsa.o[1, t], dense.o[1, t]) and torch.equal(qsa.lse[1, :, t], dense.lse[1, :, t])
+            _check_row(qsa, 1, t, list(range(t + 1)), G, tag="B=2 S=4")
+        for S2 in (5, 7):
+            inp2 = make_qsa_inputs(G, 2, S2, device=DEV, seed=23, index_source="full")
+            q2 = _run_qsa(inp2, G, block_lens=inp2["block_lens"])
+            _assert_oracles_equal(q2, _run_dense(inp2, G))
+            _check_row(q2, 1, S2 - 1, list(range(S2)), G, tag=f"S={S2}")
+
+    def test_s_kv_tails_of_one_two_three_tokens(self):
+        for S in (2051, 2050, 2049):  # tails of 3, 2, 1 at the last row (S = 2048 + tail)
+            inp = make_qsa_inputs(G, 1, S, device=DEV, seed=S, index_source="full")
+            qsa = _run_qsa(inp, G, block_lens=inp["block_lens"])
+            assert int(qsa.n_visible[0, -1]) == S and int(inp["block_lens"][0, -1]) == 512
+            _assert_oracles_equal(qsa, _run_dense(inp, G))
+            _check_row(qsa, 0, S - 1, list(range(S)), G, tag=f"tail S={S}")
+
+    def test_output_rows_are_finite_before_any_cosine(self):
+        """The NaN-blindness lesson: every cell asserts isfinite on the OUTPUT first, dead rows exactly zero."""
+        S = 128
+        seq_lens = torch.tensor([S, 0], dtype=torch.int32, device=DEV)
+        inp = make_qsa_inputs(G, 2, S, device=DEV, seed=24, index_source="synthetic", seq_lens=seq_lens)
+        qsa = _run_qsa(inp, G, block_lens=inp["block_lens"], seq_lens=seq_lens)
+        assert torch.isfinite(qsa.out).all() and torch.isfinite(qsa.o).all()
+        assert torch.isfinite(qsa.lse[0]).all() and torch.isneginf(qsa.lse[1]).all()
+        assert torch.equal(qsa.out[1], torch.zeros_like(qsa.out[1]))
+
+
+# ---------------------------------------------------------------------------
+# The packed (THD) per-sequence variant
+# ---------------------------------------------------------------------------
+
+
+def _packed_full_lists(lens, top_k=512):
+    """Per-sequence 'full' block-id lists for a packing, concatenated along the token axis: ``[T, top_k]`` / ``[T]``."""
+    ids, bl = [], []
+    for n in lens:
+        if n:
+            i, l = full_block_ids(torch.arange(int(n), device=DEV), top_k, BS)
+            ids.append(i)
+            bl.append(l)
+    if not ids:
+        return torch.zeros(0, top_k, dtype=torch.int32, device=DEV), torch.zeros(0, dtype=torch.int32, device=DEV)
+    return torch.cat(ids), torch.cat(bl)
+
+
+class TestPacked:
+    @pytest.mark.parametrize("lens", [[300, 128, 200], [0, 300, 0, 128, 200, 0], [5, 1029, 7], [2051, 13]])
+    def test_packed_equals_the_per_sequence_dense_oracle_loop_bitwise(self, lens):
+        inp, meta = make_packed_inputs(dense_geometry(G), lens, device=DEV, seed=25)
+        ids, bl = _packed_full_lists(lens)
+        assert ids.shape[0] == meta["t"]
+        refs = gated_attention_block_qsa_reference_packed(
+            inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, lens, block_ids=ids, block_lens=bl
+        )
+        dense_refs = gated_attention_block_reference_packed(
+            inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], dense_geometry(G), lens
+        )
+        assert [r is None for r in refs] == [n == 0 for n in lens]
+
+        def check(i, lo, hi, ref):
+            d = dense_refs[i]
+            for name in ("out", "o", "lse", "q", "k", "v", "gate"):
+                assert torch.equal(getattr(ref, name), getattr(d, name)), f"{name} not bitwise"
+            assert torch.equal(ref.n_visible[0], torch.arange(1, hi - lo + 1, device=DEV))
+
+        failures = compare_packed(refs, lens, check)
+        assert not failures, failures
+
+    def test_packed_slices_rank2_and_rank3_lists_alike(self):
+        lens = [35, 0, 24]  # top_k = 8: the identity bound is 8 x 4 + 3 = 35 tokens, so every sequence is the dense function
+        inp, meta = make_packed_inputs(dense_geometry(G), lens, device=DEV, seed=26)
+        ids, bl = _packed_full_lists(lens, top_k=8)
+        spec = dataclasses.replace(G.qsa, top_k=8)
+        assert spec.identity_bound == 35
+        args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], G, lens)
+        r2 = gated_attention_block_qsa_reference_packed(*args, block_ids=ids, block_lens=bl, spec=spec)
+        r3 = gated_attention_block_qsa_reference_packed(*args, block_ids=ids[None], block_lens=bl[None], spec=spec)
+        rn = gated_attention_block_qsa_reference_packed(*args, block_ids=ids, spec=spec)  # block_lens None: the derived count
+        for a, b, c in zip(r2, r3, rn):
+            if a is None:
+                assert b is None and c is None
+                continue
+            assert torch.equal(a.out, b.out) and torch.equal(a.lse, b.lse) and torch.equal(a.out, c.out) and torch.equal(a.lse, c.lse)
+        # ... and each sequence equals the dense oracle on ITS OWN rows (positions restart per sequence)
+        for (lo, hi), r in zip(sequence_slices(lens), r2):
+            if r is None:
+                continue
+            d = gated_attention_block_reference(
+                inp["h"][:, lo:hi], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"][:, lo:hi], inp["sin"][:, lo:hi], inp["w_o"], dense_geometry(G)
+            )
+            assert torch.equal(r.out, d.out) and torch.equal(r.lse, d.lse)
+
+
+# ---------------------------------------------------------------------------
+# The S = 32768 memory cell on this host
+# ---------------------------------------------------------------------------
+
+
+class TestMemory:
+    def test_s_32768_h24_oracle_fits_and_is_sane(self):
+        """1.6 GiB of fp32 scores per 512-row chunk at 24 heads: the oracle must run at the long-S cell on this host."""
+        if DEV != "cuda":
+            pytest.skip("the 32K cell needs a GPU")
+        free, total = torch.cuda.mem_get_info()
+        if total < 24 * 2**30:
+            pytest.skip(f"the 32K cell needs a >= 24 GiB device, this one has {total / 2**30:.1f} GiB")
+        g = GEOMETRY_FLASH_NEXT
+        S = 32768
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        inp = make_qsa_inputs(g, 1, S, device=DEV, seed=27, index_source="synthetic")
+        qsa = _run_qsa(inp, g, block_lens=inp["block_lens"], q_chunk=512)
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() / 2**30
+        print(f"S=32768 H_q=24 q_chunk=512: peak {peak:.2f} GiB allocated")
+        assert torch.isfinite(qsa.out).all() and torch.isfinite(qsa.lse).all()
+        n_vis = qsa.n_visible[0]
+        assert torch.equal(n_vis[:2051], torch.arange(1, 2052, device=DEV))  # the identity regime: positions 0..2050
+        assert int(n_vis[2051:].max()) <= 2051 and int(n_vis[2051:].min()) >= 2048  # 512 blocks + a 0..3 tail past the bound
+        # three rows against the independent fp64 row attention: the first, the last identity row, the last row
+        pos = torch.arange(S, device=DEV)
+        for t in (0, 2051, S - 1):
+            vis = qsa_visible_mask(inp["block_ids"][0, t : t + 1], inp["block_lens"][0, t : t + 1], pos[t : t + 1], S, S, BS, top_k=512)[0]
+            _check_row(qsa, 0, t, vis.nonzero().flatten().tolist(), g, tag="32K")
