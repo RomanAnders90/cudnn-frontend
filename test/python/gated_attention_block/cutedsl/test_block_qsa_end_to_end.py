@@ -697,14 +697,17 @@ def _indexer_two_stage(c: _Cell, label: str) -> dict:
     assert torch.equal(k_lens.long(), counts), f"{label}: the counts are not min(top_k, floor((pos + 1) / 4))"
     assert torch.equal(valid, torch.arange(top_k, device=dev)[None, None, :] < counts[..., None]), f"{label}: the valid ids are not a prefix of the count"
     assert int(k_ids.max()) < s // bs, f"{label}: an id past the last complete block"
-    m = dict(identity=not ix["selects"], launches=ix["launches"])
+    n_exec = len(c.runs)  # the stage's counter is cumulative over the cell's executes
+    m = dict(identity=not ix["selects"], launches=ix["launches"], executes=n_exec)
     if not ix["selects"]:
         j = torch.arange(top_k, device=dev, dtype=torch.int32).expand(b, s, top_k)
         assert torch.equal(torch.where(valid, k_ids, torch.full_like(k_ids, -1)), torch.where(valid, j, torch.full_like(j, -1))), f"{label}: not the identity"
-        assert ix["launches"] == (1 if "kbar_out" in ix else 0), f"{label}: {ix['launches']} indexer launches below the identity bound"
-        print(f"\n{label}: the identity list (S <= {q.identity_bound}), {ix['launches']} indexer launch(es)")
+        assert ix["launches"] == n_exec * (
+            1 if "kbar_out" in ix else 0
+        ), f"{label}: {ix['launches']} indexer launches over {n_exec} executes below the identity bound"
+        print(f"\n{label}: the identity list (S <= {q.identity_bound}), {ix['launches']} indexer launch(es) over {n_exec} executes")
         return m
-    assert ix["launches"] == 4 + (1 if "kbar_out" in ix else 0), f"{label}: {ix['launches']} launches"
+    assert ix["launches"] == n_exec * (4 + (1 if "kbar_out" in ix else 0)), f"{label}: {ix['launches']} launches over {n_exec} executes"
     ref_geom = RefQsaGeometry(**{k: getattr(geom, k) for k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}, qsa=RefQsaSpec(top_k=top_k, index_band=True))
     spec = ref_geom.qsa
     oracle = {}
@@ -882,7 +885,7 @@ def test_indexer_identity_below_the_bound_launches_only_a_requested_cache_compre
     )
     assert torch.equal(_bits(plain.runs[0][0]), _bits(caller.runs[0][0])) and plain.blk.get_workspace_size() == caller.blk.get_workspace_size()
     with_cache = _run(geom_kw, B, S, indexer=True, indexer_outputs=True, seq_lens=lens_t, inp=plain.inp, ref=plain.ref)
-    assert with_cache.ix["launches"] == 1
+    assert with_cache.ix["launches"] == len(with_cache.runs)  # one launch per execute: the cache compress
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(index_band=True))
     _, _, _, _, k_c = qsa_indexer_reference(
         plain.inp["h"],
