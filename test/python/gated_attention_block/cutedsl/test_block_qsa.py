@@ -358,7 +358,10 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
     identity) and past it the five slots (its queries, the compressed keys, the list, the scores, the scorer's scratch -- the
     scratch's closed form equal to the DSA sizing helper's count); ``execute`` then REQUIRES the two indexer norm weights,
     REFUSES ``block_ids`` / ``block_lens``, form-checks the three optional outputs, and a caller-list or a dense block refuses
-    every one of the five; off Rubin ``check_support`` names the scorer's device family.  Form only, no plan, no launch."""
+    every one of the five; off Rubin ``check_support`` declines ahead of any launch -- below cc 10 from the indexer stage, naming
+    the scorer's device family, on a cc 10.x part other than Rubin from the sparse adapter's record, naming the found cc (the
+    indexer accepts the family) -- both texts exercised on every GPU host through a simulated capability.  Form only, no plan,
+    no launch."""
     from cudnn.deepseek_sparse_attention.indexer_forward import compress_topk_cand_buffer_size_thd
     from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _Indexer, _qsa_cand_floats, _qsa_indexer_slots
 
@@ -469,10 +472,21 @@ def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contrac
             and bool((dst[:, 300:] == -1).all())
             and bool((dst[:, :299] > dst[:, 1:300]).all())
         )
-    if torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) != (10, 7):
-        # off Rubin the indexer stage declines first (it precedes the sparse SDPA): the scorer's device family, by name
-        with pytest.raises(NotImplementedError, match=r"cc 10\.x"):
-            blk.check_support()
+    if torch.cuda.is_available():
+        # Off Rubin the block declines before any launch, and WHICH stage speaks depends on the part: below cc 10 the indexer
+        # stage (it precedes the sparse SDPA) names the scorer's device family; on a cc 10.x part other than Rubin (B200 / GB300)
+        # the indexer ACCEPTS -- the scorer is an SM100-family kernel -- and the sparse adapter's record declines, naming the
+        # found cc.  Both texts on every GPU host through a simulated capability (restored on exit), then the real device.
+        for sim_cc, pattern in (((9, 0), r"qsa_indexer: .*\(cc 10\.x\).*found cc 9\.0"), ((10, 0), r"Rubin-line GPU.*got cc 10\.0")):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(torch.cuda, "get_device_capability", lambda *a, _cc=sim_cc, **k: _cc)
+                with pytest.raises(NotImplementedError, match=pattern):
+                    blk.check_support()
+        cc = tuple(torch.cuda.get_device_capability())
+        if cc != (10, 7):
+            pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] == 10 else r"cc 10\.x"
+            with pytest.raises(NotImplementedError, match=pattern):
+                blk.check_support()
 
 
 def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_reads_off_the_record():
@@ -692,7 +706,9 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     """AGENTS.md Rule 7 through the BLOCK: a too-old DSL is a typed version decline from the sparse stage's ``check_support``
     (the adapter's first check), raised before the kernel module is loaded -- never a ``KeyError('sm_107a')`` from inside the
     DSL.  Both halves: the library floor (the installed version substituted below 4.7.0) and the ``sm_107a`` target (a DSL
-    without it on a cc 10.7 device, the device capability substituted so the probe runs on any GPU).  No launch, no GPU work."""
+    without it on a cc 10.7 device, the device capability substituted so the probe runs on any GPU).  Then the in-block indexer's
+    three arms: its floor at DECLARATION (ahead of the head-group read that imports the scorer's package), its floor and its
+    ``sm_107a`` target from the stage's own ``check_support``.  No launch, no GPU work."""
     import re
 
     import cudnn.frost.buffers as buffers
@@ -712,6 +728,29 @@ def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monke
     with pytest.raises(NotImplementedError, match="sm_107a"):
         blk2.check_support()
     assert blk2._sdpa._impl._module is None
+    # The in-block indexer (QsaSpec(index_source="indexer")) carries the floor TWICE: at DECLARATION -- the scorer's packed head
+    # groups are read off the DSA tree, whose package imports its kernel modules, so the version decline must come first -- and
+    # from the stage's own check_support; the sm_107a target from the stage.  The head-group reader is replaced by a failing
+    # stub, so REACHING it below the floor is the failure, never an import error from inside the DSL.
+    import cudnn.gated_attention_block.qsa_select as qsa_select
+
+    real_groups = qsa_select.indexer_scorer_head_groups
+    geom_ix = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+    blk_ix = GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # declared AT the floor (4.8.0 above): the stage arms run on it
+    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", lambda: pytest.fail("the scorer's package was imported below the DSL floor"))
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.6.2")))
+    with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
+        GatedAttentionBlockFwd(**_samples(geom_ix), geometry=geom_ix)  # the declaration-time arm
+    with pytest.raises(NotImplementedError, match=re.escape("found 4.6.2")):
+        blk_ix._indexer.check_support()  # the stage on its own
+    assert blk_ix._indexer._k_recipe is None and blk_ix._sdpa._impl is None  # nothing compiled; no stage past the indexer was asked
+    monkeypatch.setattr(qsa_select, "indexer_scorer_head_groups", real_groups)
+    monkeypatch.setattr(buffers, "_DSL_STATE", (True, ("nvidia-cutlass-dsl", "4.8.0")))
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: False)  # the capability still reads (10, 7) from above
+    with pytest.raises(NotImplementedError, match="sm_107a"):
+        blk_ix._indexer.check_support()
+    assert blk_ix._indexer._k_recipe is None
 
 
 # ---------------------------------------------------------------------------
