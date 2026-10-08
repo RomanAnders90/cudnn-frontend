@@ -363,7 +363,9 @@ def test_DSA_compressed_indexer_forward_bshd_mxfp8_small_head_groups(h_q):
     """MXFP8 at 4 / 8 / 16 heads per KV head: the kernel's 128-row tile packs 32 / 16 / 8 query tokens and each epilogue
     warpgroup reduces its 64-column half; random per-32 E8M0 scales (the scale packing is per 128 packed rows,
     ``token * group + head``, for every group), a query tail past the last complete block and a per-batch causal
-    offset, against the fp64 reference on the dequantized values."""
+    offset, against the fp64 reference on the dequantized values. The online LSE per token rides along (``return_lse``):
+    its running max / sum are per token of the epilogue warpgroup's half, checked against ``logsumexp`` of the reference
+    row, ``-inf`` exactly where a token sees no block."""
     _require_sm100()
     try:
         from cudnn import DSA
@@ -398,6 +400,7 @@ def test_DSA_compressed_indexer_forward_bshd_mxfp8_small_head_groups(h_q):
         k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
         topk_indices_global=False,
         return_softmax=False,
+        return_lse=True,
         deterministic=True,
     )
     torch.cuda.synchronize()
@@ -405,6 +408,11 @@ def test_DSA_compressed_indexer_forward_bshd_mxfp8_small_head_groups(h_q):
     dense_ref = ref_indexer_forward(q_deq, k_deq, w, ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64) * sm_scale
     check_ref_compressed_topk(dense_ref, result["indices"], result["logits"], top_k, atol=2e-3, rtol=2e-3)
     _assert_topk_sets_match(dense_ref.view(b * s_q, s_k), result["indices"].view(b * s_q, top_k), top_k, tie_tol=2e-3)
+    lse_ref = torch.logsumexp(dense_ref, dim=-1)  # fp32 of the fp64 reference rows
+    assert result["lse"].shape == (b, s_q)
+    assert torch.equal(torch.isfinite(result["lse"]), torch.isfinite(lse_ref))
+    finite = torch.isfinite(lse_ref)
+    torch.testing.assert_close(result["lse"][finite], lse_ref[finite], atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.L0
@@ -1281,8 +1289,13 @@ def test_DSA_compressed_indexer_forward_thd_preallocated_global_indices(weight_d
 
 @pytest.mark.L0
 @torch_fork_set_rng(seed=43)
+@pytest.mark.parametrize("h_q", [4, 64], ids=["h4", "h64"])
 @pytest.mark.parametrize("deterministic", [False, True])
-def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
+def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic, h_q):
+    """THD MXFP8 with the online LSE per token, at 64 heads (one token per epilogue warpgroup) and at 4 heads (the small-group
+    epilogue: 16 tokens per warpgroup, each carrying its own running max / sum -- the heaviest rendering of that epilogue).
+    The 256-token scale alignment is a multiple of both groups' minimum (``128 // gcd(128, h_q)`` = 2, resp. 32), so the
+    padded prefixes are the same for both; the LSE is checked against ``logsumexp`` of the dense MXFP8 scorer's rows."""
     _require_sm100()
     try:
         from cudnn import DSA
@@ -1295,7 +1308,7 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
 
     device = torch.device("cuda")
     shapes = [(127, 32), (129, 64)]
-    ratio, top_k, h_q, h_kv, d = 4, 16, 64, 1, 128
+    ratio, top_k, h_kv, d = 4, 16, 1, 128
     q_lengths = [shape[0] for shape in shapes]
     k_lengths = [shape[1] for shape in shapes]
     cu_q = torch.tensor(
@@ -1360,15 +1373,17 @@ def test_DSA_compressed_indexer_forward_thd_mxfp8_lse(deterministic):
     for batch, (s_q, s_k) in enumerate(shapes):
         q0, q1 = cu_q_host[batch : batch + 2]
         k0, k1 = cu_k_host[batch : batch + 2]
+        # .clone(): a per-sequence slice of the packed slab is 16-byte aligned at 64 heads but not at 4 (127 tokens x
+        # 4 heads x 2 bytes), and the dense reference kernel takes 16-byte-aligned tensors
         dense = DSA.indexer_forward_wrapper(
-            q[q0:q1].unsqueeze(0),
-            k[k0:k1].unsqueeze(0),
-            w[q0:q1].unsqueeze(0),
+            q[q0:q1].unsqueeze(0).clone(),
+            k[k0:k1].unsqueeze(0).clone(),
+            w[q0:q1].unsqueeze(0).clone(),
             ratio=ratio,
             sm_scale=d**-0.5,
             precision="mxfp8",
             q_scale=pack_q_scale_bshd(
-                q_scale_logical[q0:q1].unsqueeze(0),
+                q_scale_logical[q0:q1].unsqueeze(0).clone(),
                 qhead_per_kv_head=h_q,
             ),
             k_scale=pack_k_scale_bshd(k_scale_logical[k0:k1].unsqueeze(0)),
