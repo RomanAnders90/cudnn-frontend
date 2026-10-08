@@ -435,11 +435,17 @@ def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
 @needs_sm100_family
 def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_selection():
     """The acceptance measurement of the fp8 cache in miniature: one dense sequence of 4096 unit-variance tokens (1024
-    blocks), the e4m3 selection against the bf16 selection of the SAME values. Every block that is in exactly one of
-    the two sets lies within the row's own e4m3 score perturbation (``max_b |s8(b) - s16(b)|``) of the bf16 k-th
-    score -- a rank-boundary flip, nothing else -- and the agreement over the sparse rows is reported. Measured on the
-    oracle's indexer activations: 99.0 % at this geometry, 97.4 % at 32K and 96.5 % at 128K (below the 99 % acceptance
-    there); the floor asserted here is a regression tripwire, not the acceptance number."""
+    blocks), the e4m3 selection against the bf16 selection of the SAME values. Two statements about every block that is
+    in exactly one of the two sets: (1) it lies within the row's own e4m3 score perturbation (``max_b |s8(b) - s16(b)|``)
+    of the bf16 k-th score -- two equal-size selections that differ only by input rounding satisfy this at 2x BY
+    CONSTRUCTION, so the measured ~1x says the kernel computes the e4m3 function (the flips are what the input rounding
+    moves, nothing else), not that the flipped blocks are ties; (2) it lies within a stated fraction of the row's TOP
+    score of the k-th -- the statement that carries information: the flipped blocks are the row's weakest selected ones
+    (measured within 3.2-4.9 % of the top score over 12 seeds of this input distribution, p99 2.0 %; 4.1-5.3 % on the
+    oracle module's indexer activations from 4K to 128K). The agreement over the sparse rows is a regression floor, not
+    the acceptance number: 99.03-99.05 % over those 12 seeds (fp64 oracle; a Philox draw depends on the SM count) and
+    99.0 % on the oracle's activations at this geometry, 97.4 % at 32K and 96.5 % at 128K (below the 99 % acceptance
+    there)."""
     device = torch.device("cuda")
     s_q = 4096
     n_blocks = s_q // QSA_BLOCK_SIZE
@@ -465,10 +471,20 @@ def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_
         kth = torch.topk(r16, QSA_TOP_K, dim=-1).values[:, -1]
         finite = torch.isfinite(r16) & torch.isfinite(r8)
         noise = (r8 - r16).abs().masked_fill(~finite, 0.0).max(dim=-1).values
+        top = r16.masked_fill(~torch.isfinite(r16), float("-inf")).max(dim=-1).values
         gap = (r16 - kth[:, None]).abs()
         rows_d = torch.nonzero(differs)[:, 0]
+        # (1) <= 2 by construction; ~1 measured: the flips are explained by this row's own input rounding
         over = gap[differs] / noise[rows_d].clamp_min(1e-30)
-        assert bool((over <= 1.5).all()), f"a flipped block sits {float(over.max()):.2f} x the row's e4m3 noise from the k-th score: not a rank-boundary flip"
+        assert bool(
+            (over <= 1.5).all()
+        ), f"a flipped block sits {float(over.max()):.2f} x the row's e4m3 noise from the k-th score: not the e4m3 function of these inputs"
+        # (2) the informative bound: measured max 3.2-4.9 % over 12 seeds (p99 2.0 %); 8 % leaves the margin and still
+        # catches a flip that is not at the boundary (a wrong row or column puts it at O(100 %))
+        rel = gap[differs] / top[rows_d].clamp_min(1e-30)
+        assert bool(
+            (rel <= 0.08).all()
+        ), f"a flipped block sits {100 * float(rel.max()):.1f} % of the row's top score from the k-th score (measured <= 4.9 %): not the row's weakest blocks"
     assert (
-        agreement >= 0.98
-    ), f"e4m3 vs bf16 selection agreement {100 * agreement:.3f} % over the sparse rows (measured 99.0 % on the oracle's activations at this geometry)"
+        agreement >= 0.99
+    ), f"e4m3 vs bf16 selection agreement {100 * agreement:.3f} % over the sparse rows (measured 99.03-99.05 % over 12 seeds of this distribution, 99.0 % on the oracle's activations)"
