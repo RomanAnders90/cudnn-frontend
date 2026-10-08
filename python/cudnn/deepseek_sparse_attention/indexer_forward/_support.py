@@ -18,8 +18,11 @@ from __future__ import annotations
 # (``qhead_per_kv_head * q_tokens_per_tile``) a multiple of 16. The small groups (4, 8, 16) serve
 # block-sparse selectors with a few indexer heads per token; 32 and 64 are the original targets.
 SUPPORTED_QHEAD_PER_KV_HEAD_BF16 = (4, 8, 16, 32, 64)
-# The MXFP8 kernel keeps its own scale-factor packing per 128 packed rows and is unchanged.
-SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (32, 64)
+# The MXFP8 kernel keeps its 128-row tile for every group (its scale atom is 128 packed rows, so the
+# scale packing ``packed_m = token * group + head`` does not depend on the group): a small group packs
+# ``128 // group`` tokens per tile, split between the two epilogue warpgroups. Same set as BF16; a
+# plain-e4m3 scorer is the MXFP8 kernel with all-ones E8M0 scale blobs.
+SUPPORTED_QHEAD_PER_KV_HEAD_MXFP8 = (4, 8, 16, 32, 64)
 
 # Query tokens packed per MMA tile at head_dim 128, keyed by head group. The 32 / 64 entries are the
 # measured SM100 picks of each path and stay as they were (the dense path packs 4 tokens x 32 heads, the

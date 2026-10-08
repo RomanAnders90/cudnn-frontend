@@ -33,6 +33,7 @@ pytestmark = pytest.mark.L0
 
 _D = 128
 _H = 4
+_E4M3 = torch.float8_e4m3fn
 
 
 def _cc():
@@ -408,3 +409,49 @@ def test_decode_scorer_tile_is_a_knob():
     assert torch.equal(torch.sort(a["block_ids"], dim=-1).values, torch.sort(b["block_ids"], dim=-1).values)
     assert torch.equal(torch.sort(a["scores"], dim=-1).values, torch.sort(b["scores"], dim=-1).values)
     assert torch.equal(a["block_lens"], b["block_lens"])
+
+
+# --------------------------------------------------------------------------------------------- the fp8 indexer cache arm
+
+
+@needs_cuda
+def test_decode_rejects_a_mixed_cache_dtype_and_the_tile_knob_with_e4m3():
+    device = torch.device("cuda")
+    qi, kbar = _inputs(2, 1, 16, device)
+    kv = _kv_lens([40, 41], 1, device)
+    with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
+        qsa_select_decode(qi.to(_E4M3), kbar, kv)
+    with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
+        qsa_select_decode(qi, kbar.to(_E4M3), kv)
+    with pytest.raises(ValueError, match="fixed 128-row tile"):
+        qsa_select_decode(qi.to(_E4M3), kbar.to(_E4M3), kv, m_block_size=16)
+
+
+@needs_sm100_family
+@pytest.mark.parametrize("rows_per_seq", [1, 4])
+def test_decode_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(rows_per_seq):
+    """The fp8 indexer cache at decode: e4m3 ``qi`` / ``kbar`` through the dense MXFP8 scorer (its 128-row tile, all-ones
+    scales) and the radix top-k; both list forms; sets equal the fp64 top-k of the e4m3 values up to ties, counts equal
+    the oracle's; a cache capacity that is a multiple of 8 but not of the 128-row scale atom."""
+    device = torch.device("cuda")
+    batch, n_blocks_max = 3, 1032
+    pos0 = [4 * n_blocks_max - rows_per_seq, 4 * 600 + 1, 4 * 100 + 2]
+    qi, kbar = _inputs(batch, rows_per_seq, n_blocks_max, device, seed=41 + rows_per_seq)
+    q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
+    kv = _kv_lens(pos0, rows_per_seq, device)
+
+    per_row = qsa_select_decode(q8, k8, kv, list_per_sequence=False, n_blocks_per_seq=[n_blocks_max] * batch)
+    shared = qsa_select_decode(q8, k8, kv, list_per_sequence=True)
+    torch.cuda.synchronize()
+
+    positions = torch.tensor(pos0, device=device)[:, None] + torch.arange(rows_per_seq, device=device)[None, :]
+    assert torch.equal(per_row["block_lens"], _oracle_counts(positions, QSA_TOP_K, QSA_BLOCK_SIZE).to(torch.int32))
+    ref = _decode_reference(q8, k8, positions, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_rows(
+        per_row["block_ids"].view(-1, QSA_TOP_K),
+        per_row["scores"].view(-1, QSA_TOP_K),
+        per_row["block_lens"].view(-1),
+        ref.view(batch * rows_per_seq, n_blocks_max),
+        QSA_TOP_K,
+    )
+    _assert_rows(shared["block_ids"], shared["scores"], shared["block_lens"], ref[:, 0], QSA_TOP_K)

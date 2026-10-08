@@ -20,6 +20,7 @@ pytestmark = pytest.mark.L0
 
 _D = 128
 _H = 4
+_E4M3 = torch.float8_e4m3fn
 
 
 def _cc():
@@ -183,6 +184,22 @@ def test_qsa_select_declines_devices_below_the_sm100_family(monkeypatch):
         qsa_select(qi, kbar, cu, top_k=2)
 
 
+@needs_cuda
+def test_qsa_select_rejects_a_mixed_or_unsupported_cache_dtype():
+    """The fp8 indexer cache arm is selected by BOTH inputs being e4m3; a mixed pair, another dtype, or fp32 head
+    weights with e4m3 inputs are refused (the MXFP8 scorer takes bf16 weights)."""
+    device = torch.device("cuda")
+    qi, kbar, cu = _inputs([8], 4, device)
+    with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
+        qsa_select(qi.to(_E4M3), kbar, cu, top_k=2)
+    with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
+        qsa_select(qi, kbar.to(_E4M3), cu, top_k=2)
+    with pytest.raises(ValueError, match="both be bfloat16, or both float8_e4m3fn"):
+        qsa_select(qi.half(), kbar.half(), cu, top_k=2)
+    with pytest.raises(ValueError, match="bfloat16 head weights"):
+        qsa_select(qi.to(_E4M3), kbar.to(_E4M3), cu, top_k=2, w=torch.ones(8, _H, dtype=torch.float32, device=device))
+
+
 # --------------------------------------------------------------------------------------------- accept cells
 
 
@@ -336,3 +353,138 @@ def test_qsa_select_preallocated_outputs_and_scratch():
     assert torch.equal(torch.sort(pre["scores"]).values, torch.sort(plain["scores"]).values)
     ref = _qsa_reference(qi, kbar, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
     _assert_selection(pre["block_ids"], pre["scores"], ref, 128)
+
+
+# --------------------------------------------------------------------------------------------- the fp8 indexer cache arm
+
+
+def _membership(ids: torch.Tensor, n_blocks: int) -> torch.Tensor:
+    rows = ids.shape[0]
+    mem = torch.zeros(rows, n_blocks, dtype=torch.bool, device=ids.device)
+    valid = ids >= 0
+    r = torch.arange(rows, device=ids.device)[:, None].expand_as(ids)
+    mem[r[valid], ids[valid].long()] = True
+    return mem
+
+
+@needs_sm100_family
+@pytest.mark.parametrize("n_blocks", [7, 513, 8192])
+def test_qsa_select_e4m3_cache_matches_the_fp64_reference_on_the_e4m3_values(n_blocks):
+    """The fp8 indexer cache arm: e4m3 ``qi`` / ``kbar`` through the MXFP8 scorer with all-ones scales select the top-k of
+    the fp64 score of the e4m3 VALUES (their upcast is exact) up to ties at the k-th score; the bf16 kernel on the upcast
+    values selects the same sets (the two arms compute one function); identity region, padding and local ids as bf16."""
+    device = torch.device("cuda")
+    if n_blocks <= QSA_TOP_K:
+        s_q, pos0 = QSA_BLOCK_SIZE * n_blocks + QSA_BLOCK_SIZE - 1, 0
+    else:
+        s_q = 96  # not a multiple of the 32 tokens an MXFP8 tile holds at 4 heads
+        pos0 = QSA_BLOCK_SIZE * n_blocks - s_q
+    qi, kbar, cu = _inputs([s_q], n_blocks, device, seed=100 + n_blocks)
+    q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
+    q_pos0 = torch.tensor([pos0], dtype=torch.int32, device=device)
+
+    fp8 = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
+    upcast = qsa_select(q8.to(torch.bfloat16), k8.to(torch.bfloat16), cu, q_pos0=q_pos0, n_blocks_per_seq=[n_blocks])
+    torch.cuda.synchronize()
+
+    ref = _qsa_reference(q8, k8, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_selection(fp8["block_ids"], fp8["scores"], ref, QSA_TOP_K)
+    _assert_selection(upcast["block_ids"], upcast["scores"], ref, QSA_TOP_K)
+    visible = torch.isfinite(ref).sum(dim=-1)
+    assert torch.equal((fp8["block_ids"] >= 0).sum(dim=-1), visible.clamp(max=QSA_TOP_K))
+    # the two kernels agree up to ties: an id in exactly one of the two sets lies within 1e-4 of the row's k-th reference score
+    m8, m16 = _membership(fp8["block_ids"], n_blocks), _membership(upcast["block_ids"], n_blocks)
+    differs = m8 ^ m16
+    if bool(differs.any()):
+        k_eff = min(QSA_TOP_K, n_blocks)
+        topk = torch.topk(ref, k_eff, dim=-1).values
+        kth = torch.where(torch.isfinite(topk), topk, torch.full_like(topk, float("inf"))).min(dim=-1).values
+        assert bool(
+            ((ref - kth[:, None]).abs()[differs] <= 1e-4).all()
+        ), f"{int(differs.sum())} ids differ between the e4m3 and the upcast-bf16 kernels beyond a tie"
+
+
+@needs_sm100_family
+def test_qsa_select_e4m3_cache_thd_tails_and_chunked_prefill():
+    """Packed e4m3 sequences whose lengths are not multiples of the 32-token scale span of a 4-head MXFP8 tile: 5 tokens
+    (one block), 2051 (the identity bound), 133 from position 1024 (chunked prefill) -- the per-sequence scale prefix
+    rounds each up on device; sets equal the fp64 reference on the e4m3 values up to ties, padding and local ids as
+    in the bf16 arm."""
+    device = torch.device("cuda")
+    lengths, pos0 = [5, 2051, 133], [0, 0, 1024]
+    n_blocks = [(p + n) // QSA_BLOCK_SIZE for p, n in zip(pos0, lengths)]
+    qi, kbar, cu = _inputs(lengths, max(n_blocks), device, seed=23)
+    q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
+    q_pos0 = torch.tensor(pos0, dtype=torch.int32, device=device)
+
+    result = qsa_select(q8, k8, cu, q_pos0=q_pos0, n_blocks_per_seq=n_blocks, max_seqlen_q=max(lengths))
+    torch.cuda.synchronize()
+
+    ref = _qsa_reference(q8, k8, cu, q_pos0, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_selection(result["block_ids"], result["scores"], ref, QSA_TOP_K)
+    ids = result["block_ids"]
+    assert bool((ids[:3] == -1).all())
+    assert torch.equal(ids[3:5, 0], torch.zeros(2, dtype=torch.int32, device=device)) and bool((ids[3:5, 1:] == -1).all())
+    seq1 = ids[5 : 5 + 2051]
+    assert torch.equal((seq1 >= 0).sum(dim=-1).long(), (torch.arange(2051, device=device) + 1) // QSA_BLOCK_SIZE)
+    seq2 = ids[5 + 2051 :]
+    assert torch.equal((seq2 >= 0).sum(dim=-1).long(), (1024 + torch.arange(133, device=device) + 1) // QSA_BLOCK_SIZE)
+    assert int(seq2.max()) < n_blocks[2]
+
+
+@needs_sm100_family
+def test_qsa_select_e4m3_cache_flips_only_at_the_rank_boundary_against_the_bf16_selection():
+    """The acceptance measurement of the fp8 cache in miniature: one dense sequence of 4096 unit-variance tokens (1024
+    blocks), the e4m3 selection against the bf16 selection of the SAME values. Two statements about every block that is
+    in exactly one of the two sets: (1) it lies within the row's own e4m3 score perturbation (``max_b |s8(b) - s16(b)|``)
+    of the bf16 k-th score -- two equal-size selections that differ only by input rounding satisfy this at 2x BY
+    CONSTRUCTION, so the measured ~1x says the kernel computes the e4m3 function (the flips are what the input rounding
+    moves, nothing else), not that the flipped blocks are ties; (2) it lies within a stated fraction of the row's TOP
+    score of the k-th -- the statement that carries information: the flipped blocks are the row's weakest selected ones
+    (measured within 3.2-4.9 % of the top score over 12 seeds of this input distribution, p99 2.0 %; 4.1-5.3 % on the
+    oracle module's indexer activations from 4K to 128K). The agreement over the sparse rows is a regression floor, not
+    the acceptance number: 99.03-99.05 % over those 12 seeds (fp64 oracle; a Philox draw depends on the SM count) and
+    99.0 % on the oracle's activations at this geometry, 97.4 % at 32K and 96.5 % at 128K (below the 99 % acceptance
+    there)."""
+    device = torch.device("cuda")
+    s_q = 4096
+    n_blocks = s_q // QSA_BLOCK_SIZE
+    qi, kbar, cu = _inputs([s_q], n_blocks, device, seed=31)
+    q8, k8 = qi.to(_E4M3), kbar.to(_E4M3)
+
+    bf16 = qsa_select(qi, kbar, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
+    fp8 = qsa_select(q8, k8, cu, n_blocks_per_seq=[n_blocks], max_seqlen_q=s_q)
+    torch.cuda.synchronize()
+
+    ref16 = _qsa_reference(qi, kbar, cu, None, QSA_BLOCK_SIZE, _D**-0.5)
+    ref8 = _qsa_reference(q8, k8, cu, None, QSA_BLOCK_SIZE, _D**-0.5)
+    _assert_selection(bf16["block_ids"], bf16["scores"], ref16, QSA_TOP_K)
+    _assert_selection(fp8["block_ids"], fp8["scores"], ref8, QSA_TOP_K)
+    sparse = torch.isfinite(ref16).sum(dim=-1) > QSA_TOP_K
+    assert int(sparse.sum()) == s_q - (QSA_BLOCK_SIZE * QSA_TOP_K + QSA_BLOCK_SIZE - 1)
+    m16, m8 = _membership(bf16["block_ids"], n_blocks)[sparse], _membership(fp8["block_ids"], n_blocks)[sparse]
+    r16, r8 = ref16[sparse], ref8[sparse]
+    agree = (m16 & m8).sum(dim=-1).double()
+    agreement = float(agree.sum() / m16.sum())
+    differs = m16 ^ m8
+    if bool(differs.any()):
+        kth = torch.topk(r16, QSA_TOP_K, dim=-1).values[:, -1]
+        finite = torch.isfinite(r16) & torch.isfinite(r8)
+        noise = (r8 - r16).abs().masked_fill(~finite, 0.0).max(dim=-1).values
+        top = r16.masked_fill(~torch.isfinite(r16), float("-inf")).max(dim=-1).values
+        gap = (r16 - kth[:, None]).abs()
+        rows_d = torch.nonzero(differs)[:, 0]
+        # (1) <= 2 by construction; ~1 measured: the flips are explained by this row's own input rounding
+        over = gap[differs] / noise[rows_d].clamp_min(1e-30)
+        assert bool(
+            (over <= 1.5).all()
+        ), f"a flipped block sits {float(over.max()):.2f} x the row's e4m3 noise from the k-th score: not the e4m3 function of these inputs"
+        # (2) the informative bound: measured max 3.2-4.9 % over 12 seeds (p99 2.0 %); 8 % leaves the margin and still
+        # catches a flip that is not at the boundary (a wrong row or column puts it at O(100 %))
+        rel = gap[differs] / top[rows_d].clamp_min(1e-30)
+        assert bool(
+            (rel <= 0.08).all()
+        ), f"a flipped block sits {100 * float(rel.max()):.1f} % of the row's top score from the k-th score (measured <= 4.9 %): not the row's weakest blocks"
+    assert (
+        agreement >= 0.99
+    ), f"e4m3 vs bf16 selection agreement {100 * agreement:.3f} % over the sparse rows (measured 99.03-99.05 % over 12 seeds of this distribution, 99.0 % on the oracle's activations)"

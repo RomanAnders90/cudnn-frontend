@@ -34,6 +34,15 @@ Contract (prefill, THD-packed queries):
   select every visible block -- the identity region), unsorted. ``scores`` are the selected logits
   (``-inf`` on the padding). With ``deterministic=True`` (the default) a tie at the k-th boundary keeps the
   smaller block id, so the selected SET is reproducible across runs; the slot order within a row is not.
+* **The fp8 indexer cache**: ``qi`` and ``kbar`` may both be ``float8_e4m3fn`` -- plain e4m3 of the RMSNormed values,
+  no scales (both are O(1) after their norms; the choice of the reference serving stacks). The scorer then runs
+  the DSA MXFP8 arm with all-ones E8M0 scale blobs, which is exactly ``sum_h relu(e4m3(q_h) . e4m3(kbar_b))`` in
+  fp32 -- the bf16 kernel on the upcast values gives the same scores -- so the selection differs from the bf16
+  one only where the e4m3 rounding of the inputs moves a score across the k-th boundary. That is a NUMERICS
+  choice the caller makes by the dtype, not a knob: measured on the oracle's indexer activations (random weights,
+  one dense sequence), the e4m3 selection agrees with the bf16 one on 99.0 % of the selected blocks at
+  S = 4096, 97.4 % at 32768 and 96.5 % at 131072 (sparse rows; every flipped block within the row's own e4m3 score
+  noise of the k-th score), against 99.8 % for bf16 vs fp32. A mixed pair (one bf16, one e4m3) is refused.
 
 The DECODE form is :func:`qsa_select_decode` (one to a few query rows per sequence, the verify rows sharing the
 step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k kernel with one length per row.
@@ -41,6 +50,7 @@ step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k
 
 from __future__ import annotations
 
+import math
 from threading import Lock
 from typing import Optional, Sequence, Union
 
@@ -55,11 +65,18 @@ QSA_BLOCK_SIZE = 4  # tokens per compressed block (the compression ratio of the 
 QSA_TOP_K = 512  # blocks kept per token (2048 selected tokens / 4)
 TOP_K_KERNEL_MAX = 2048  # the radix top-k kernel's bound on top_k (0 < top_k <= 2048); the block's own cap (512) is QsaSpec's
 _SCORE_ROW_ALIGN = 8  # fp32 score rows are read by the top-k kernel in 256-bit vectors: n_blocks_max must be a multiple of 8
+_E4M3 = torch.float8_e4m3fn  # the fp8 indexer cache's element type (plain e4m3, no scales)
+_E8M0 = torch.float8_e8m0fnu  # the MXFP8 scorer's scale type; 1.0 (= 2^0, byte 127) everywhere for the plain-e4m3 scorer
+_SF_VEC_SIZE = 32  # elements per E8M0 scale of the MXFP8 scorer (head_dim 128 -> 4 scale groups per row)
+_SF_ATOM_ROWS = 128  # packed (token, head) rows per scale atom: every scale span is a multiple of it
+_MXFP8_TILE_ROWS = 128  # the MXFP8 scorer's packed-row tile (fixed; the bf16 scorer's m_block_size knob does not apply)
 
 _ones_cache: dict = {}
 _ones_cache_lock = Lock()
 _cu_k_cache: dict = {}
 _cu_k_cache_lock = Lock()
+_unit_scale_cache: dict = {}
+_unit_scale_cache_lock = Lock()
 
 
 def _constant_weights(numel: int, device: torch.device) -> torch.Tensor:
@@ -77,6 +94,34 @@ def _constant_weights(numel: int, device: torch.device) -> torch.Tensor:
             buf = torch.ones((capacity,), dtype=torch.bfloat16, device=torch.device("cuda", index))
             _ones_cache[key] = buf
     return buf[:numel]
+
+
+def _unit_scale_blob(shape: tuple, device: torch.device) -> torch.Tensor:
+    """An all-ones E8M0 scale tensor of ``shape`` (``(L, rows, sf_groups)``): the plain-e4m3 scorer's scale factors.
+
+    Every byte is 127 (= 2^0), so the MXFP8 scorer multiplies by 1.0 and computes the plain e4m3 x e4m3 dot. Cached per
+    exact shape and never evicted (a CUDA graph may retain the address captured at warm-up); the blob is 1/32 of the data.
+    """
+    index = torch.cuda.current_device() if device.index is None else device.index
+    key = (index, tuple(int(x) for x in shape))
+    with _unit_scale_cache_lock:
+        blob = _unit_scale_cache.get(key)
+        if blob is None:
+            blob = torch.ones(key[1], dtype=torch.float32, device=torch.device("cuda", index)).to(_E8M0)
+            _unit_scale_cache[key] = blob
+    return blob
+
+
+def _round_up(x: int, m: int) -> int:
+    return -(-int(x) // int(m)) * int(m)
+
+
+def _padded_prefix(cu_seqlens: torch.Tensor, align: int) -> torch.Tensor:
+    """``cu_seqlens`` with every sequence length rounded up to ``align`` (device ops, no sync): the MXFP8 scale prefix."""
+    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+    out = torch.zeros_like(cu_seqlens)
+    torch.cumsum(torch.div(lengths + (align - 1), align, rounding_mode="floor") * align, dim=0, out=out[1:])
+    return out
 
 
 def _padded_cu_seqlens_k(batch: int, n_blocks_max: int, device: torch.device) -> torch.Tensor:
@@ -126,8 +171,9 @@ def qsa_select(
     Args:
         qi: ``[T, n_heads, head_dim]`` bf16 indexer queries, THD-packed; ``n_heads`` in (4, 8, 16, 32, 64)
             (the groups the DSA unified scorer packs), ``head_dim == 128``. Any strides with a unit last
-            stride are read in place (a column slice of a wider slab needs no copy).
-        kbar: ``[B, n_blocks_max, head_dim]`` bf16 compressed keys, contiguous.
+            stride are read in place (a column slice of a wider slab needs no copy). ``float8_e4m3fn``
+            together with an e4m3 ``kbar`` selects the fp8 indexer cache arm (the module docstring).
+        kbar: ``[B, n_blocks_max, head_dim]`` bf16 (or e4m3 with an e4m3 ``qi``) compressed keys, contiguous.
         cu_seqlens_q: ``[B + 1]`` int32 CUDA prefix of the query lengths (``T == cu_seqlens_q[-1]``).
         top_k: blocks kept per token (1..2048).
         block_size: tokens per compressed block (the compression ratio), 4 for QSA.
@@ -140,7 +186,7 @@ def qsa_select(
         max_seqlen_q: the longest query length; required under CUDA-graph capture (deriving it syncs).
         scale: the constant head weight; ``None`` = ``1 / sqrt(head_dim)``.
         w: optional ``[T, n_heads]`` bf16 or fp32 per-head weights replacing the constant (every head then
-            weighs ``w[t, h] * scale``).
+            weighs ``w[t, h] * scale``); bf16 only with e4m3 inputs.
         deterministic: ties at the k-th boundary keep the smaller block id (reproducible sets).
         block_ids_out / scores_out: optional preallocated ``[T, top_k]`` int32 / fp32 outputs.
         cand_buffer / cand_batch_offsets: the compact-logits scratch from
@@ -164,8 +210,7 @@ def qsa_select(
     batch, n_blocks_max, head_dim_k = kbar.shape
     if head_dim != 128 or head_dim_k != 128:
         raise ValueError(f"qsa_select scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
-    if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:
-        raise ValueError(f"qi and kbar must be bfloat16, got {qi.dtype} and {kbar.dtype}")
+    fp8 = _fp8_cache_arm(qi, kbar)
     if not qi.is_cuda or kbar.device != qi.device:
         raise ValueError("qi and kbar must be CUDA tensors on one device")
     if qi.stride(-1) != 1:
@@ -197,6 +242,8 @@ def qsa_select(
     if w is not None:
         if not isinstance(w, torch.Tensor) or tuple(w.shape) != (total_q, n_heads) or w.dtype not in (torch.bfloat16, torch.float32) or w.device != qi.device:
             raise ValueError(f"w must be a [T={total_q}, n_heads={n_heads}] bf16 or fp32 tensor on qi's device")
+        if fp8 and w.dtype != torch.bfloat16:
+            raise ValueError(f"the e4m3 scorer takes bfloat16 head weights, got w of {w.dtype}")
 
     # Typed declines come before any device query or DSL import: the head count is a property of the request.
     from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
@@ -236,6 +283,24 @@ def qsa_select(
         scale = head_dim**-0.5
     weights = w if w is not None else _constant_weights(total_q * n_heads, qi.device).view(total_q, n_heads)
     cu_seqlens_k = _padded_cu_seqlens_k(batch, n_blocks_max, qi.device)
+    fp8_kwargs = {}
+    if fp8:
+        # The plain-e4m3 scorer = the MXFP8 arm with all-ones scales. Its scale storage is per 128 packed rows: the Q
+        # prefix rounds every sequence up to 128 // gcd(128, n_heads) tokens (32 for 4 heads) on device (no sync), the
+        # blob covers the largest padded extent that prefix can reach; the K prefix is host-known (kbar is padded per
+        # sequence to n_blocks_max rows, its scale span to the next multiple of 128).
+        sf_groups = head_dim // _SF_VEC_SIZE
+        q_align = _SF_ATOM_ROWS // math.gcd(_SF_ATOM_ROWS, n_heads)
+        q_rows_bound = _round_up((total_q + batch * (q_align - 1)) * n_heads, _SF_ATOM_ROWS)
+        k_rows_per_seq = _round_up(n_blocks_max, _SF_ATOM_ROWS)
+        fp8_kwargs = dict(
+            precision="mxfp8",
+            q_scale=_unit_scale_blob((1, q_rows_bound, sf_groups), qi.device),
+            k_scale=_unit_scale_blob((1, batch * k_rows_per_seq, sf_groups), qi.device),
+            cu_seqlens_q_scale_padded=_padded_prefix(cu_seqlens_q, q_align),
+            cu_seqlens_k_scale_padded=_padded_cu_seqlens_k(batch, k_rows_per_seq, qi.device),
+            sf_vec_size=_SF_VEC_SIZE,
+        )
     result = indexer_forward_top_k_wrapper(
         qi,
         kbar.view(batch * n_blocks_max, 1, head_dim),
@@ -257,8 +322,18 @@ def qsa_select(
         cand_batch_offsets=cand_batch_offsets,
         return_softmax=False,
         deterministic=deterministic,
+        **fp8_kwargs,
     )
     return TupleDict(block_ids=result["indices"], scores=result["logits"])
+
+
+def _fp8_cache_arm(qi: torch.Tensor, kbar: torch.Tensor) -> bool:
+    """True for the e4m3 pair (the fp8 indexer cache), False for the bf16 pair; anything else is refused."""
+    if qi.dtype == torch.bfloat16 and kbar.dtype == torch.bfloat16:
+        return False
+    if qi.dtype == _E4M3 and kbar.dtype == _E4M3:
+        return True
+    raise ValueError(f"qi and kbar must both be bfloat16, or both float8_e4m3fn for the fp8 indexer cache; got {qi.dtype} and {kbar.dtype}")
 
 
 # --------------------------------------------------------------------------------------------- the decode form
@@ -321,10 +396,12 @@ def qsa_select_decode(
 
     * ``qi``: ``[B, rows_per_seq, n_heads, head_dim]`` bf16, the indexer queries of this step's tokens, row ``j`` of
       sequence ``b`` at position ``pos0[b] + j`` with ``pos0 = kv_lens - rows_per_seq``; ``n_heads`` in
-      (4, 8, 16, 32, 64), ``head_dim == 128``.
-    * ``kbar``: ``[B, n_blocks_max, head_dim]`` bf16, contiguous, the compressed keys of every sequence (one row per
-      complete block; rows at or past a row's visible count are never read); ``n_blocks_max`` a multiple of 8 (the
-      fp32 score rows are vector-read; size the compressed-key cache to a multiple-of-8 row capacity).
+      (4, 8, 16, 32, 64), ``head_dim == 128``. ``float8_e4m3fn`` together with an e4m3 ``kbar`` = the fp8 indexer
+      cache arm (the module docstring): the dense MXFP8 scorer at its 128-row tile with all-ones scales.
+    * ``kbar``: ``[B, n_blocks_max, head_dim]`` bf16 (or e4m3 with an e4m3 ``qi``), contiguous, the compressed keys of
+      every sequence (one row per complete block; rows at or past a row's visible count are never read);
+      ``n_blocks_max`` a multiple of 8 (the fp32 score rows are vector-read; size the compressed-key cache to a
+      multiple-of-8 row capacity).
     * ``kv_lens``: ``[B]`` int32 CUDA, the logical KV length per sequence INCLUDING the new tokens (the serving
       stack's vocabulary); every value ``>= rows_per_seq``.
     * ``list_per_sequence=True`` (default): ONE list per sequence from the step-0 row -- ``block_ids [B, top_k]``,
@@ -338,7 +415,8 @@ def qsa_select_decode(
       smaller block id at an equal k-th score (the selected SET is reproducible; its order is not); ``0`` leaves the
       cutoff tie to the kernel, ``2`` prefers the larger id.
     * ``top_k`` in ``[1, 2048]`` (the radix kernel's bound; a block declaration caps it at 512); ``block_size`` is the
-      compression ratio (4); ``scale`` defaults to ``1 / sqrt(head_dim)``.
+      compression ratio (4); ``scale`` defaults to ``1 / sqrt(head_dim)``; ``m_block_size`` is the bf16 scorer's tile
+      knob (the e4m3 scorer's tile is fixed at 128 rows and refuses another value).
 
     Launches: the position / count prologue (two small elementwise ops), the scorer, the top-k.  Nothing is read
     back to the host unless ``n_blocks_per_seq`` is given (a host consistency check that reads ``kv_lens``).
@@ -360,8 +438,7 @@ def qsa_select_decode(
         raise ValueError("qi must hold at least one query row per sequence")
     if head_dim != 128 or head_dim_k != 128:
         raise ValueError(f"qsa_select_decode scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
-    if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:
-        raise ValueError(f"qi and kbar must be bfloat16, got {qi.dtype} and {kbar.dtype}")
+    fp8 = _fp8_cache_arm(qi, kbar)
     if not qi.is_cuda or kbar.device != qi.device:
         raise ValueError("qi and kbar must be CUDA tensors on one device")
     if qi.stride(-1) != 1:
@@ -390,6 +467,10 @@ def qsa_select_decode(
         raise ValueError(f"tie_break must be 0 (kernel order), 1 (smaller block id) or 2 (larger block id), got {tie_break}")
     if m_block_size is not None and (int(m_block_size) < 16 or int(m_block_size) % 16 != 0):
         raise ValueError(f"m_block_size must be a multiple of 16 (the scorer's N tile), got {m_block_size}")
+    if fp8 and m_block_size is not None and int(m_block_size) != _MXFP8_TILE_ROWS:
+        raise ValueError(
+            f"the e4m3 scorer runs the MXFP8 kernel's fixed {_MXFP8_TILE_ROWS}-row tile; m_block_size = {m_block_size} is a knob of the bf16 scorer only"
+        )
 
     if n_blocks_per_seq is not None:
         counts = _as_host_ints(n_blocks_per_seq, "n_blocks_per_seq")
@@ -422,7 +503,10 @@ def qsa_select_decode(
 
     if n_heads not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16:
         raise NotImplementedError(f"qsa_select_decode packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
-    m_eff = max(16, n_heads) if m_block_size is None else int(m_block_size)
+    if fp8:
+        m_eff = _MXFP8_TILE_ROWS
+    else:
+        m_eff = max(16, n_heads) if m_block_size is None else int(m_block_size)
     if m_eff % n_heads != 0:
         raise ValueError(f"m_block_size must be a multiple of n_heads = {n_heads} (whole tokens per tile), got {m_block_size}")
 
@@ -438,6 +522,17 @@ def qsa_select_decode(
         pos0 = positions if list_per_sequence else positions[:, 0].contiguous()
         q_rows = qi if not list_per_sequence else qi[:, :1]
         weights = _constant_weights(batch * rows * n_heads, qi.device).view(batch, rows, n_heads)
+        fp8_kwargs = {}
+        if fp8:
+            # all-ones E8M0 blobs in the dense (BSHD) packing: (B, packed rows rounded up to 128, 4) for Q, (B, blocks
+            # rounded up to 128, 4) for K -- exact shapes, cached
+            sf_groups = head_dim // _SF_VEC_SIZE
+            fp8_kwargs = dict(
+                precision="mxfp8",
+                q_scale=_unit_scale_blob((batch, _round_up(rows * n_heads, _SF_ATOM_ROWS), sf_groups), qi.device),
+                k_scale=_unit_scale_blob((batch, _round_up(n_blocks_max, _SF_ATOM_ROWS), sf_groups), qi.device),
+                sf_vec_size=_SF_VEC_SIZE,
+            )
         scores = indexer_forward_wrapper(
             q_rows,
             kbar.view(batch, n_blocks_max, 1, head_dim),
@@ -448,6 +543,7 @@ def qsa_select_decode(
             sm_scale=float(scale),
             stream=stream,
             q_causal_offsets=pos0,
+            **fp8_kwargs,
         )["scores"]
         selected = indexer_top_k_wrapper(
             scores.view(batch * rows, n_blocks_max),
