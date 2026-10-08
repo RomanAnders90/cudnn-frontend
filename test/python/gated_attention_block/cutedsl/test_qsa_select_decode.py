@@ -329,7 +329,8 @@ def test_decode_shared_list_is_the_step0_row_and_is_reused_by_the_verify_rows():
             idx = grown.nonzero().flatten()
             assert bool(((idx >= tail_start) & (idx <= pos0[b] + j)).all()), f"sequence {b} row {j}: a token outside the step-0 tail appeared"
             assert bool(visible[j, tail_start : pos0[b] + j + 1].all()), f"sequence {b} row {j}: the tail to the row's own position is not fully visible"
-        completed = [((pos0[b] + j + 1) // QSA_BLOCK_SIZE) for j in range(rows_per_seq) if (pos0[b] + j) % QSA_BLOCK_SIZE == QSA_BLOCK_SIZE - 1 and j > 0]
+        # a draft row at position p with p % 4 == 3 completes block p // 4 (its own block), which the step-0 row cannot see
+        completed = [(pos0[b] + j) // QSA_BLOCK_SIZE for j in range(1, rows_per_seq) if (pos0[b] + j) % QSA_BLOCK_SIZE == QSA_BLOCK_SIZE - 1]
         for blk in completed:  # completed by a draft row: not in the step-0 list, visible through the tail to the last row
             assert int(blk) not in shared["block_ids"][b].tolist()
             assert bool(visible[rows_per_seq - 1, QSA_BLOCK_SIZE * blk : QSA_BLOCK_SIZE * blk + QSA_BLOCK_SIZE].all())
