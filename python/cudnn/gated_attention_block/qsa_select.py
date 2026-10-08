@@ -72,7 +72,9 @@ _ones_cache_lock = Lock()
 
 def indexer_scorer_head_groups() -> tuple:
     """The indexer head counts per token the bf16 scorer packs on its MMA tile -- the DSA kernel's own contract, read, not
-    transcribed (the module that spells it carries no kernel import, so a declaration-time decline may call this)."""
+    transcribed.  The module that spells it carries no kernel import of its own, but importing it runs the DSA package's
+    ``__init__`` (its kernel modules): a declaration-time caller gates the CuTe DSL floor FIRST
+    (``api._check_qsa_indexer_geometry``), so a too-old DSL reads as a version decline, never as an error from inside the DSL."""
     from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
 
     return tuple(SUPPORTED_QHEAD_PER_KV_HEAD_BF16)

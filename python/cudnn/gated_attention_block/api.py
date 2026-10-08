@@ -4342,7 +4342,8 @@ class _Indexer(_Stage):
     """(4i) The in-block indexer of a block-sparse (``QsaSpec``) block declared with ``index_source="indexer"``: the
     per-query selection stage (4) consumes, derived from the slab's fifth band instead of handed in by the caller.
 
-    **Four launches (plus one per 4096 rows past the first), no kernel of its own.**
+    **Five launches at ``T <= 4096`` -- two compress, the scorer GEMM, the radix top-k, the row sort -- one more sort window
+    per further 4096 rows (:meth:`launches_per_execute`); no kernel of its own.**
 
     1. The indexer QUERIES -- the band's ``index_heads`` x ``index_head_dim`` query columns of every token, RMSNormed
        (``w_iq_norm``, ``index_norm_eps``) and partially rotated at the token's position -- through the block-compress
@@ -4391,8 +4392,9 @@ class _Indexer(_Stage):
     Barrier / SMEM tables: the compress kernel has no mbarrier and no SMEM (its module docstring: both tables empty by
     construction); the scorer and the top-k are the DSA kernels with their own suites.  Declines, typed: at declaration
     (:func:`_check_qsa_indexer_geometry`) f16 activations, an ``index_head_dim`` other than the scorer's, an
-    ``index_heads`` outside its packed groups, THD; at ``check_support`` the CuTe DSL floor / target before any kernel
-    import and a device outside the scorer's family (cc 10.x).
+    ``index_heads`` outside its packed groups, THD, and the CuTe DSL floor as well (ahead of the head-group read, which
+    imports the scorer's package); at ``check_support`` the floor again and the ``sm_107a`` target, both before any kernel
+    import, and a device outside the scorer's family (cc 10.x).
     """
 
     name = "qsa_indexer"
@@ -4435,6 +4437,8 @@ class _Indexer(_Stage):
         no_target = cutedsl_arch_requirement_error(cc)
         if no_target is not None:
             raise NotImplementedError(no_target)
+        # cc 10.x = the family the scorer has run on (cc 10.0 / 10.3 / 10.7); the sparse record's 11.9 upper bound is the attention
+        # CORE's, not the scorer's -- a cc 11.x part is a typed decline here until the scorer is run on one (widen from that run).
         if cc[0] != 10:
             raise NotImplementedError(f"{self.name}: the indexer scorer is an SM100-family (cc 10.x) tcgen05 kernel; found cc {cc[0]}.{cc[1]}")
         from .kernels.qsa_compress import DEFAULT_THREADS_PER_CTA, validate_compress_shape

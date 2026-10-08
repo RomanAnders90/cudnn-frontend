@@ -247,7 +247,9 @@ adapter's own `check_support` enforces; the block transcribes none of it. Typed 
 the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`; under `index_source="indexer"` also an f16
 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
 (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0
-wheel), named with the installed version, before the kernel module is imported.
+wheel), named with the installed version, before the kernel module is imported. Under `index_source="indexer"` the floor is
+checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose package imports its kernels, so a
+too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the stage's `check_support`).
 
 ### Serving: index lists and paged KV
 
@@ -324,7 +326,8 @@ band of `W_qkvg` -- and `index_kv_heads x index_head_dim` the raw indexer key's 
 section); under `index_source="caller"` no kernel scores with them, under `index_source="indexer"` they are the scorer's.
 
 **The in-block indexer (`QsaSpec(index_source="indexer", index_band=True)`, bf16).** The block derives the selection
-from its own fifth band in three launches and no kernel of its own: (1) the band's indexer QUERIES, RMSNormed with
+from its own fifth band -- five launches at `T <= 4096` (two compress launches, the scorer GEMM, the radix top-k, the row
+sort; one more sort window per further 4096 rows), no kernel of its own: (1) the band's indexer QUERIES, RMSNormed with
 `w_iq_norm` (`index_norm_eps`) and partially rotated at the token's position -- the block-compress kernel at pool 1 over
 the slab's query columns, bitwise the block's own norm + RoPE chain on those rows (one fp32 pass, one rounding); (2) the
 COMPRESSED KEYS -- the band's raw key head mean-pooled in fp32 per complete 4-token block, RMSNormed with `w_ik_norm` and
@@ -381,7 +384,8 @@ EXACT given the kernel's selection -- the block oracle on the kernel's list with
 
 **The CuTe DSL floor.** The Rubin sparse core needs the public `nvidia-cutlass-dsl` 4.8.0 wheel (the `sm_107a`
 target); below it `check_support()` raises a typed `NotImplementedError` that names the installed version, BEFORE any
-kernel module is imported -- never a `KeyError` from inside the DSL.
+kernel module is imported -- never a `KeyError` from inside the DSL. An `index_source="indexer"` block raises the same
+decline already at declaration (the declines paragraph above).
 
 A prefill step with write-through into the stack's pools, the stack's own lists:
 
@@ -408,7 +412,7 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 | the stack has | the block / core takes |
 |---|---|
 | the top-k output over compressed blocks -- vLLM's `block_indices [num_tokens, 512]` BEFORE its block-to-token expansion, SGLang's `topk_indices [rows, 512]` when its backend keeps block indices | `block_ids`, as is (int32, contiguous); no expansion to token ids |
-| the stack's own indexer chain (the `index_qk_proj` GEMM, the compress, the scorer, the top-k) | `QsaSpec(index_source="indexer")`: the block's -- the band in the one projection GEMM, two compress launches, the scorer pair; `block_ids_out` / `block_lens_out` hand the list back, `index_k_compressed` fills the stack's compressed-key cache |
+| the stack's own indexer chain (the `index_qk_proj` GEMM, the compress, the scorer, the top-k) | `QsaSpec(index_source="indexer")`: the block's -- the band in the one projection GEMM, two compress launches, the scorer pair, the row sort; `block_ids_out` / `block_lens_out` hand the list back, `index_k_compressed` fills the stack's compressed-key cache |
 | the per-row count -- vLLM's `min(visible_blocks, 512)` (the expand kernel's `complete_blocks`), SGLang's visible-block count of its row ranges | `block_lens` (optional; pass it whenever a list is shorter than the derived default) |
 | vLLM's packed `[num_tokens, 2052]` buffer of token ids with the trailing count column | not a served form (the token-id arm is a follow-up) -- keep the block-id output of the top-k |
 | `slot_mapping` / `out_cache_loc` | `slot_mapping` (flat slot = page x P + offset; negative = no write) |
