@@ -391,7 +391,7 @@ graph.sdpa(
     - Pass `page_table_v` tensor with block offsets into the V container (optional if V is not paged)
     - Pass sequence length tensors (`seq_len_q`, `seq_len_kv`) for padding mask
     - Optionally pass `paged_attention_max_seq_len_kv` for the maximum KV sequence length (recommended)
-  - **FROST engines** (opt-in, SM100 line, f16/bf16): paged decode and MTP graphs (`S_q * pack_g <= 128` on the d128 flavor, `pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise) run a dedicated decode tile (`TILE_CGA_M=1`); other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
+  - **FROST engines** (opt-in, f16/bf16): paged decode and MTP graphs run a dedicated decode tile instead of the prefill pipeline. On the SM100 line: `S_q * pack_g <= 128` on the d128 flavor (`pack_g` = the packed head group for a PackGQA plan — `H_q/H_kv`, or its largest divisor of 128 — and 1 otherwise; `TILE_CGA_M=1`). On cc 10.7 (Rubin): the d256 flavor's swap-AB decode tile over a dense or a paged cache — PackGQA packs the whole group into the tile's Q rows (24/2 = 12 rows), the KV range splits (dense or paged) through the shared combine, which also applies the fused epilogue gate when the plan splits, and an MTP step rides it in token units (`S_q * G <= 16` packed rows in one unit of the 16-column tile, rows in (16, 32] on the 32-column tile, a packed group in up to two token units). Other shapes run the prefill pipeline. See `python/cudnn/sdpa/frost/SUPPORT_MATRIX_TRACKER.md`.
   - **Offset calculation**:
     - $K_{cache}[b,h,s,d] = K_{container}[page\_table\_k[b,1,s / bs_k, 1], h, s \mod bs_k, d]$
     - $V_{cache}[b,h,s,d] = V_{container}[page\_table\_v[b,1,s / bs_v, 1], h, s \mod bs_v, d]$
@@ -425,8 +425,10 @@ whole tail fused: the gate tile is TMA-staged by the kernel's load warp and appl
 dead-row select, so the gated `O` (and the quantized `O` on the FP8 / MXFP8 rows) is written once. Served today at
 `d_qk = d_v = 256` with a bf16 `G`, dense / unsplit / non-PackGQA / non-paged layouts; any other combination
 falls back to the unfused three-node execution -- with one exception on the f16/bf16 engine: a decode-shaped
-graph (`S_q` times the packed GQA group at most 16 rows) whose plan splits the KV range runs on the d256 decode
-tile, and there the gate is applied by the split **combine** on the fp32 merged value before the single cast (the
+graph (`S_q` times the packed GQA group within the decode tile's routed rows: 16 in one unit of the 16-column
+tile, (16, 32] on the 32-column tile, a packed group in up to two token units) whose plan splits the KV range
+runs on the d256 decode tile, and there the gate is applied by the split **combine** on the fp32 merged value
+before the single cast (the
 same `h * tanh(g / 2) + h` arithmetic as the fused epilogue: one rounding, so the split and the unsplit gated
 plans differ only by the attention's summation order), over a dense or a paged cache, packed or not. Two
 contracts hold on the fused path: `Stats` (LSE) is
