@@ -34,6 +34,9 @@ Contract (prefill, THD-packed queries):
   select every visible block -- the identity region), unsorted. ``scores`` are the selected logits
   (``-inf`` on the padding). With ``deterministic=True`` (the default) a tie at the k-th boundary keeps the
   smaller block id, so the selected SET is reproducible across runs; the slot order within a row is not.
+
+The DECODE form is :func:`qsa_select_decode` (one to a few query rows per sequence, the verify rows sharing the
+step-0 list): the dense DSA scorer at the smallest MMA tile plus the radix top-k kernel with one length per row.
 """
 
 from __future__ import annotations
@@ -46,10 +49,12 @@ import torch
 from cudnn.api_base import TupleDict
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
-__all__ = ["qsa_select", "QSA_BLOCK_SIZE", "QSA_TOP_K"]
+__all__ = ["qsa_select", "QSA_BLOCK_SIZE", "QSA_TOP_K", "qsa_select_decode", "decode_row_positions_and_counts", "TOP_K_KERNEL_MAX"]
 
 QSA_BLOCK_SIZE = 4  # tokens per compressed block (the compression ratio of the indexer)
 QSA_TOP_K = 512  # blocks kept per token (2048 selected tokens / 4)
+TOP_K_KERNEL_MAX = 2048  # the radix top-k kernel's bound on top_k (0 < top_k <= 2048); the block's own cap (512) is QsaSpec's
+_SCORE_ROW_ALIGN = 8  # fp32 score rows are read by the top-k kernel in 256-bit vectors: n_blocks_max must be a multiple of 8
 
 _ones_cache: dict = {}
 _ones_cache_lock = Lock()
@@ -254,3 +259,205 @@ def qsa_select(
         deterministic=deterministic,
     )
     return TupleDict(block_ids=result["indices"], scores=result["logits"])
+
+
+# --------------------------------------------------------------------------------------------- the decode form
+
+
+def decode_row_positions_and_counts(
+    kv_lens: torch.Tensor,
+    rows_per_seq: int,
+    block_size: int,
+    n_blocks_max: int,
+    *,
+    list_per_sequence: bool,
+) -> tuple:
+    """The decode step's query positions and per-row visible COMPLETE-block counts (any device; no sync).
+
+    ``kv_lens [B]`` is the logical KV length per sequence INCLUDING this step's ``rows_per_seq`` new tokens, so the
+    step's first row (the step-0 token) sits at ``pos0 = kv_lens - rows_per_seq`` and row ``j`` at ``pos0 + j``.  A row
+    at position ``p`` sees ``n_vis = clamp(floor((p + 1) / block_size), 0, n_blocks_max)`` complete blocks.
+
+    ``list_per_sequence=True`` returns the step-0 row only (``positions [B]``, ``counts [B]``): the list every row of
+    the sequence shares (the speculative-verify reuse).  ``False`` returns one row per new token (``[B, rows_per_seq]``
+    each).  The counts are block-granular: consecutive rows see the SAME count except at a block boundary, which is
+    why the radix top-k is driven with one length per row (``next_n = 1``) rather than its per-key draft stagger
+    (``seq_lens[b] - next_n + j + 1``, which adds one KEY per row -- the decode form of a 1:1 indexer).
+    """
+    pos0 = kv_lens.to(torch.int32) - int(rows_per_seq)
+    if list_per_sequence:
+        positions = pos0
+    else:
+        positions = pos0[:, None] + torch.arange(int(rows_per_seq), dtype=torch.int32, device=kv_lens.device)[None, :]
+    counts = torch.div(positions + 1, int(block_size), rounding_mode="floor").clamp_(0, int(n_blocks_max)).to(torch.int32)
+    return positions, counts
+
+
+def qsa_select_decode(
+    qi: torch.Tensor,
+    kbar: torch.Tensor,
+    kv_lens: torch.Tensor,
+    *,
+    top_k: int = QSA_TOP_K,
+    block_size: int = QSA_BLOCK_SIZE,
+    list_per_sequence: bool = True,
+    n_blocks_per_seq: Optional[Union[Sequence[int], torch.Tensor]] = None,
+    scale: Optional[float] = None,
+    tie_break: int = 1,
+    m_block_size: Optional[int] = None,
+    stream=None,
+) -> TupleDict:
+    """Block selection for a DECODE step (one to a few query tokens per sequence; the speculative-verify rows share
+    the step-0 list).
+
+    The prefill selector (:func:`qsa_select`) runs the compact-logits + fused top-k path, sized for thousands of
+    query rows.  A decode step has ``rows_per_seq`` (1, or ``1 + drafts``) rows per sequence, so the dense
+    ``[rows, n_blocks_max]`` score matrix is small (``B x 4 x n_blocks_max x 4 B``: 2 MiB at 128K tokens, ``B = 4``)
+    and the two-launch form -- the DSA unified scorer writing dense ratio-causal scores, then the radix top-k
+    kernel with one length per row -- serves it with the smallest MMA tile (``m_block_size = max(16, n_heads)``: a
+    16-wide N tile packs the four indexer heads of up to four tokens).
+
+    Contract:
+
+    * ``qi``: ``[B, rows_per_seq, n_heads, head_dim]`` bf16, the indexer queries of this step's tokens, row ``j`` of
+      sequence ``b`` at position ``pos0[b] + j`` with ``pos0 = kv_lens - rows_per_seq``; ``n_heads`` in
+      (4, 8, 16, 32, 64), ``head_dim == 128``.
+    * ``kbar``: ``[B, n_blocks_max, head_dim]`` bf16, contiguous, the compressed keys of every sequence (one row per
+      complete block; rows at or past a row's visible count are never read); ``n_blocks_max`` a multiple of 8 (the
+      fp32 score rows are vector-read; size the compressed-key cache to a multiple-of-8 row capacity).
+    * ``kv_lens``: ``[B]`` int32 CUDA, the logical KV length per sequence INCLUDING the new tokens (the serving
+      stack's vocabulary); every value ``>= rows_per_seq``.
+    * ``list_per_sequence=True`` (default): ONE list per sequence from the step-0 row -- ``block_ids [B, top_k]``,
+      ``block_lens [B]``, ``scores [B, top_k]``; the ``rows_per_seq - 1`` verify rows reuse it (the sparse core's
+      per-sequence list form: row ``j`` sees the listed blocks plus every token from the step-0 tail start to its
+      own position).  ``False``: one list per row -- ``block_ids [B, rows_per_seq, top_k]``, ``block_lens
+      [B, rows_per_seq]``, ``scores [B, rows_per_seq, top_k]`` -- each row at its own position (the exact per-row
+      re-selection).
+    * ``block_ids`` are LOCAL block ids of the sequence, a valid prefix of ``block_lens = min(top_k, n_vis)`` entries
+      then ``-1``; ``scores`` the selected scores (``-inf`` on the padding).  ``tie_break = 1`` (default) keeps the
+      smaller block id at an equal k-th score (the selected SET is reproducible; its order is not); ``0`` leaves the
+      cutoff tie to the kernel, ``2`` prefers the larger id.
+    * ``top_k`` in ``[1, 2048]`` (the radix kernel's bound; a block declaration caps it at 512); ``block_size`` is the
+      compression ratio (4); ``scale`` defaults to ``1 / sqrt(head_dim)``.
+
+    Launches: the position / count prologue (two small elementwise ops), the scorer, the top-k.  Nothing is read
+    back to the host unless ``n_blocks_per_seq`` is given (a host consistency check that reads ``kv_lens``).
+
+    Raises:
+        NotImplementedError: a CuTe DSL below the floor / without the target, a device outside the SM100 family
+            (cc 10.x), or a head count outside the packed groups -- the message names the version or the set.
+        ValueError: a malformed input (shape, dtype, device, alignment, geometry, ``top_k`` past 2048).
+    """
+    if not isinstance(qi, torch.Tensor) or qi.ndim != 4:
+        raise ValueError(f"qi must be a [B, rows_per_seq, n_heads, head_dim] tensor, got {None if not isinstance(qi, torch.Tensor) else tuple(qi.shape)}")
+    if not isinstance(kbar, torch.Tensor) or kbar.ndim != 3:
+        raise ValueError(f"kbar must be a [B, n_blocks_max, head_dim] tensor, got {None if not isinstance(kbar, torch.Tensor) else tuple(kbar.shape)}")
+    batch, rows_per_seq, n_heads, head_dim = (int(x) for x in qi.shape)
+    batch_k, n_blocks_max, head_dim_k = (int(x) for x in kbar.shape)
+    if batch_k != batch:
+        raise ValueError(f"qi holds B = {batch} sequences but kbar holds {batch_k}")
+    if rows_per_seq < 1:
+        raise ValueError("qi must hold at least one query row per sequence")
+    if head_dim != 128 or head_dim_k != 128:
+        raise ValueError(f"qsa_select_decode scores head_dim 128 indexer heads, got qi head_dim {head_dim} and kbar head_dim {head_dim_k}")
+    if qi.dtype != torch.bfloat16 or kbar.dtype != torch.bfloat16:
+        raise ValueError(f"qi and kbar must be bfloat16, got {qi.dtype} and {kbar.dtype}")
+    if not qi.is_cuda or kbar.device != qi.device:
+        raise ValueError("qi and kbar must be CUDA tensors on one device")
+    if qi.stride(-1) != 1:
+        raise ValueError(f"qi needs a unit last stride, got strides {tuple(qi.stride())}")
+    if not kbar.is_contiguous():
+        raise ValueError(f"kbar must be contiguous, got strides {tuple(kbar.stride())}")
+    if n_blocks_max < 1 or n_blocks_max % _SCORE_ROW_ALIGN != 0:
+        raise ValueError(
+            f"kbar must hold a positive multiple of {_SCORE_ROW_ALIGN} block rows per sequence (the fp32 score rows are read in 256-bit vectors), "
+            f"got n_blocks_max = {n_blocks_max}: allocate the compressed-key cache with a multiple-of-{_SCORE_ROW_ALIGN} row capacity"
+        )
+    if (
+        not isinstance(kv_lens, torch.Tensor)
+        or kv_lens.ndim != 1
+        or kv_lens.numel() != batch
+        or kv_lens.dtype != torch.int32
+        or not kv_lens.is_cuda
+        or kv_lens.device != qi.device
+    ):
+        raise ValueError(f"kv_lens must be a [B={batch}] int32 CUDA tensor on qi's device")
+    if block_size < 1:
+        raise ValueError(f"block_size must be >= 1, got {block_size}")
+    if not 1 <= top_k <= TOP_K_KERNEL_MAX:
+        raise ValueError(f"top_k must be in [1, {TOP_K_KERNEL_MAX}] (the radix top-k kernel's bound), got {top_k}")
+    if tie_break not in (0, 1, 2):
+        raise ValueError(f"tie_break must be 0 (kernel order), 1 (smaller block id) or 2 (larger block id), got {tie_break}")
+    if m_block_size is not None and (int(m_block_size) < 16 or int(m_block_size) % 16 != 0):
+        raise ValueError(f"m_block_size must be a multiple of 16 (the scorer's N tile), got {m_block_size}")
+
+    if n_blocks_per_seq is not None:
+        counts = _as_host_ints(n_blocks_per_seq, "n_blocks_per_seq")
+        if len(counts) != batch:
+            raise ValueError(f"n_blocks_per_seq has {len(counts)} entries for B = {batch} sequences")
+        lens = _as_host_ints(kv_lens, "kv_lens")
+        for s, n_blocks_s in enumerate(counts):
+            if lens[s] < rows_per_seq:
+                raise ValueError(f"sequence {s}: kv_lens = {lens[s]} is shorter than the {rows_per_seq} new rows of this step")
+            needed = lens[s] // block_size
+            if not needed <= n_blocks_s <= n_blocks_max:
+                raise ValueError(
+                    f"sequence {s}: a KV length of {lens[s]} holds floor({lens[s]} / {block_size}) = {needed} complete blocks, "
+                    f"but n_blocks_per_seq = {n_blocks_s} and kbar holds {n_blocks_max} rows per sequence"
+                )
+
+    # Rule 7 first: the DSL floor and target, then the device family -- before any kernel module is imported, so a
+    # sub-floor DSL gets the typed message and never a DSL-internal import error.
+    dsl_problem = cutedsl_requirement_error("qsa_select_decode")
+    if dsl_problem is not None:
+        raise NotImplementedError(dsl_problem)
+    device_cc = tuple(torch.cuda.get_device_capability(qi.device))
+    arch_problem = cutedsl_arch_requirement_error(device_cc)
+    if arch_problem is not None:
+        raise NotImplementedError(arch_problem)
+    if device_cc[0] != 10:
+        raise NotImplementedError(f"qsa_select_decode runs the SM100-family indexer scorer (cc 10.x); found cc {device_cc[0]}.{device_cc[1]}")
+
+    from cudnn.deepseek_sparse_attention.indexer_forward._support import SUPPORTED_QHEAD_PER_KV_HEAD_BF16
+
+    if n_heads not in SUPPORTED_QHEAD_PER_KV_HEAD_BF16:
+        raise NotImplementedError(f"qsa_select_decode packs n_heads in {SUPPORTED_QHEAD_PER_KV_HEAD_BF16} indexer heads per token, got {n_heads}")
+    m_eff = max(16, n_heads) if m_block_size is None else int(m_block_size)
+    if m_eff % n_heads != 0:
+        raise ValueError(f"m_block_size must be a multiple of n_heads = {n_heads} (whole tokens per tile), got {m_block_size}")
+
+    from cudnn.deepseek_sparse_attention.indexer_forward import indexer_forward_wrapper
+    from cudnn.deepseek_sparse_attention.indexer_top_k import indexer_top_k_wrapper
+    from cudnn.deepseek_sparse_attention.utils.runtime import torch_stream_context
+
+    if scale is None:
+        scale = head_dim**-0.5
+    rows = 1 if list_per_sequence else rows_per_seq
+    with torch_stream_context(stream):
+        positions, n_vis = decode_row_positions_and_counts(kv_lens, rows_per_seq, block_size, n_blocks_max, list_per_sequence=list_per_sequence)
+        pos0 = positions if list_per_sequence else positions[:, 0].contiguous()
+        q_rows = qi if not list_per_sequence else qi[:, :1]
+        weights = _constant_weights(batch * rows * n_heads, qi.device).view(batch, rows, n_heads)
+        scores = indexer_forward_wrapper(
+            q_rows,
+            kbar.view(batch, n_blocks_max, 1, head_dim),
+            weights,
+            ratio=block_size,
+            qhead_per_kv_head=n_heads,
+            m_block_size=m_eff,
+            sm_scale=float(scale),
+            stream=stream,
+            q_causal_offsets=pos0,
+        )["scores"]
+        selected = indexer_top_k_wrapper(
+            scores.view(batch * rows, n_blocks_max),
+            n_vis.reshape(-1).contiguous(),
+            top_k,
+            next_n=1,
+            return_val=True,
+            stream=stream,
+            tie_break=tie_break,
+        )
+        block_lens = torch.minimum(n_vis, torch.full_like(n_vis, int(top_k)))
+    out_shape = (batch, top_k) if list_per_sequence else (batch, rows_per_seq, top_k)
+    return TupleDict(block_ids=selected["indices"].view(out_shape), block_lens=block_lens, scores=selected["values"].view(out_shape))
