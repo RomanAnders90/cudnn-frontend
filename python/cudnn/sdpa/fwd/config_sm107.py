@@ -1524,7 +1524,10 @@ _REG_FILE_PER_CTA = 65536
 # same backstop every other Rubin flavor applies to THD / the gate / split_kv); each arm's landing commit adds its name here and
 # flips the adapter's claims record in the same commit.  Names: "epilogue_gate", "thd_varlen", "paged_kv", "split_kv",
 # "list_per_sequence", "bottom_right", "pure_list" (qsa_include_open_block=False), "seq_q_lens".
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset()
+# "paged_kv": the gather warps read K / V from page pools through a (B, max_pages) block table -- one table lookup per
+# 4-token block (PAGE_SIZE % 4 == 0, so a block never straddles a page); the visible range comes from the per-batch KV
+# lengths, which the paged form therefore REQUIRES (SEQ_KV_LENS_PRESENT is forced to 1 below).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:
@@ -1876,6 +1879,15 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             (
                 not cfg.PAGED_KV or (cfg.PAGE_SIZE > 0 and cfg.PAGE_SIZE % cfg.BLOCK_SIZE == 0),
                 f"{flavor}: page_size must be a positive multiple of BLOCK_SIZE = {cfg.BLOCK_SIZE} (got {cfg.PAGE_SIZE}) or a block straddles two pages",
+            ),
+            (
+                not cfg.PAGED_KV or cfg.SEQ_KV_LENS_PRESENT == 1,
+                f"{flavor}: the paged form must force SEQ_KV_LENS_PRESENT=1 -- a page pool has no dense extent, so the visible range (and the "
+                f"gather rows past it, which read as -1) can only come from the per-batch KV lengths",
+            ),
+            (
+                cfg.PAGED_KV == 1 or cfg.PAGE_SIZE == 0,
+                f"{flavor}: PAGE_SIZE is 0 exactly when the kernel is not paged (the body divides by it only under PAGED_KV)",
             ),
             (cfg.SPLIT_KV >= 1, f"{flavor}: split_kv must be >= 1"),
             (

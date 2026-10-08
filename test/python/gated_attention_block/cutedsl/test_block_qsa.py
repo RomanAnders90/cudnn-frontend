@@ -471,19 +471,30 @@ def _adapter_request(**over):
 
 
 def test_adapter_accept_decline_set_equals_the_record():
-    """The record-driven consistency check (Form A): for EVERY arm field of the record, a request that asks for the arm is
-    accepted by the adapter's ``check_support`` iff the record claims it -- today every arm is False and every request a
-    typed decline naming the arm; the served baseline (dense BSHD bf16 / f16, d 256, caller lists, per-batch KV lengths)
-    passes on any host with the public ``sm_107a`` DSL (the cc is handed in, nothing is launched)."""
+    """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
+    the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
+    arm's own operands -- the paged read's pools, table and lengths; an unclaimed arm's request is a typed decline naming
+    the arm); the served baseline (dense BSHD bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with
+    the public ``sm_107a`` DSL (the cc is handed in, nothing is launched)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
 
     rec = _record()
     assert _adapter_request().check_support()  # the served baseline, bf16
     f16 = {nm: SparseOperandDesc((1, 64, h, 256), (64 * h * 256, h * 256, 256, 1), torch.float16) for nm, h in (("q", 24), ("k", 2), ("v", 2), ("o", 24))}
     assert _adapter_request(**f16).check_support()  # ... and f16: every member of the record's dtypes
+    # the paged read's operands at the baseline geometry (B = 1, S = 64 -> 4 pages of 16; HND-compact pools)
+    page, max_pages, num_pages = 16, 4, 6
+    paged = dict(
+        paged_kv=True,
+        page_size=page,
+        k=SparseOperandDesc((num_pages, 2, page, 256), (2 * page * 256, page * 256, 256, 1), torch.bfloat16),
+        v=SparseOperandDesc((num_pages, 2, page, 256), (2 * page * 256, page * 256, 256, 1), torch.bfloat16),
+        block_table=SparseOperandDesc((1, max_pages), (max_pages, 1), torch.int32),
+        seq_kv_lens=SparseOperandDesc((1,), (1,), torch.int32),
+    )
     arms = {
         "thd": dict(thd=True),
-        "paged_kv": dict(paged_kv=True),
+        "paged_kv": paged,
         "epilogue_gate": dict(epilogue_gate=object()),
         "split_kv": dict(split_kv=2),
         "bottom_right": dict(bottom_right=True),
