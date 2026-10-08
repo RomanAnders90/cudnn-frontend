@@ -14,7 +14,7 @@ This folder documents the Python FE APIs implemented under `python/cudnn`. For d
 - [Kimi Delta Attention in JAX](kda_jax.md)
 - [GEMM + Amax](gemm_fusions/gemm_amax.md)
 - [GEMM + RoPE + MXFP8 Projection](gemm_fusions/gemm_proj_rope_mxfp8.md)
-- [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output)
+- [Gated Attention Block (SM107)](gated_attention_block.md) — projection, QK-norm + RoPE, SDPA, sigmoid gate, out projection as one FROST block (bf16 / FP8 / MXFP8, optional MXFP4 weights and NVFP4 / MXFP4 output); index-list sparse attention (`QsaSpec`) and write-through into a paged KV cache
 - [Tail RoPE + Microscaled QDQ](rope_qdq.md)
 - [Prepared BF16 Tail RoPE](rope_tail.md)
 - [GEMM + SwiGLU](gemm_fusions/gemm_swiglu.md)
