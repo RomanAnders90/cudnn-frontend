@@ -480,10 +480,11 @@ QSA_TOP_K_MAX = 512
 """The most blocks a query's list may carry (a 2048-token budget at block size 4): the index staging is sized at it."""
 QSA_TOP_K_ALIGN = 4
 """The per-query id list is copied in 16-byte units, so ``top_k`` int32 ids must be a multiple of 4."""
-# The sparse core packs the GQA group (query heads per KV head) on its N tile; this is the widest group the v1 body
-# takes.  The sparse adapter's capabilities record becomes the enforcement point (and this block reads the cap off it,
-# never a literal) the moment the core lands; until then the declaration-time decline below carries the same number.
-_N_MAX_SPARSE_V1 = 16
+# What the sparse core SERVES (head dim, block size, the top_k range, the GQA group it packs on its N tile, the dtypes,
+# the arms it carries) is read off the sparse adapter's capabilities record (``cudnn.sdpa.fwd.sparse_gqa_sm107
+# .SPARSE_CAPABILITIES`` through ``_sparse_record()``), never transcribed here: the adapter's ``check_support`` enforces
+# that record, and two copies of one fact drift.  The three constants above are the API's own contract (the list's
+# unit, width and alignment); a declaration also has to satisfy the record (``_check_qsa_geometry_against_record``).
 
 # Two more DECLARATION ATTRIBUTES of the serving surface sit beside QsaSpec, on ``GatedAttentionBlockFwd`` itself, as
 # compile-key fields that never enter a knob dataclass or an autotuner: ``paged_kv_page_size`` (landed: it changes the
@@ -3728,30 +3729,91 @@ class _Sdpa(_Stage):
         )
 
 
+def _sparse_record():
+    """The sparse core's claims: the adapter-owned ``SparseCapabilities`` record of ``cudnn.sdpa.fwd.sparse_gqa_sm107``
+    (Form A -- no engine row, no manifest slot: no graph form carries a block-index list).  Read lazily (the adapter
+    module imports no framework at import time) and never transcribed: the adapter's ``check_support`` enforces this same
+    record, and two copies of one fact drift (engine-contract s 8b')."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SPARSE_CAPABILITIES
+
+    return SPARSE_CAPABILITIES
+
+
+_SHORT_DTYPE = {torch.bfloat16: "bf16", torch.float16: "f16", torch.float32: "fp32"}
+
+
+def _sparse_record_torch_dtypes(rec) -> Tuple[torch.dtype, ...]:
+    """The record's ``dtypes`` (public ``cudnn.data_type`` members) as torch dtypes, in a stable order."""
+    from cudnn.sdpa.graph_analyzer import to_torch_dtype
+
+    return tuple(to_torch_dtype(dt) for dt in sorted(rec.dtypes, key=str))
+
+
+def _check_qsa_geometry_against_record(geom: GatedAttentionBlockGeometry, dtype: torch.dtype) -> None:
+    """A ``QsaSpec`` geometry's claims on the sparse core against the adapter's record -- the head dim (``d_shapes``), the
+    block size, the ``top_k`` range, the GQA group the core packs on its N tile, the activation dtype -- as typed
+    ``NotImplementedError`` naming the feature and the record's bound.  Device-free; called at declaration
+    (``GatedAttentionBlockFwd._check_qsa_declaration``) and again by the sparse stage's ``check_support`` so the stage stays
+    honest on its own; the adapter re-checks every one of them (it is the enforcement point)."""
+    rec = _sparse_record()
+    g, q = geom, geom.qsa
+    if (g.d_head, g.d_head) not in rec.d_shapes:
+        raise NotImplementedError(
+            f"QsaSpec needs d_head == {' / '.join(str(d) for d, _ in sorted(rec.d_shapes))} (the sparse core's head dim: the d256 swap-AB body), got d_head={g.d_head}"
+        )
+    if q.block_size not in rec.index_block_sizes:
+        raise NotImplementedError(
+            f"QsaSpec.block_size={q.block_size}: the sparse core serves block sizes {sorted(rec.index_block_sizes)} (one gather transaction = one block's rows)"
+        )
+    if not (rec.index_top_k_min <= q.top_k <= rec.index_top_k_max) or q.top_k % QSA_TOP_K_ALIGN:
+        raise NotImplementedError(
+            f"QsaSpec.top_k={q.top_k}: the sparse core serves top_k as a multiple of {QSA_TOP_K_ALIGN} in [{rec.index_top_k_min}, {rec.index_top_k_max}] "
+            "(its index staging is sized by it)"
+        )
+    if not (rec.index_gqa_group_min <= g.gqa_ratio <= rec.index_gqa_group_max):
+        raise NotImplementedError(
+            f"QsaSpec needs h_q // h_kv <= {rec.index_gqa_group_max} (the sparse core packs the GQA group on an N tile of at most "
+            f"{rec.index_gqa_group_max} rows), got {g.h_q} // {g.h_kv} = {g.gqa_ratio}"
+        )
+    served = _sparse_record_torch_dtypes(rec)
+    if dtype not in served:
+        raise NotImplementedError(
+            f"QsaSpec needs {' / '.join(_SHORT_DTYPE.get(t, str(t)) for t in served)} activations (the sparse core's dtypes), got {dtype}"
+        )
+
+
 class _SparseSdpa(_Stage):
     """(4) under a :class:`QsaSpec`: ``O = softmax(Q K^T * scale + mask) V`` over each query's SELECTED 4-token blocks
-    and its open tail block, causal, GQA-broadcast -- the index-list sparse attention core.
+    and its open tail block, causal, GQA-broadcast -- the index-list sparse attention core
+    (``sdpa/fwd/kernels/sm107/sparse_d256_f16.py`` through its standalone adapter
+    ``sdpa/fwd/sparse_gqa_sm107.SparseGqaFwdDslSm107``).
 
-    The core (the Rubin d256 swap-AB body under a gather loader) has not landed in this checkout, so this stage IS the
-    typed decline every sparse request meets at ``check_support``: it names the feature, and it is reached only after
-    every stage ahead of it -- the projection (with the indexer band) and norm + RoPE -- accepted the geometry, which is
-    what makes a declared block's slab usable through those stages today.  The block's declaration-time declines
-    (``GatedAttentionBlockFwd._check_qsa_declaration``) run first, so a request the core will never take as declared
-    (packed sequences, training, a quantized pipeline, the fused gate, a fused projection over the band, the
-    bottom-right diagonal, an fp32 activation, a GQA group wider than the N tile, the in-block indexer, another head
-    dim) hears about THAT feature instead of this one.
+    **This stage writes no kernel.**  Like :class:`_Sdpa` it drives an adapter and reads every claim off ONE record --
+    the adapter-owned ``SparseCapabilities`` (Form A: no engine row, no manifest slot; no graph form carries a
+    block-index list) through :func:`_sparse_record`, never a literal: the served dtypes, head dim, block size, ``top_k``
+    range and GQA group, the arms the body does not carry.  The adapter's ``check_support`` is the ENFORCEMENT point and
+    runs inside this stage's: the CuTe DSL ``sm_107a`` gate FIRST (Rule 7, before any kernel import), then the arch range
+    off the record (no ``_SM107_CC`` literal here -- that would be a second copy of the record's ``sm_lo`` / ``sm_hi``),
+    then every unserved arm by name, the dtypes, the shapes, the stride contract and the index tensors' form -- so a
+    sparse decline reads the same through the block and through the adapter.
 
-    When the core lands this class reads its claims off the sparse adapter's capabilities record (never a literal),
-    declares the adapter at the block's strides, folds the adapter's scratch into the workspace and hands over the
-    block's BSHD views plus the index tensors exactly as :class:`_Sdpa` hands over its operands.
+    Declared at the block's strides with storage-free ``SparseOperandDesc`` stand-ins (the buffers exist only at execute):
+    Q / K / V as BSHD column slices of the slab (``token_stride = n_qkvg``, the in-place pipeline) or the compact buffers
+    (``inplace_qkv=False``), O compact, LSE ``[B, H_q, S]`` fp32, the index tensors FLAT (``[T, top_k]`` / ``[T]`` int32),
+    ``seq_kv_lens`` ``[B]`` when declared.  ``execute`` binds the real views AS THEY ARE -- the adapter's contract is BSHD,
+    so unlike :class:`_Sdpa` there is no transpose -- plus the index tensors (a ``[B, S, top_k]`` list is viewed flat: an
+    exact view of a contiguous tensor, no copy).  ``block_lens`` is optional PER CALL, so :meth:`compile` builds BOTH
+    ``has_block_lens`` variants at plan time and the adapter dispatches on the tensor it is handed (plan-time keys only,
+    Rule 4).  The kernel carries no GMEM scratch (the count, the tail block and the dead items are derived on device), so
+    :meth:`scratch_workspace_bytes` folds 0 into the block's workspace -- a ``QsaSpec`` block's workspace is the dense one.
+
+    Not here (typed declines at the block's declaration, each naming its feature): ``fuse_gate`` -- the sparse core's
+    epilogue-gate operand is not bound through this stage yet; THD -- the packed arm; ``causal_bottom_right`` -- the
+    decode / verify form; the quantized pipelines and training.  Each lands by flipping the record, the adapter AND this
+    stage in the same change; the declaration decline names the record's state so the flip is visible.
     """
 
     name = "sdpa_sparse"
-    _NOT_LANDED = (
-        "the index-list sparse attention core (stage (4) under QsaSpec) has not landed in this checkout: a block declared with "
-        "geometry.qsa is served up to and including its projection (with the indexer band) and norm + RoPE, and this stage declines "
-        "until the core lands. Declare the geometry without qsa for dense attention."
-    )
 
     def __init__(
         self,
@@ -3766,6 +3828,8 @@ class _SparseSdpa(_Stage):
         token_stride: int = 0,
         gate_token_stride: int = 0,
     ) -> None:
+        if geometry.qsa is None:
+            raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
@@ -3773,21 +3837,136 @@ class _SparseSdpa(_Stage):
         self.device = device
         self.want_lse = bool(want_lse)
         self.seq_lens_present = bool(seq_lens_present)
+        # token_stride != 0 => Q/K/V are column slices of the fused projection, read in place at that stride (the
+        # adapter validates the stride contract on the declaration).  0 => the compact buffers.
         self.token_stride = int(token_stride)
-        self.gate_token_stride = int(gate_token_stride)
+        self.gate_token_stride = int(gate_token_stride)  # carried for the gate arm's block half (the slab's GATE columns)
         self._impl = None
+        self._compiled = False
+
+    @staticmethod
+    def _record():
+        return _sparse_record()
+
+    def _operands(self) -> dict:
+        """The declared operands as storage-free descriptors at the block's strides -- what ``check_support`` validates
+        and what every ``execute`` binding has to match exactly."""
+        from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
+
+        g, b, s, d = self.geom, self.batch, self.seq_len, self.geom.d_head
+        t = b * s
+        ts_q = self.token_stride or g.h_q * d
+        ts_kv = self.token_stride or g.h_kv * d
+
+        def bshd(h: int, ts: int) -> SparseOperandDesc:
+            return SparseOperandDesc((b, s, h, d), (s * ts, ts, d, 1), self.dtype, self.device)
+
+        return dict(
+            q=bshd(g.h_q, ts_q),
+            k=bshd(g.h_kv, ts_kv),
+            v=bshd(g.h_kv, ts_kv),
+            o=bshd(g.h_q, g.h_q * d),
+            block_ids=SparseOperandDesc((t, g.qsa.top_k), (g.qsa.top_k, 1), torch.int32, self.device),
+            block_lens=SparseOperandDesc((t,), (1,), torch.int32, self.device),
+            lse=SparseOperandDesc((b, g.h_q, s), (g.h_q * s, s, 1), torch.float32, self.device) if self.want_lse else None,
+            seq_kv_lens=SparseOperandDesc((b,), (1,), torch.int32, self.device) if self.seq_lens_present else None,
+        )
 
     def check_support(self) -> None:
-        raise NotImplementedError(f"{self.name}: {self._NOT_LANDED}")
+        """The geometry against the record (device-free: the rows the declaration checked, re-run so the stage is honest on
+        its own), then the adapter -- the enforcement point: the DSL ``sm_107a`` gate before any kernel import (Rule 7),
+        the arch range off the record, the unserved arms by name, dtypes, shapes, the stride contract, the index tensors."""
+        from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+        g = self.geom
+        _check_qsa_geometry_against_record(g, self.dtype)
+        cc = tuple(torch.cuda.get_device_capability(self.device))
+        ops = self._operands()
+        self._impl = SparseGqaFwdDslSm107(
+            q=ops["q"],
+            k=ops["k"],
+            v=ops["v"],
+            o=ops["o"],
+            block_ids=ops["block_ids"],
+            lse=ops["lse"],
+            block_lens=ops["block_lens"],
+            seq_kv_lens=ops["seq_kv_lens"],
+            top_k=g.qsa.top_k,
+            block_size=g.qsa.block_size,
+            scale=g.scale,
+            bottom_right=g.causal_bottom_right,
+            device_cc=cc,
+        )
+        self._impl.check_support()
 
     def compile(self) -> None:
-        raise RuntimeError(f"{self.name}: call check_support() before compile()")
+        if self._impl is None:
+            raise RuntimeError(f"{self.name}: call check_support() before compile()")
+        # BOTH block_lens variants at plan time: the caller passes block_lens per call or not, and nothing may compile on
+        # the execute path (Rule 4).  One template load, two pointer-ABI artifacts.
+        self._impl.compile(has_block_lens=True)
+        self._impl.compile(has_block_lens=False)
+        self._compiled = True
 
     def scratch_workspace_bytes(self) -> int:
-        raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
+        """0: the kernel has no GMEM scratch (adapter ``scratch_workspace_bytes``); folded into the block's workspace like
+        the dense stage's so the size stays honest if an arm ever grows one."""
+        if self._impl is None:
+            raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
+        return int(self._impl.scratch_workspace_bytes())
 
-    def execute(self, *args, **kwargs) -> None:
-        raise RuntimeError(f"{self.name}: call compile() before execute()")
+    def execute(
+        self,
+        q: torch.Tensor,  # [B, S, H_q,  D]  compact or a slab column slice (token_stride)
+        k: torch.Tensor,  # [B, S, H_kv, D]
+        v: torch.Tensor,  # [B, S, H_kv, D]
+        o: torch.Tensor,  # [B, S, H_q,  D]  compact, written
+        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32, iff declared want_lse
+        seq_lens: Optional[torch.Tensor] = None,  # [B] int32 per-batch visible KV length, iff declared seq_lens_present
+        workspace: Optional[torch.Tensor] = None,  # unused: the kernel has no GMEM scratch
+        current_stream=None,
+        gate: Optional[torch.Tensor] = None,  # refused: no fused gate on the sparse stage
+        descale_q: Optional[torch.Tensor] = None,  # refused: the quantized pipelines' operands
+        descale_k: Optional[torch.Tensor] = None,
+        descale_v: Optional[torch.Tensor] = None,
+        scale_o: Optional[torch.Tensor] = None,
+        sf_q: Optional[torch.Tensor] = None,
+        sf_k: Optional[torch.Tensor] = None,
+        sf_v: Optional[torch.Tensor] = None,
+        block_ids: Optional[torch.Tensor] = None,  # [T, top_k] or [B, S, top_k] int32 contiguous (the block's form check ran)
+        block_lens: Optional[torch.Tensor] = None,  # [T] or [B, S] int32 contiguous, optional per call
+    ) -> None:
+        """Hand the block's BSHD views over AS THEY ARE (no transpose, no copy) plus the index tensors viewed flat.  The
+        dense stage's gate / quantization operands have no sparse arm and are refused rather than ignored; the LSE and the
+        KV-length presence must match the declaration (both are compiled into the specialization)."""
+        if self._impl is None or not self._compiled:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        if gate is not None:
+            raise ValueError(f"{self.name}: gate is the fused epilogue gate's operand; this stage was declared without fuse_gate")
+        if any(x is not None for x in (descale_q, descale_k, descale_v, scale_o, sf_q, sf_k, sf_v)):
+            raise ValueError(f"{self.name}: descales / scale_o / scale-factor blobs are the quantized pipelines' operands; the sparse core is bf16 / f16")
+        if block_ids is None:
+            raise ValueError(f"{self.name}: block_ids is required at execute (the per-query block list)")
+        if self.seq_lens_present and seq_lens is None:
+            raise ValueError(f"{self.name}: declared with seq_lens_present=True; execute needs seq_lens ([B] int32, the per-batch visible KV length)")
+        if not self.seq_lens_present and seq_lens is not None:
+            raise ValueError(f"{self.name}: seq_lens given, but this stage was declared without seq_lens_present (the KV-length presence is compiled in)")
+        if self.want_lse and lse is None:
+            raise ValueError(f"{self.name}: declared with return_lse=True; execute needs lse ([B, H_q, S] fp32)")
+        if not self.want_lse and lse is not None:
+            raise ValueError(f"{self.name}: lse given, but this stage was declared without return_lse (the LSE presence is compiled in)")
+        g, t = self.geom, self.batch * self.seq_len
+        self._impl.execute(
+            stream=current_stream,
+            q=q,
+            k=k,
+            v=v,
+            o=o,
+            lse=lse,
+            block_ids=block_ids.view(t, g.qsa.top_k),
+            block_lens=None if block_lens is None else block_lens.view(t),
+            seq_kv_lens=seq_lens,
+        )
 
 
 class _ElementwiseStage(_Stage):
@@ -4067,6 +4246,13 @@ class GatedAttentionBlockFwd(APIBase):
     (and the raw indexer key into ``index_k_raw`` when the geometry declares the band) -- and changes
     nothing stage (4) reads, so ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE:
     ``execute`` then REQUIRES the pools and the slot mapping and refuses them otherwise.
+
+    **Block-sparse attention (``geometry.qsa``, a :class:`QsaSpec`; bf16 / f16 inference, dense ``[B, S, d_model]``)**
+    swaps stage (4) for the index-list sparse core -- ``(4) sdpa_sparse  PROJ[Q,K,V], block_ids[, block_lens] -> O (+LSE)``,
+    ``sdpa/fwd/kernels/sm107/sparse_d256_f16.py`` through its adapter (:class:`_SparseSdpa`) -- at the same operands, the
+    same strides and the same launch count; ``execute`` then REQUIRES ``block_ids`` (``[T, top_k]`` int32: each query's
+    selected 4-token blocks, the open tail block always visible) and refuses it otherwise.  Every claim of that core is read
+    off the adapter's capabilities record, never transcribed; what the core does not serve is a typed decline at declaration.
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -4632,8 +4818,17 @@ class GatedAttentionBlockFwd(APIBase):
         g = self.geom
         g.validate()
         q = g.qsa
+        rec = _sparse_record()
         if self.thd:
-            raise NotImplementedError("QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up")
+            raise NotImplementedError(
+                "QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up ("
+                + (
+                    "the sparse adapter's record declines THD"
+                    if not rec.thd
+                    else "the kernel carries the arm, this block's sparse stage does not bind packed operands yet"
+                )
+                + ")"
+            )
         if self.save_for_backward:
             raise NotImplementedError(
                 "QsaSpec with save_for_backward=True: sparse-attention training (the sparse backward and the indexer loss) is out of scope; the "
@@ -4646,7 +4841,13 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if self.fuse_gate:
             raise NotImplementedError(
-                "QsaSpec with fuse_gate=True: the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch (fuse_gate=False)"
+                "QsaSpec with fuse_gate=True: the sparse core's epilogue gate is a follow-up ("
+                + (
+                    "the sparse adapter's record declines it"
+                    if not rec.epilogue_gate
+                    else "the kernel carries the arm, this block's sparse stage does not bind the gate operand yet"
+                )
+                + "); stage (5) runs as its own launch (fuse_gate=False)"
             )
         if self.fuse_norm_rope and q.index_band:
             tile = _FusedQkvProjection._TILE_N
@@ -4658,21 +4859,20 @@ class GatedAttentionBlockFwd(APIBase):
         if g.causal_bottom_right:
             raise NotImplementedError(
                 "QsaSpec with causal_bottom_right=True: the bottom-right diagonal (speculative verify rows) arrives with the sparse decode mode; "
-                "the prefill form serves the top-left causal diagonal"
+                "the prefill form serves the top-left causal diagonal ("
+                + (
+                    "the sparse adapter's record declines bottom_right"
+                    if not rec.bottom_right
+                    else "the kernel carries the arm, this block's sparse stage does not route it yet"
+                )
+                + ")"
             )
-        if self.dtype not in (torch.bfloat16, torch.float16):
-            raise NotImplementedError(f"QsaSpec needs bf16 / f16 activations (the sparse core's dtypes), got {self.dtype}")
-        if g.gqa_ratio > _N_MAX_SPARSE_V1:
-            raise NotImplementedError(
-                f"QsaSpec needs h_q // h_kv <= {_N_MAX_SPARSE_V1} (the sparse core packs the GQA group on an N tile of at most "
-                f"{_N_MAX_SPARSE_V1} rows), got {g.h_q} // {g.h_kv} = {g.gqa_ratio}"
-            )
+        # The head dim, the block size, the top_k range, the GQA group and the dtype: the RECORD's claims, read, not transcribed.
+        _check_qsa_geometry_against_record(g, self.dtype)
         if q.index_source == "indexer":
             raise NotImplementedError(
                 "QsaSpec(index_source='indexer'): the in-block indexer is a follow-up; pass the selection as execute(block_ids=) under " "index_source='caller'"
             )
-        if g.d_head != 256:
-            raise NotImplementedError(f"QsaSpec needs d_head == 256 (the sparse core is the d256 swap-AB body), got d_head={g.d_head}")
 
     def _check_qsa_execute_args(self, block_ids, block_lens, h: torch.Tensor) -> None:
         """The index tensors against the declaration -- FORM only (dtype / rank / shape / contiguity / device), never a
@@ -5566,6 +5766,9 @@ class GatedAttentionBlockFwd(APIBase):
             )
         # (4) [+ (5) under fuse_gate: the SDPA gates the SUBSTITUTED O inside
         # its epilogue, after the dead-row select, and writes O_gated.]
+        # Under QsaSpec stage (4) is the index-list sparse core: the SAME operands at the SAME strides plus the caller's
+        # block list (form-checked at the top of execute; the kernel reads its values on device).
+        sparse_kw = dict(block_ids=block_ids, block_lens=block_lens) if self.qsa is not None else {}
         self._sdpa.execute(
             q_c.view(self.batch, self.seq_len, g.h_q, g.d_head),
             k_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
@@ -5583,6 +5786,7 @@ class GatedAttentionBlockFwd(APIBase):
             sf_q=sfq,
             sf_k=sfk,
             sf_v=sfv,
+            **sparse_kw,
         )
         if not self.fuse_gate:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
