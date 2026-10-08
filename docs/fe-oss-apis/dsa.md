@@ -322,8 +322,12 @@ compressed column 0.
 - **Constraints** — `head_dim == 128`. The SM90 direct path supports
   `qhead_per_kv_head ∈ {16, 32, 64}` and currently requires `H_kv == 1`;
   SM100 BF16 dense and combined Top-K paths support
-  `qhead_per_kv_head ∈ {32, 64}`, as do their MXFP8 paths. All currently
-  require `H_kv == 1` (MQA).
+  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` (a group packs up to 8 query
+  tokens per MMA tile: 4 heads x 8 tokens = 32 columns, ..., 64 heads x 2
+  tokens = 128), their MXFP8 paths `{32, 64}`. All currently require
+  `H_kv == 1` (MQA). A query may be up to `ratio - 1` tokens longer than
+  `ratio * seqlen_k` (its trailing tokens have not completed a compressed
+  block and score the complete blocks only); a longer one is refused.
 
 ```python
 result = DSA.indexer_forward_wrapper(
@@ -714,9 +718,9 @@ result = DSA.dense_indexer_backward_wrapper(
   uses a feature-local LLVM inline-assembly bridge with the compiler-owned TMA
   descriptor; the issued data movement remains hardware TMA `gather4`.
 - **Indexer Forward only supports `head_dim = 128`**. SM90 supports
-  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 and MXFP8
-  support `qhead_per_kv_head ∈ {32, 64}`. Both the dense and combined Top-K
-  paths require `H_kv = 1`.
+  `qhead_per_kv_head ∈ {16, 32, 64}` with `H_kv = 1`; SM100 BF16 supports
+  `qhead_per_kv_head ∈ {4, 8, 16, 32, 64}` and MXFP8 `{32, 64}`. Both the
+  dense and combined Top-K paths require `H_kv = 1`.
 - **Standalone Top-K only up to 2048**; `top_k > 2048` is not supported by
   its radix Top-K kernel. The combined compressed path uses a separate stage-2
   implementation.
