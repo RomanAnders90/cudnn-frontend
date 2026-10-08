@@ -8,9 +8,13 @@ re-derived oracle (``gated_block_qsa_reference.py``) stays the acceptance gate; 
 re-derivation slip, not a dependency.
 
 Status: written against the HF source as it stood on 2026-10-07 (``modeling_qwen4_exp.py``: the indexer at 665-771,
-the attention at 811-893; ``configuration_qwen4_exp.py``: the QSA validator at 187-229).  No environment of this
-project carries ``transformers >= 5.16`` with the model yet, so this module has only been seen to SKIP; the first run
-on an environment that has the package records the measured agreement in its log.
+the attention at 811-893; ``configuration_qwen4_exp.py``: the QSA validator at 187-229) and first RUN against the
+released package on 2026-10-08 -- transformers 5.19.0 (its ``qwen4_exp`` sources byte-identical to that copy), torch
+2.14.1, a Rubin cc 10.7 device, fp32 end to end, nothing changed to make it run: the visible sets equal on every
+untied row (24 / 24 at S = 12; 94 / 96 at S = 48, 56 of them past the identity bound), the layer output within
+``3.7e-8`` absolute at a scale of ``1.5e-1`` (cosine ``1 - 6e-8``), the raw indexer scores within ``9.5e-7`` over 21
+queries.  The venvs this repo's tests usually run in do not carry the package, so the module SKIPS there; a run that
+does not skip prints the package, torch and device it compared against and the measured gaps.
 
 Mapping of the oracle's weights onto the HF module (fp32 end to end, so the comparison is fp32 accumulation order):
 ``q_proj.weight`` = the per-head interleave ``[q_h | gate_h]`` of the oracle's Q and GATE bands (``modeling:859-862``:
