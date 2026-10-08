@@ -37,7 +37,11 @@ from cudnn.deepseek_sparse_attention.utils.tensor_conversion import (
     to_cute_tensor as _to_cute_tensor,
 )
 
-from ._support import check_q_covered_by_k as _check_q_covered_by_k
+from ._support import (
+    check_q_covered_by_k as _check_q_covered_by_k,
+    resolve_m_block_size as _resolve_m_block_size,
+    validate_qhead_per_kv_head as _validate_indexer_qhead_per_kv_head,
+)
 
 
 def _packed_mxfp8_scale_shape(
@@ -85,12 +89,6 @@ def _validate_thd_mxfp8_scale_contract(
             raise ValueError(f"THD {name} must have shape ({n_heads_kv}, multiple_of_128, " f"{sf_padded}), got {tuple(scale.shape)}")
         if scale.device != device:
             raise ValueError("q_scale/k_scale must be on the same device as q/k")
-
-
-def _validate_indexer_qhead_per_kv_head(qhead_per_kv_head: int, precision: str) -> None:
-    supported = (32, 64)
-    if qhead_per_kv_head not in supported:
-        raise ValueError(f"precision={precision!r} indexer requires " f"qhead_per_kv_head=32 or 64, got {qhead_per_kv_head}")
 
 
 _compile_cache: dict = {}
@@ -472,15 +470,8 @@ def indexer_fwd_compress_topk(
     _validate_indexer_qhead_per_kv_head(qhead_per_kv_head, precision)
     if n_heads_kv != 1:
         raise ValueError("compress-logits top-k currently requires n_heads_kv=1 (MQA); " f"got n_heads_kv={n_heads_kv}. The stage-1 GEMM reads only KV head 0.")
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
-        if m_block_size == 128:
-            m_block_size = qhead_per_kv_head * 2
-        else:
-            raise ValueError(
-                "SM100 compressed indexer forward supports at most 2 q tokens "
-                f"per tile; got m_block_size={m_block_size}, "
-                f"qhead_per_kv_head={qhead_per_kv_head}"
-            )
+    if precision == "bf16":
+        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     _check_q_covered_by_k(seqlen_q, seqlen_k, ratio)
@@ -1355,15 +1346,8 @@ def _indexer_fwd_compress_topk_thd(
             sf_groups=_ceil_div(head_dim, sf_vec_size),
             device=device,
         )
-    if precision == "bf16" and m_block_size // qhead_per_kv_head > 2:
-        if m_block_size == 128:
-            m_block_size = qhead_per_kv_head * 2
-        else:
-            raise ValueError(
-                "SM100 compressed indexer forward supports at most 2 q tokens "
-                f"per tile; got m_block_size={m_block_size}, "
-                f"qhead_per_kv_head={qhead_per_kv_head}"
-            )
+    if precision == "bf16":
+        m_block_size = _resolve_m_block_size(m_block_size, qhead_per_kv_head, head_dim, compressed=True, path="SM100 compressed indexer forward")
     if m_block_size % qhead_per_kv_head != 0:
         raise ValueError(f"m_block_size ({m_block_size}) must be divisible by " f"qhead_per_kv_head ({qhead_per_kv_head})")
     cu_q32 = cu_seqlens_q.to(torch.int32)

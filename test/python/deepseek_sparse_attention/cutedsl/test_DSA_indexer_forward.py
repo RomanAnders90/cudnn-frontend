@@ -110,6 +110,8 @@ def test_DSA_indexer_forward_wrapper(
     )
     if torch.cuda.get_device_capability()[0] not in (9, 10):
         pytest.skip("Indexer forward requires Hopper or Blackwell")
+    if torch.cuda.get_device_capability()[0] == 9 and qhead_per_kv_head < 16:
+        pytest.skip("the SM90 indexer forward serves qhead_per_kv_head 16 / 32 / 64; the 4 / 8 groups are SM100-family cells")
     q, k, w = _allocate_inputs(cfg, weight_dtype)
     q_causal_offsets = torch.full((cfg["b"],), 4, dtype=torch.int32, device=q.device)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -145,7 +147,7 @@ def test_DSA_indexer_forward_wrapper_qh16_causal_block_boundary():
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    _require_sm90()
+    _require_sm90()  # return_lse=True: the SM100 dense path does not expose LSE
     device = torch.device("cuda")
     b, s_q, s_k, h_q, h_kv, d = 1, 8, 128, 16, 1, 128
     ratio = 4
@@ -330,9 +332,7 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute, wei
     except ImportError:
         pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
 
-    if h_q == 16:
-        _require_sm90()
-    elif torch.cuda.get_device_capability()[0] not in (9, 10):
+    if torch.cuda.get_device_capability()[0] not in (9, 10):
         pytest.skip("Requires Hopper or Blackwell")
     device = torch.device("cuda")
     shapes = [(1, 1), (3, 7), (7, 67), (11, 70)]
