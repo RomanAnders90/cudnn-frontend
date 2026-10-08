@@ -415,6 +415,58 @@ def test_DSA_indexer_forward_wrapper_thd_varlen_tails(h_q, ratio, recompute, wei
 
 
 @pytest.mark.L0
+@torch_fork_set_rng(seed=73)
+@pytest.mark.parametrize("h_q", [4, 8])
+def test_DSA_indexer_forward_wrapper_mxfp8_small_head_groups_match_dequant_reference(h_q):
+    """The DENSE MXFP8 scorer at 4 / 8 heads per KV head (a decode selector's shape: a few query rows, the 128-row tile
+    mostly padding): random per-32 E8M0 scales, per-batch causal offsets, a key length that is not a multiple of the
+    key tile, against the fp64 reference on the dequantized values."""
+    try:
+        from cudnn import DSA
+    except ImportError:
+        pytest.skip("Environment not supported: cudnn[cutedsl] not installed")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("MXFP8 indexer forward requires SM100+")
+    scale_utils = pytest.importorskip("cudnn.deepseek_sparse_attention.utils.sm100.mxfp8_scale_utils")
+
+    device = torch.device("cuda")
+    b, s_q, s_k, d = 3, 37, 200, 128
+    ratio = 4
+    q_ref = torch.randn(b, s_q, h_q, d, dtype=torch.bfloat16, device=device)
+    k_ref = torch.randn(b, s_k, 1, d, dtype=torch.bfloat16, device=device)
+    w = torch.randn(b, s_q, h_q, dtype=torch.bfloat16, device=device).abs() * 0.1
+    q_scale_logical = make_random_mxfp8_scale((b, s_q, h_q, d // 32), device=device, seed=79 + h_q, exponent_min=-2, exponent_max=3)
+    k_scale_logical = make_random_mxfp8_scale((b, s_k, 1, d // 32), device=device, seed=83 + h_q, exponent_min=-2, exponent_max=3)
+    q = quantize_mxfp8(q_ref, q_scale_logical)
+    k = quantize_mxfp8(k_ref, k_scale_logical)
+    q_deq = q.float() * expand_mxfp8_scale(q_scale_logical, d)
+    k_deq = k.float() * expand_mxfp8_scale(k_scale_logical, d)
+    q_causal_offsets = torch.tensor([0, 300, 4 * s_k - s_q], dtype=torch.int32, device=device)
+
+    result = DSA.indexer_forward_wrapper(
+        q,
+        k,
+        w,
+        ratio=ratio,
+        qhead_per_kv_head=h_q,
+        q_causal_offsets=q_causal_offsets,
+        precision="mxfp8",
+        q_scale=scale_utils.pack_q_scale_bshd(q_scale_logical, qhead_per_kv_head=h_q),
+        k_scale=scale_utils.pack_k_scale_bshd(k_scale_logical),
+    )
+    torch.cuda.synchronize()
+
+    ref = ref_indexer_forward(q_deq, k_deq, w, ratio, q_causal_offsets=q_causal_offsets, compute_dtype=torch.float64)  # fp32 of an fp64 value
+    scores = result["scores"]
+    assert scores.shape == (b, s_q, s_k)
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isneginf(scores), ~finite)
+    torch.testing.assert_close(scores[finite], ref[finite], atol=2e-3, rtol=2e-3)
+    # the third sequence's last row sees every key; the first sequence's first three rows see none
+    assert bool(finite[2, -1].all()) and bool((~finite[0, :3]).all())
+
+
+@pytest.mark.L0
 def test_DSA_indexer_forward_wrapper_mxfp8_requires_mqa():
     try:
         from cudnn import DSA
