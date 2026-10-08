@@ -5668,7 +5668,7 @@ class GatedAttentionBlockFwd(APIBase):
             sfk = _view(workspace, ws.sf_k, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
             sfv = _view(workspace, ws.sf_v, (_sf_slot_bytes(self.batch, g.h_kv, self.seq_len, g.d_head),), torch.uint8)
 
-        o_q, o_g, o_k, o_v = g.qkvg_offsets
+        o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]  # the four DENSE bands; a five-band (indexer) slab's band is never an SDPA operand
         # Column slices of the fused projection, as strided views. Every consumer
         # addresses these strides natively -- no repack anywhere (Rule 2).
         q_src = _cols(proj, o_q, g.h_q, g.d_head)
