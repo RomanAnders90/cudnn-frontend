@@ -302,8 +302,9 @@ _E4M3 = torch.float8_e4m3fn
 _UNIT_QUANT = QuantSpec(descale_h=1.0, descale_w_qkvg=1.0, descale_w_o=1.0, scale_q=1.0, scale_k=1.0, scale_v=1.0, scale_o=1.0)
 
 # (geometry overrides, QsaSpec, block kwargs, sample dtype, exception, match) -- one row per typed decline of the sparse path.
+# The row ``thd`` (NotImplementedError "thd=True") INVERTED on 2026-10-08 into test_thd_under_qsa_declares_the_packed_sparse_stage
+# when the block's sparse stage bound packed operands; the two THD compositions the core does not carry keep their rows below.
 _DECLINES = [
-    pytest.param({}, QsaSpec(), dict(thd=True, num_sequences=1, max_seq_len=8), torch.bfloat16, NotImplementedError, "thd=True", id="thd"),
     pytest.param({}, QsaSpec(), dict(save_for_backward=True), torch.bfloat16, NotImplementedError, "save_for_backward=True", id="training"),
     pytest.param({}, QsaSpec(), dict(quant=_UNIT_QUANT), _E4M3, NotImplementedError, "quantized pipelines", id="quant"),
     pytest.param({}, QsaSpec(), dict(fuse_gate=True), torch.bfloat16, NotImplementedError, "fuse_gate=True", id="fuse_gate"),
@@ -326,6 +327,25 @@ _DECLINES = [
         {}, QsaSpec(index_source="indexer", index_band=True, index_heads=3), {}, torch.bfloat16, NotImplementedError, "head groups", id="indexer_heads"
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
+    # THD composed with what the core does not carry under packed sequences: the in-block indexer, the paged write-through
+    pytest.param(
+        {},
+        QsaSpec(index_source="indexer", index_band=True),
+        dict(thd=True, num_sequences=1, max_seq_len=8),
+        torch.bfloat16,
+        NotImplementedError,
+        "packed-sequence form",
+        id="indexer_x_thd",
+    ),
+    pytest.param(
+        {},
+        QsaSpec(),
+        dict(thd=True, num_sequences=1, max_seq_len=8, paged_kv_page_size=16),
+        torch.bfloat16,
+        NotImplementedError,
+        "paged_kv_page_size with thd=True",
+        id="write_through_x_thd",
+    ),
     pytest.param(dict(is_causal=False), QsaSpec(), {}, torch.bfloat16, ValueError, "is_causal=True", id="bidirectional"),
     pytest.param(dict(window_left=64), QsaSpec(), {}, torch.bfloat16, ValueError, "sliding window", id="window"),
     pytest.param({}, QsaSpec(top_k=516), {}, torch.bfloat16, ValueError, "top_k", id="top_k_516"),
@@ -350,6 +370,66 @@ def test_declaration_declines_every_sparse_request_it_cannot_serve(geom_kw, qsa,
             GatedAttentionBlockFwd(**kw_d, geometry=dense, **blk_kw)
         except (NotImplementedError, ValueError) as e:  # a dense decline of its own is fine; the sparse wording is not
             assert "QsaSpec" not in str(e)
+
+
+def test_thd_under_qsa_declares_the_packed_sparse_stage():
+    """INVERTED 2026-10-08 (the ``thd`` row of ``_DECLINES`` until the block's sparse stage bound packed operands): a ``QsaSpec``
+    block declared ``thd=True`` CONSTRUCTS (no host sync) with its sparse stage in the packed form -- internally ``batch 1,
+    seq_len T``, the SAME ``[1, T, H, D]`` operand descriptors the dense arm declares (the slab column slice at the token
+    stride), ONE lengths descriptor of exactly ``num_sequences`` (``num_sequences + 1`` under ``cu_seqlens``) int32 entries
+    bound to BOTH length sides, the flat ``[T, top_k]`` list and the head-major ``[1, H_q, T]`` LSE -- at both packed input
+    ranks; a dense declaration carries neither length descriptor; the block's own packed contract still holds
+    (``seq_lens_present`` exclusive, the knobs refused without ``thd``); the stage's own guards hold without the block; the
+    two compositions the core does not carry under packed sequences stay typed declines naming the feature (rows of
+    ``_DECLINES``: the in-block indexer, the paged write-through)."""
+    geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
+    t, top_k, b = 16, geom.qsa.top_k, 3
+    with _no_host_sync():
+        for cu, rank2 in ((False, False), (True, True)):
+            kw = _samples(geom, batch=1, seq_len=t)
+            if rank2:
+                for nm in ("sample_h", "sample_cos", "sample_sin", "sample_out"):
+                    kw[nm] = kw[nm][0]
+            blk = GatedAttentionBlockFwd(**kw, geometry=geom, thd=True, num_sequences=b, max_seq_len=8, cu_seqlens=cu, return_lse=True)
+            st = blk._sdpa
+            assert isinstance(st, _SparseSdpa) and st.thd and st.cu_seqlens == cu and (st.num_sequences, st.max_seq_len) == (b, 8)
+            assert (blk.batch, blk.seq_len, blk.thd) == (1, t, True) and not st.seq_lens_present
+            ops = st._operands()
+            assert ops["q"].shape == (1, t, geom.h_q, geom.d_head) and ops["o"].shape == (1, t, geom.h_q, geom.d_head)
+            assert ops["k"].shape == ops["v"].shape == (1, t, geom.h_kv, geom.d_head)
+            assert ops["q"].stride() == (t * geom.n_qkvg, geom.n_qkvg, geom.d_head, 1)  # the slab column slice, in place
+            n = b + int(cu)
+            assert ops["seq_q_lens"].shape == ops["seq_kv_lens"].shape == (n,) and str(ops["seq_q_lens"].dtype) == "torch.int32"
+            assert ops["block_ids"].shape == (t, top_k) and ops["block_lens"].shape == (t,) and ops["lse"].shape == (1, geom.h_q, t)
+        dense = GatedAttentionBlockFwd(**_samples(geom, batch=1, seq_len=t), geometry=geom)
+        ops_d = dense._sdpa._operands()
+        assert not dense._sdpa.thd and ops_d["seq_q_lens"] is None and ops_d["seq_kv_lens"] is None
+        # the block's own packed contract, unchanged under QsaSpec
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            GatedAttentionBlockFwd(**_samples(geom, batch=1, seq_len=t), geometry=geom, thd=True, num_sequences=b, max_seq_len=8, seq_lens_present=True)
+        with pytest.raises(ValueError, match="THD-only"):
+            GatedAttentionBlockFwd(**_samples(geom, batch=1, seq_len=t), geometry=geom, num_sequences=b)
+        # the stage's own guards (it stays honest without the block): the packed form is batch 1, the sequence count is a
+        # declaration fact, the two length contracts are exclusive, the knobs are THD-only, and a launch without the
+        # lengths or the metadata arm is refused BEFORE the adapter is touched
+        st_kw = dict(dtype=torch.bfloat16, device=_DEV, want_lse=True)
+        with pytest.raises(ValueError, match="batch 1"):
+            _SparseSdpa(geom, batch=2, seq_len=8, thd=True, num_sequences=2, **st_kw)
+        with pytest.raises(ValueError, match="num_sequences >= 1"):
+            _SparseSdpa(geom, batch=1, seq_len=t, thd=True, **st_kw)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _SparseSdpa(geom, batch=1, seq_len=t, thd=True, num_sequences=b, seq_lens_present=True, **st_kw)
+        with pytest.raises(ValueError, match="THD-only"):
+            _SparseSdpa(geom, batch=1, seq_len=t, cu_seqlens=True, **st_kw)
+        st = _SparseSdpa(geom, batch=1, seq_len=t, thd=True, num_sequences=b, **st_kw)
+        st._impl, st._compiled = object(), True  # the guards run ahead of any adapter call
+        z = lambda *shape, dt=torch.bfloat16: torch.zeros(*shape, dtype=dt, device=_DEV)  # noqa: E731
+        q, kv, o = z(1, t, geom.h_q, geom.d_head), z(1, t, geom.h_kv, geom.d_head), z(1, t, geom.h_q, geom.d_head)
+        ids, lse, lens = z(t, top_k, dt=torch.int32), z(1, geom.h_q, t, dt=torch.float32), z(b, dt=torch.int32)
+        with pytest.raises(ValueError, match="requires seq_lens"):
+            st.execute(q, kv, kv, o, lse=lse, workspace=z(64, dt=torch.uint8), block_ids=ids)
+        with pytest.raises(ValueError, match="requires workspace"):
+            st.execute(q, kv, kv, o, lse=lse, seq_lens=lens, block_ids=ids)
 
 
 def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contract_flips():
@@ -559,8 +639,9 @@ def _record():
 def test_the_api_constants_and_the_block_declines_read_the_sparse_record():
     """The block transcribes NOTHING of the sparse core's claims: the API's list constants agree with the record (a drift
     is a test failure, not a silent narrowing); the dtype / head-dim / GQA / block-size / top_k declines come from the
-    record's fields (a request at each bound is served iff the record says so); the THD / gate / bottom-right declines name
-    the record's state; and ``_SparseSdpa`` reads the same record object the adapter enforces."""
+    record's fields (a request at each bound is served iff the record says so); the gate / bottom-right declines name the
+    record's state and the THD arm constructs because the record claims it (and declines naming the record where it does
+    not); and ``_SparseSdpa`` reads the same record object the adapter enforces."""
     from cudnn.gated_attention_block.api import _check_qsa_geometry_against_record, _sparse_record, _sparse_record_torch_dtypes
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
@@ -586,18 +667,22 @@ def test_the_api_constants_and_the_block_declines_read_the_sparse_record():
     # top_k: every multiple of 4 in the record's range is served; the API's validator and the record agree on the bounds.
     for top_k in (rec.index_top_k_min, 64, rec.index_top_k_max):
         _check_qsa_geometry_against_record(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(top_k=top_k)), torch.bfloat16)
-    # The three arm declines of the declaration name the record's state (today: declined by the record).
-    kw = _samples(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec()))
+    # The arm declines of the declaration read the record's state: an arm the record claims AND the stage binds CONSTRUCTS
+    # (THD, since 2026-10-08); an arm the record does not claim declines naming the record; a claimed arm the stage does not
+    # bind yet names that instead.
     for blk_kw, geom_kw, field in (
         (dict(thd=True, num_sequences=1, max_seq_len=8), {}, "thd"),
         (dict(fuse_gate=True), {}, "epilogue_gate"),
         ({}, dict(causal_bottom_right=True), "bottom_right"),
     ):
         geom = GatedAttentionBlockGeometry(**{**_SMALL_D256, **geom_kw}, qsa=QsaSpec())
+        if field == "thd" and rec.thd:
+            blk = GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
+            assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd
+            continue
         with pytest.raises(NotImplementedError) as e:
             GatedAttentionBlockFwd(**_samples(geom), geometry=geom, **blk_kw)
         assert ("the sparse adapter's record declines" in str(e.value)) == (not getattr(rec, field)), (field, str(e.value))
-    del kw
 
 
 def _adapter_request(**over):
@@ -626,7 +711,8 @@ def test_adapter_accept_decline_set_equals_the_record():
     """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
     the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
     arm's own operands -- the paged read's pools, table and lengths; THD's two length descriptors of a one-sequence packing on
-    the batch-extent-1 operands; an unclaimed arm's request is a typed decline naming the arm); the served baseline (dense BSHD
+    the batch-extent-1 operands, in the ``[B]`` and, for ``cu_seq_len``, the ``[B + 1]`` form; an unclaimed arm's request is a
+    typed decline naming the arm); the served baseline (dense BSHD
     bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with the public ``sm_107a`` DSL (the cc is handed
     in, nothing is launched)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
@@ -647,6 +733,14 @@ def test_adapter_accept_decline_set_equals_the_record():
     )
     arms = {
         "thd": dict(thd=True, seq_q_lens=SparseOperandDesc((1,), (1,), torch.int32), seq_kv_lens=SparseOperandDesc((1,), (1,), torch.int32)),
+        # the [B + 1] prefix-sum form of the THD lengths (the record's cu_seq_len, reached through thd)
+        "cu_seq_len": dict(
+            thd=True,
+            cu_seq_q_lens=True,
+            cu_seq_kv_lens=True,
+            seq_q_lens=SparseOperandDesc((2,), (1,), torch.int32),
+            seq_kv_lens=SparseOperandDesc((2,), (1,), torch.int32),
+        ),
         "paged_kv": paged,
         "epilogue_gate": dict(epilogue_gate=object()),
         "split_kv": dict(split_kv=2),

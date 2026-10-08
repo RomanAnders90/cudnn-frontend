@@ -1013,7 +1013,7 @@ red (2026-09-08).
 | Split-KV | f16/bf16 + per-tensor fp8, envelopeᵛⁱⁱ | denseᵛⁱⁱ; half THD | denseᵛⁱⁱ; half nonpaged THD | half paged THD, CGA2; the decode tile's dense (unpadded) / paged split, packed or not (fp32 partials + the shared combine, `choose_decode_tile_split_kv`)ᵈʳ | ❌ᵛⁱⁱ | — |  —  |
 | Paged KV (half THD, no sink) | envelope | ✅ | ❌ | ✅, including unpacked split; decode-shaped dense Q on the decode tile, sink, PackGQA and split includedᵈʳ | ❌ | — | — |
 | Fused epilogue gate (sdpa virtual `O_v` → `mul(O_v, sigmoid(G))`, `G = (B, H_q, S_q, D_v)`; graph tail + standalone `sample_gate`)ᵛⁱⁱⁱ | ❌ | ❌ | ❌ | f16/bf16 ✅ (+ on the d256 decode tile's SPLIT the gate is applied by the combine: dense or paged, packed or notᵈʳ) · fp8 ✅ (bf16 G) · mxfp8 ✅ (bf16 G; a gated e4m3 O is unscaled) | ❌ | — |  —  |
-| Index-list sparse attention (`QsaSpec`: per-query lists of 4-token KV blocks + the open tail; frontend-only -- the gated attention block's sparse stage and the standalone adapter, no graph form; the `SM107 d256 index-list sparse forward` section below) | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense BSHD, or paged K / V pools through the standalone adapter; per-batch KV lengths; GQA group 1..16; `top_k` 4..512) | ❌ | ❌ |  ❌  |
+| Index-list sparse attention (`QsaSpec`: per-query lists of 4-token KV blocks + the open tail; frontend-only -- the gated attention block's sparse stage and the standalone adapter, no graph form; the `SM107 d256 index-list sparse forward` section below) | ❌ | ❌ | ❌ | f16/bf16 ✅ (dense BSHD or packed THD sequences -- through the gated attention block and the standalone adapter --, or paged K / V pools through the standalone adapter; per-batch KV lengths; GQA group 1..16; `top_k` 4..512) | ❌ | ❌ |  ❌  |
 | Optional stats (LSE store compiled out) | ✅ | ✅ | ✅ | ✅ | ✅ | — |  —  |
 | Bias | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |  ❌  |
 | Ragged `S_kv` (non-multiple of 128) | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ⁱˣ | ✅ᵇ (any S_q / S_kv on every row, every mask; padded to 128 / 256; the mxfp8 row also re-stages the scale-factor pads zero-filledᵐˣ) |  ✅ (any S_q / S_kv; padded to 256 / 128 and masked)  |
@@ -1937,7 +1937,7 @@ still declines THD (the wrapper's `cu_seqlen` path serves it).
 
 | Missing | Where |
 |---|---|
-| Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), the block's paged-READ mode (`block_table` / `kv_lens` through the gated attention block), the fused epilogue gate, split-KV, bottom-right, a sink, a band, Q-length trimming of a dense batch, log2 stats, the decode form; THD through the BLOCK (the standalone adapter serves it, the block's sparse stage does not bind packed operands yet); THD and paged pools in ONE declaration | SM107 — frontend-only: the gated attention block's sparse stage (`GatedAttentionBlockGeometry(qsa=QsaSpec(...))`, `execute(block_ids=, block_lens=)`) and the standalone `sparse_gqa_sm107` adapter serve dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths; the standalone adapter also reads paged K / V pools (`paged_kv=True`: `[num_pages, H_kv, page_size, D]` HND compact or NHD by strides, one `(B, max_pages)` block table, `page_size` a positive multiple of 4, per-batch lengths required) and serves packed THD sequences (`thd=True`: per-sequence or cumulative lengths, sequence-relative block ids) -- one of the two per declaration (`thd=True` with `paged_kv=True` is a typed decline); every other arm is a typed decline by name (see the SM107 index-list section below) |
+| Index-list (block-sparse) forward: a GRAPH form (no `sdpa` node carries a block-index list), the block's paged-READ mode (`block_table` / `kv_lens` through the gated attention block), the fused epilogue gate, split-KV, bottom-right, a sink, a band, Q-length trimming of a dense batch, log2 stats, the decode form; THD together with the in-block indexer or the paged write-through (through the block); THD and paged pools in ONE declaration | SM107 — frontend-only: the gated attention block's sparse stage (`GatedAttentionBlockGeometry(qsa=QsaSpec(...))`, `execute(block_ids=, block_lens=)`) and the standalone `sparse_gqa_sm107` adapter serve dense BSHD bf16 / f16, d = 256, caller lists at `top_k` in [4, 512] (multiples of 4), query-head groups 1..16, per-batch KV lengths, and packed THD sequences (`thd=True`: per-sequence `[B]` or cumulative `[B + 1]` lengths (`cu_seq_len`), sequence-relative block ids; through the block `GatedAttentionBlockFwd(thd=True, num_sequences=, max_seq_len=, cu_seqlens=)` + `execute(seq_lens=, block_ids=)`); the standalone adapter also reads paged K / V pools (`paged_kv=True`: `[num_pages, H_kv, page_size, D]` HND compact or NHD by strides, one `(B, max_pages)` block table, `page_size` a positive multiple of 4, per-batch lengths required) -- one of the two arms per declaration (`thd=True` with `paged_kv=True` is a typed decline); every other arm is a typed decline by name (see the SM107 index-list section below) |
 | Backward pass entirely | SM90 |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (per-tensor FP8 E4M3 and block-scale MXFP8 E4M3): every other head dim; and on the d256 rows the dense GRAPH padding mask (per-batch kv lengths ride every row's standalone adapter), sink / dSink, bias / dBias, deterministic, `dense_flex`, right-band widening, decode; on the MXFP8 row also fp16 gradients and the `amax_dQ/dK/dV` outputs; on the d512 row THD, `dense_flex`, the dense padding mask, sink / dSink, bias / dBias, deterministic, decode | SM107 — the three d256 rows plus the d512 2x2-datapath row (`sdpa_bwd_sm107_d512`, opt_in, since 2026-10-01) are the whole Rubin backward (see the SM107 table, ᵇ ᵐˣ and ᵇ³) |
 | Backward outside d ∈ (256, 512] ∪ {256} (f16/bf16) or d = 256 (MXFP8) | SM100, SM103 — the three backward engines there serve exactly those bands (f16/bf16 d = 256 via the 2x2-datapath row ᵇ², opt_in, since 2026-10-01) |
@@ -2175,19 +2175,28 @@ same tokens through a paged pool and through a dense tensor produce BITWISE the 
 page 16 / 64 / 48, NHD and HND, bf16 and f16, B = 2 with different lengths and lists).  The gated attention block's paged-READ
 mode (`block_table` / `kv_lens` at `execute`) stays a typed decline until the decode form lands.
 
-Served since 2026-10-08, standalone adapter only (`thd=True`): packed THD sequences — Q / O `[1, T_q, H, 256]`, K / V `[1, T_kv,
-H_kv, 256]` (capacities; the live totals are device values), `block_ids` `[T_q, top_k]` with ids RELATIVE TO THEIR SEQUENCE,
-`seq_q_lens` and `seq_kv_lens` as per-sequence lengths `[B]` or cumulative `[B + 1]` (`cu_seq_q_lens` / `cu_seq_kv_lens`), LSE
-`(1, H, T_q)`, a `workspace` of `scratch_workspace_bytes()` for the shared THD metadata (`[seq_kv_lens | cu_q | cu_k | remap |
-live | ctr]`, written by the dense forwards' setup launch); the kernel runs the persistent claim-counter scheduler (one unit per
-packed token per KV head, the gather row carries `cu_k[b]`); a sequence with `S_kv_b = 0` is dead (`O = 0` / `LSE = -inf`
-stored), an empty sequence contributes no work, a one-sequence packing is bitwise the dense `B = 1` run.  The gated attention
-block's sparse stage still declines `thd=True` under `QsaSpec` (it does not bind packed operands yet; the decline names the
-record's state).  `thd=True` together with `paged_kv=True` is a typed decline (the packed sequence's K / V row offset `cu_k[b]`
-composes with a dense `[1, T_kv, H_kv, D]` tensor only, never with a page pool; the combination lands with its own accept cells
-when a serving stack asks for it).
+Served since 2026-10-08 (`thd=True`; the standalone adapter, and the gated attention block since the same day): packed THD
+sequences — Q / O `[1, T_q, H, 256]`, K / V `[1, T_kv, H_kv, 256]` (capacities; the live totals are device values), `block_ids`
+`[T_q, top_k]` with ids RELATIVE TO THEIR SEQUENCE, `seq_q_lens` and `seq_kv_lens` as per-sequence lengths `[B]` or cumulative
+`[B + 1]` (`cu_seq_q_lens` / `cu_seq_kv_lens`; the record's `cu_seq_len`), LSE `(1, H, T_q)`, a `workspace` of
+`scratch_workspace_bytes()` for the shared THD metadata (`[seq_kv_lens | cu_q | cu_k | remap | live | ctr]`, written by the dense
+forwards' setup launch); the kernel runs the persistent claim-counter scheduler (one unit per packed token per KV head, the
+gather row carries `cu_k[b]`); a sequence with `S_kv_b = 0` is dead (`O = 0` / `LSE = -inf` stored), an empty sequence
+contributes no work, a one-sequence packing is bitwise the dense `B = 1` run.  Through the gated attention block
+(`GatedAttentionBlockFwd(thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=)` on a `QsaSpec` geometry; `execute(seq_lens=,
+block_ids=)`): the block is internally `B = 1, S = T`, its sparse stage binds the same `[1, T, H, D]` views the dense arm binds,
+ONE lengths tensor serves both sides (self-attention), `block_ids` `[T, top_k]` carries each token's blocks numbered from its own
+sequence's first token, and the adapter's metadata rides the block's engine workspace arm (`get_workspace_size()` reports it);
+validated on Rubin per sequence against the per-sequence fp32 QSA oracle (bf16 and f16; packings with empty, 5-token and
+non-multiple-of-4 sequences; a one-sequence packing BITWISE the dense `B = 1` sparse block;
+`test/python/gated_attention_block/cutedsl/test_block_qsa_end_to_end.py`).  `thd=True` together with `paged_kv=True` is a typed
+decline (the packed sequence's K / V row offset `cu_k[b]` composes with a dense `[1, T_kv, H_kv, D]` tensor only, never with a
+page pool; the combination lands with its own accept cells when a serving stack asks for it); through the block, `thd=True`
+together with the in-block indexer (`index_source="indexer"`: the scorer reads dense `[B, S]` prompts) or with the paged
+write-through (`paged_kv_page_size`) stays a typed decline naming the feature.
 
-Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): THD through
-the block (above), the block's paged-read mode, THD and paged pools in one declaration, the fused epilogue gate, split-KV,
-bottom-right, a sink, a sliding window / band, Q-length trimming of a dense batch, log2 stats, a pure caller list without the
-tail, one list per sequence (the decode / MTP form), head dims other than 256, FP8 / MXFP8.
+Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): the block's
+paged-read mode, THD and paged pools in one declaration, THD with the in-block indexer or the paged write-through (through the
+block), the fused epilogue gate, split-KV, bottom-right, a sink, a sliding window / band, Q-length trimming of a dense batch,
+log2 stats, a pure caller list without the tail, one list per sequence (the decode / MTP form), head dims other than 256,
+FP8 / MXFP8.

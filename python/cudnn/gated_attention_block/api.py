@@ -263,10 +263,13 @@ the :class:`SavedForBackward` contract is unchanged (``seq_lens`` REQUIRED and
 ``seq_lens_form`` naming its form).  ``cos`` / ``sin`` are PER-TOKEN tables whose
 positions restart at every sequence; the caller packs them.  Served: bf16 / fp16
 (inference and training), the UNFUSED per-tensor FP8 pipeline, ``fuse_norm_rope``
-for bf16 / fp16 inference.  Typed declines: ``fuse_gate`` (the SDPA's epilogue
-gate has no THD gate descriptor), MXFP8 and the fp4 modes that ride it (no packed
-per-sequence scale-factor layout), ``seq_lens_present`` (the two length contracts
-are mutually exclusive).  The lengths are device data, never read on the host:
+for bf16 / fp16 inference, block-sparse attention (``QsaSpec`` with caller lists:
+``block_ids`` ``[T, top_k]`` with every id relative to the token's OWN sequence,
+the sparse core's packed arm over the same views).  Typed declines: ``fuse_gate``
+(the SDPA's epilogue gate has no THD gate descriptor), MXFP8 and the fp4 modes
+that ride it (no packed per-sequence scale-factor layout), ``seq_lens_present``
+(the two length contracts are mutually exclusive), the in-block indexer and the
+paged write-through under ``QsaSpec``.  The lengths are device data, never read on the host:
 the caller's contract is every length in ``[0, max_seq_len]`` and
 ``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
 the gate and the backward's weight-gradient GEMMs read every one of the ``T``
@@ -3877,13 +3880,28 @@ class _SparseSdpa(_Stage):
     so unlike :class:`_Sdpa` there is no transpose -- plus the index tensors (a ``[B, S, top_k]`` list is viewed flat: an
     exact view of a contiguous tensor, no copy).  ``block_lens`` is optional PER CALL, so :meth:`compile` builds BOTH
     ``has_block_lens`` variants at plan time and the adapter dispatches on the tensor it is handed (plan-time keys only,
-    Rule 4).  The kernel carries no GMEM scratch (the count, the tail block and the dead items are derived on device), so
-    :meth:`scratch_workspace_bytes` folds 0 into the block's workspace -- a ``QsaSpec`` block's workspace is the dense one.
+    Rule 4).  The dense kernel carries no GMEM scratch (the count, the tail block and the dead items are derived on
+    device), so :meth:`scratch_workspace_bytes` folds 0 into the block's workspace -- a dense ``QsaSpec`` block's workspace
+    is the dense block's.
+
+    **THD / packed sequences (``thd=True``)**: the adapter's packed arm (the kernel's persistent claim-counter form).  The
+    block is internally ``B = 1, S = T``, and the adapter's packed contract IS that shape -- Q / O ``[1, T, H, D]``, K / V
+    ``[1, T, H_kv, D]`` with batch extent 1, the token totals as CAPACITIES -- so ``execute`` binds the very same views the
+    dense arm binds (no transpose, no copy; the slab column slice keeps its token stride).  ``execute(seq_lens=)`` is
+    REQUIRED and serves BOTH length sides (self-attention): the ``[B]`` int32 lengths or the ``[B+1]`` int32 prefix sums
+    (``cu_seqlens=True``), declared as ``seq_q_lens`` / ``seq_kv_lens`` descriptors of exactly that extent and never read
+    on the host (the setup launch normalizes them on device).  ``block_ids`` keeps its ``[T, top_k]`` form with every id
+    RELATIVE TO ITS SEQUENCE (block ``j`` of sequence ``b`` = its tokens ``[4j, 4j + 4)``); the LSE is the head-major packed
+    ``[1, H_q, T]`` the block already carries at ``B = 1``.  The ONE scratch the arm needs -- the adapter's int32 THD
+    metadata (``THD_META_WORDS(B)``, 16-byte rounded) -- enters the block's engine arm through
+    :meth:`scratch_workspace_bytes` and is handed back at ``execute(workspace=)``.  A one-sequence packing computes the
+    dense ``B = 1`` function bitwise; an empty sequence owns no rows.
 
     Not here (typed declines at the block's declaration, each naming its feature): ``fuse_gate`` -- the sparse core's
-    epilogue-gate operand is not bound through this stage yet; THD -- the packed arm; ``causal_bottom_right`` -- the
-    decode / verify form; the quantized pipelines and training.  Each lands by flipping the record, the adapter AND this
-    stage in the same change; the declaration decline names the record's state so the flip is visible.
+    epilogue-gate operand is not bound through this stage yet; ``causal_bottom_right`` -- the decode / verify form; the
+    quantized pipelines and training; THD together with the in-block indexer (the scorer reads dense ``[B, S]`` prompts)
+    and THD together with the paged write-through.  Each lands by flipping the record, the adapter AND this stage in the
+    same change; the declaration decline names the record's state so the flip is visible (``thd`` flipped 2026-10-08).
     """
 
     name = "sdpa_sparse"
@@ -3900,6 +3918,10 @@ class _SparseSdpa(_Stage):
         seq_lens_present: bool = False,
         token_stride: int = 0,
         gate_token_stride: int = 0,
+        thd: bool = False,  # packed sequences: batch=1, seq_len=T; the adapter's THD arm (see the class docstring)
+        num_sequences: Optional[int] = None,  # THD: B, the length tensor's [B] (or [B+1] prefix-sum) entries
+        max_seq_len: Optional[int] = None,  # THD: S_max, the longest sequence the block admits (recorded; the core derives on device)
+        cu_seqlens: bool = False,  # THD: seq_lens is [B+1] int32 prefix sums (True) or [B] int32 lengths (False)
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
@@ -3914,6 +3936,25 @@ class _SparseSdpa(_Stage):
         # adapter validates the stride contract on the declaration).  0 => the compact buffers.
         self.token_stride = int(token_stride)
         self.gate_token_stride = int(gate_token_stride)  # carried for the gate arm's block half (the slab's GATE columns)
+        # THD (packed sequences).  The block validates the whole contract (typed, in order) before building this stage; the
+        # checks here keep the STAGE honest on its own: the sequence count must be declared (the lengths' extent is a
+        # declaration fact the adapter binds exactly), the two length contracts are exclusive, and the record's claim is
+        # read, never assumed -- a record that drops the arm declines here by name (the declaration's decline reads the same).
+        self.thd = bool(thd)
+        self.cu_seqlens = bool(cu_seqlens)
+        self.num_sequences = None if num_sequences is None else int(num_sequences)
+        self.max_seq_len = None if max_seq_len is None else int(max_seq_len)
+        if self.thd:
+            if self.batch != 1:
+                raise ValueError(f"{self.name}: thd=True is the packed form -- batch 1, seq_len T; got batch={self.batch}")
+            if self.num_sequences is None or self.num_sequences < 1:
+                raise ValueError(f"{self.name}: thd=True needs num_sequences >= 1 (the length tensor's [B] / [B+1] extent the adapter binds)")
+            if self.seq_lens_present:
+                raise ValueError(f"{self.name}: thd=True and seq_lens_present=True are mutually exclusive (the packed lengths ARE the per-sequence lengths)")
+            if not self._record().thd:
+                raise NotImplementedError(f"{self.name}: thd=True -- the sparse adapter's record declines THD (the kernel body does not carry the packed arm)")
+        elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
+            raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
         self._impl = None
         self._compiled = False
 
@@ -3934,6 +3975,9 @@ class _SparseSdpa(_Stage):
         def bshd(h: int, ts: int) -> SparseOperandDesc:
             return SparseOperandDesc((b, s, h, d), (s * ts, ts, d, 1), self.dtype, self.device)
 
+        # THD: ONE lengths tensor of exactly num_sequences (+1 under cu_seqlens) int32 entries serves both sides; the block's
+        # execute-time form check (`_check_thd_seq_lens`) and the adapter's `_bind` both hold the caller to this extent.
+        lens = SparseOperandDesc((self.num_sequences + (1 if self.cu_seqlens else 0),), (1,), torch.int32, self.device) if self.thd else None
         return dict(
             q=bshd(g.h_q, ts_q),
             k=bshd(g.h_kv, ts_kv),
@@ -3942,7 +3986,8 @@ class _SparseSdpa(_Stage):
             block_ids=SparseOperandDesc((t, g.qsa.top_k), (g.qsa.top_k, 1), torch.int32, self.device),
             block_lens=SparseOperandDesc((t,), (1,), torch.int32, self.device),
             lse=SparseOperandDesc((b, g.h_q, s), (g.h_q * s, s, 1), torch.float32, self.device) if self.want_lse else None,
-            seq_kv_lens=SparseOperandDesc((b,), (1,), torch.int32, self.device) if self.seq_lens_present else None,
+            seq_kv_lens=lens if self.thd else (SparseOperandDesc((b,), (1,), torch.int32, self.device) if self.seq_lens_present else None),
+            seq_q_lens=lens,
         )
 
     def check_support(self) -> None:
@@ -3969,6 +4014,12 @@ class _SparseSdpa(_Stage):
             scale=g.scale,
             bottom_right=g.causal_bottom_right,
             device_cc=cc,
+            # THD: the packed arm -- both length descriptors, the lengths' FORM (a declaration fact: [B] or [B+1]); the
+            # metadata workspace is bound per call (the block's engine arm, `execute(workspace=)`).
+            thd=self.thd,
+            seq_q_lens=ops["seq_q_lens"],
+            cu_seq_q_lens=self.cu_seqlens,
+            cu_seq_kv_lens=self.cu_seqlens,
         )
         self._impl.check_support()
 
@@ -3982,8 +4033,9 @@ class _SparseSdpa(_Stage):
         self._compiled = True
 
     def scratch_workspace_bytes(self) -> int:
-        """0: the kernel has no GMEM scratch (adapter ``scratch_workspace_bytes``); folded into the block's workspace like
-        the dense stage's so the size stays honest if an arm ever grows one."""
+        """The adapter's ``scratch_workspace_bytes``: 0 on a dense declaration (the kernel has no GMEM scratch), the int32
+        THD metadata (``THD_META_WORDS(B)`` words, 16-byte rounded) under ``thd=True``; folded into the block's workspace
+        like the dense stage's so the size stays honest either way."""
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
         return int(self._impl.scratch_workspace_bytes())
@@ -3994,9 +4046,11 @@ class _SparseSdpa(_Stage):
         k: torch.Tensor,  # [B, S, H_kv, D]
         v: torch.Tensor,  # [B, S, H_kv, D]
         o: torch.Tensor,  # [B, S, H_q,  D]  compact, written
-        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32, iff declared want_lse
-        seq_lens: Optional[torch.Tensor] = None,  # [B] int32 per-batch visible KV length, iff declared seq_lens_present
-        workspace: Optional[torch.Tensor] = None,  # unused: the kernel has no GMEM scratch
+        lse: Optional[torch.Tensor] = None,  # [B, H_q, S] fp32, iff declared want_lse; THD: [1, H_q, T] (head-major packed)
+        seq_lens: Optional[
+            torch.Tensor
+        ] = None,  # [B] int32 per-batch visible KV length, iff declared seq_lens_present; THD (REQUIRED): [B] lengths / [B+1] prefix sums
+        workspace: Optional[torch.Tensor] = None,  # dense: unused (no GMEM scratch); THD (REQUIRED): the engine arm holding the packed metadata
         current_stream=None,
         gate: Optional[torch.Tensor] = None,  # refused: no fused gate on the sparse stage
         descale_q: Optional[torch.Tensor] = None,  # refused: the quantized pipelines' operands
@@ -4011,7 +4065,9 @@ class _SparseSdpa(_Stage):
     ) -> None:
         """Hand the block's BSHD views over AS THEY ARE (no transpose, no copy) plus the index tensors viewed flat.  The
         dense stage's gate / quantization operands have no sparse arm and are refused rather than ignored; the LSE and the
-        KV-length presence must match the declaration (both are compiled into the specialization)."""
+        KV-length presence must match the declaration (both are compiled into the specialization).  Under ``thd=True`` the
+        same ``[1, T, H, D]`` views ARE the adapter's packed operands; ``seq_lens`` (REQUIRED) binds both length sides and
+        ``workspace`` (REQUIRED) is the engine arm the adapter's packed metadata lands in."""
         if self._impl is None or not self._compiled:
             raise RuntimeError(f"{self.name}: call compile() before execute()")
         if gate is not None:
@@ -4020,15 +4076,24 @@ class _SparseSdpa(_Stage):
             raise ValueError(f"{self.name}: descales / scale_o / scale-factor blobs are the quantized pipelines' operands; the sparse core is bf16 / f16")
         if block_ids is None:
             raise ValueError(f"{self.name}: block_ids is required at execute (the per-query block list)")
-        if self.seq_lens_present and seq_lens is None:
-            raise ValueError(f"{self.name}: declared with seq_lens_present=True; execute needs seq_lens ([B] int32, the per-batch visible KV length)")
-        if not self.seq_lens_present and seq_lens is not None:
-            raise ValueError(f"{self.name}: seq_lens given, but this stage was declared without seq_lens_present (the KV-length presence is compiled in)")
+        if self.thd:
+            if seq_lens is None:
+                raise ValueError(f"{self.name}: thd=True requires seq_lens at execute (the packed per-sequence lengths, for the Q and the KV side alike)")
+            if workspace is None:
+                raise ValueError(f"{self.name}: thd=True requires workspace at execute (the engine arm the packed metadata is written to)")
+        else:
+            if self.seq_lens_present and seq_lens is None:
+                raise ValueError(f"{self.name}: declared with seq_lens_present=True; execute needs seq_lens ([B] int32, the per-batch visible KV length)")
+            if not self.seq_lens_present and seq_lens is not None:
+                raise ValueError(f"{self.name}: seq_lens given, but this stage was declared without seq_lens_present (the KV-length presence is compiled in)")
         if self.want_lse and lse is None:
             raise ValueError(f"{self.name}: declared with return_lse=True; execute needs lse ([B, H_q, S] fp32)")
         if not self.want_lse and lse is not None:
             raise ValueError(f"{self.name}: lse given, but this stage was declared without return_lse (the LSE presence is compiled in)")
         g, t = self.geom, self.batch * self.seq_len
+        # THD: ONE lengths tensor serves both sides (self-attention) and the metadata lands in the engine arm; the adapter
+        # holds each to its declaration (`_bind`: shape / strides / dtype) and sizes the workspace (`_check_workspace`).
+        thd_kw = dict(seq_q_lens=seq_lens, workspace=workspace) if self.thd else {}
         self._impl.execute(
             stream=current_stream,
             q=q,
@@ -4039,6 +4104,7 @@ class _SparseSdpa(_Stage):
             block_ids=block_ids.view(t, g.qsa.top_k),
             block_lens=None if block_lens is None else block_lens.view(t),
             seq_kv_lens=seq_lens,
+            **thd_kw,
         )
 
 
@@ -4631,12 +4697,14 @@ class GatedAttentionBlockFwd(APIBase):
     nothing stage (4) reads, so ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE:
     ``execute`` then REQUIRES the pools and the slot mapping and refuses them otherwise.
 
-    **Block-sparse attention (``geometry.qsa``, a :class:`QsaSpec`; bf16 / f16 inference, dense ``[B, S, d_model]``)**
-    swaps stage (4) for the index-list sparse core -- ``(4) sdpa_sparse  PROJ[Q,K,V], block_ids[, block_lens] -> O (+LSE)``,
-    ``sdpa/fwd/kernels/sm107/sparse_d256_f16.py`` through its adapter (:class:`_SparseSdpa`) -- at the same operands, the
-    same strides and the same launch count; ``execute`` then REQUIRES ``block_ids`` (``[T, top_k]`` int32: each query's
-    selected 4-token blocks, the open tail block always visible) and refuses it otherwise.  Every claim of that core is read
-    off the adapter's capabilities record, never transcribed; what the core does not serve is a typed decline at declaration.
+    **Block-sparse attention (``geometry.qsa``, a :class:`QsaSpec`; bf16 / f16 inference, dense ``[B, S, d_model]`` or
+    packed ``thd=True``)** swaps stage (4) for the index-list sparse core -- ``(4) sdpa_sparse  PROJ[Q,K,V], block_ids[,
+    block_lens] -> O (+LSE)``, ``sdpa/fwd/kernels/sm107/sparse_d256_f16.py`` through its adapter (:class:`_SparseSdpa`) -- at
+    the same operands, the same strides and the same launch count; ``execute`` then REQUIRES ``block_ids`` (``[T, top_k]``
+    int32: each query's selected 4-token blocks, the open tail block always visible; under ``thd=True`` the ids are relative
+    to the token's OWN sequence) and refuses it otherwise.  Every claim of that core is read off the adapter's capabilities
+    record, never transcribed; what the core does not serve is a typed decline at declaration (the in-block indexer and the
+    paged write-through under ``thd`` among them).
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -4697,10 +4765,13 @@ class GatedAttentionBlockFwd(APIBase):
     SDPA's small packed-metadata scratch), the same record -- ``saved.lse`` is
     the head-major ``[1, H_q, T]``, ``saved.seq_lens`` the lengths tensor itself,
     ``saved.seq_lens_form`` its form.  Stage (4) runs the SDPA's varlen arm over
-    packed ``(T, H, D)`` views in the natural tile order.  bf16 / fp16 (inference
-    and training), the UNFUSED per-tensor FP8 pipeline and ``fuse_norm_rope``
-    (bf16 / fp16 inference) are served; ``fuse_gate``, MXFP8 / fp4 and
-    ``seq_lens_present`` are typed declines.  Module docstring, "THD".
+    packed ``(T, H, D)`` views in the natural tile order (a ``QsaSpec`` block
+    runs the sparse core's packed arm over the same ``[1, T, H, D]`` views, the
+    block ids relative to each token's sequence).  bf16 / fp16 (inference and
+    training), the UNFUSED per-tensor FP8 pipeline, ``fuse_norm_rope`` (bf16 /
+    fp16 inference) and block-sparse attention with caller lists are served;
+    ``fuse_gate``, MXFP8 / fp4, ``seq_lens_present``, the in-block indexer and the
+    paged write-through are typed declines.  Module docstring, "THD".
 
     **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
     knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
@@ -5092,6 +5163,11 @@ class GatedAttentionBlockFwd(APIBase):
                 seq_lens_present=self.seq_lens_present,
                 token_stride=sdpa_token_stride,
                 gate_token_stride=sdpa_gate_token_stride,
+                # THD: the packed form (B = 1, S = T), the sequence count and the lengths' form -- the adapter's THD arm.
+                thd=self.thd,
+                num_sequences=self.num_sequences,
+                max_seq_len=self.max_seq_len,
+                cu_seqlens=self.cu_seqlens,
             )
         else:
             self._sdpa = _Sdpa(
@@ -5212,15 +5288,12 @@ class GatedAttentionBlockFwd(APIBase):
         g.validate()
         q = g.qsa
         rec = _sparse_record()
-        if self.thd:
+        if self.thd and not rec.thd:
+            # Served since 2026-10-08 (the record claims `thd`; the stage binds the packed operands): this decline stays
+            # reachable so a record that drops the arm declines by name instead of launching a body without it.
             raise NotImplementedError(
-                "QsaSpec with thd=True: the sparse attention core serves dense BSHD first; its packed-sequence arm is a follow-up ("
-                + (
-                    "the sparse adapter's record declines THD"
-                    if not rec.thd
-                    else "the kernel carries the arm, this block's sparse stage does not bind packed operands yet"
-                )
-                + ")"
+                "QsaSpec with thd=True: the sparse adapter's record declines THD (the kernel body does not carry the packed-sequence arm); "
+                "declare the dense [B, S, d_model] form"
             )
         if self.save_for_backward:
             raise NotImplementedError(
@@ -5984,8 +6057,9 @@ class GatedAttentionBlockFwd(APIBase):
         with ``index_source="caller"`` (``block_ids``; ``block_lens`` optional),
         REFUSED on a block declared without ``qsa``.  Form checks only -- the ids
         are device data the sparse core reads (block ``b`` = tokens ``[4b, 4b + 4)``
-        of the query's own sequence, ``-1`` = padding; the open tail block is
-        always visible).
+        of the query's own sequence -- under ``thd=True`` numbered from that
+        sequence's first token, ``-1`` = padding; the open tail block is always
+        visible).
 
         ``k_cache`` / ``v_cache`` / ``slot_mapping`` (appended): REQUIRED under
         ``paged_kv_page_size > 0`` -- after norm + RoPE the block writes every

@@ -232,6 +232,15 @@ Served today:
   `[B, S, d_model]` with or without `seq_lens`, `return_lse` on or off, `fuse_norm_rope` (without the band), `inplace_qkv`
   on or off, the indexer band on the unfused projection, `paged_kv_page_size` write-through; validated on Rubin (SM107) at
   the 24/2, 12/1, 6/1 and 32/2 geometries against the fp32 QSA oracle.
+- packed sequences (`thd=True, num_sequences=B, max_seq_len=S_max, cu_seqlens=`, "Packed sequences (THD)" below): the sparse
+  core's packed arm over the same `[1, T, H, D]` views. `execute(seq_lens=)` (REQUIRED: the `[B]` int32 lengths or the
+  `[B+1]` int32 prefix sums) serves the Q and the KV side alike, and `block_ids` `[T, top_k]` carries each token's blocks
+  numbered FROM ITS OWN SEQUENCE'S FIRST TOKEN (block `j` of sequence `b` = tokens `[4j, 4j + 4)` of that sequence; the count
+  rule and the open tail are per sequence, positions restarting at every sequence like the RoPE tables). `get_workspace_size()`
+  grows by the packed SDPA's small metadata scratch. A one-sequence packing is bitwise the dense `B = 1, S = T` sparse block;
+  an empty sequence owns no rows. Validated on Rubin per sequence against the per-sequence fp32 QSA oracle (bf16 and f16).
+  Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) and the paged write-through -- both typed
+  declines naming the feature.
 - the in-block indexer: a block declared `QsaSpec(index_source="indexer", index_band=True)` derives the selection itself from
   the band -- `execute(..., w_iq_norm=, w_ik_norm=)` instead of `block_ids=` -- and hands it back through the optional
   `block_ids_out` / `block_lens_out` / `index_k_compressed`; the contract is "The in-block indexer" in the serving section
@@ -241,11 +250,12 @@ Served today:
 Every claim of the sparse core -- the dtypes, the head dim, the block size, the `top_k` range, the GQA group, the arms it does
 not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.sparse_gqa_sm107.SPARSE_CAPABILITIES`), which the
 adapter's own `check_support` enforces; the block transcribes none of it. Typed declines at declaration, naming the feature:
-`thd`, `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
+`save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
 `fuse_gate` (the sparse core's epilogue gate is a follow-up; stage (5) runs as its own launch), `fuse_norm_rope` together with
 `index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them -- the unfused projection serves
-the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`; under `index_source="indexer"` also an f16
-activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
+the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd` together with
+`paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under `index_source="indexer"`
+also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the scorer's packed head groups
 (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target needs (the public 4.8.0
 wheel), named with the installed version, before the kernel module is imported. Under `index_source="indexer"` the floor is
 checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose package imports its kernels, so a
@@ -646,11 +656,13 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   unfused pipeline (`QuantSpec`; inference and training -- a packed FP8 training forward writes the same bf16 record at
   `(1, T)` as the dense quantized training forward, with `saved.h` the e4m3 `h`, and the packed bf16 backward
   differentiates it given the dequantized bf16 `h` and weights, exactly as on the dense side), `fuse_norm_rope` (bf16 /
-  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables). Declined, typed:
+  fp16 inference in place: the projection fork norms and rotates per token with the per-token tables), block-sparse
+  attention (`QsaSpec` with caller lists: the sparse core's packed arm, `block_ids` numbered per sequence -- "Sparse
+  attention (QSA)" above). Declined, typed:
   `fuse_gate` (the SDPA's epilogue gate has no THD gate descriptor;
   stage (5) runs as its own launch), MXFP8 and the fp4 modes (the MXFP8 SDPA row serves no THD, and the block-scale
   quantize writes one scale-factor atom per (sequence, head, 128-row tile) of a padded grid), the fully fused quantized
-  pipelines.
+  pipelines, the in-block indexer and the paged write-through under `QsaSpec`.
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
@@ -948,11 +960,12 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   the fully fused MXFP8 path needs `scale_o == 1.0` and, at `B > 1`, `S % 128 == 0` (a scale-factor atom is per
   sequence).
 - `fuse_gate` and `fuse_norm_rope` are inference-only specializations (no pre-gate `O`, no pre-norm Q/K).
-- Block-sparse attention (`QsaSpec`): bf16 / f16 inference, dense `[B, S, d_model]` (with or without `seq_lens`), `d_head == 256`,
+- Block-sparse attention (`QsaSpec`): bf16 / f16 inference, dense `[B, S, d_model]` (with or without `seq_lens`) or packed
+  (`thd=True`, caller lists with sequence-relative ids), `d_head == 256`,
   `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`) or the in-block indexer
-  (`index_source="indexer"`: bf16, the band, `index_head_dim` 128, `index_heads` in the scorer's packed groups); the indexer
-  band on the UNFUSED projection; `thd`, `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band
-  and `causal_bottom_right` are typed declines ("Sparse attention (QSA)" above); what a serving stack hands in -- the list
+  (`index_source="indexer"`: bf16, the band, `index_head_dim` 128, `index_heads` in the scorer's packed groups; dense only); the indexer
+  band on the UNFUSED projection; `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band,
+  `causal_bottom_right`, and `thd` together with the in-block indexer or the paged write-through are typed declines ("Sparse attention (QSA)" above); what a serving stack hands in -- the list
   form, the count rule, the decode-mode list, the pools, the indexer's inputs and outputs -- is the contract page "Serving:
   index lists and paged KV" above.
 - Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
