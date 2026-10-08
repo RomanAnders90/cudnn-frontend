@@ -197,7 +197,7 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 | `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
 | `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer (not served yet) |
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
-| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band only and are unread by any kernel today |
+| `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); no kernel scores with them today |
 
 `QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
 every query's complete blocks fit the list, so a full list reproduces dense causal attention exactly. `is_causal=False` or a
@@ -273,10 +273,13 @@ entries when `block_lens` is given, `n_sel_default` entries otherwise. A `-1` at
 derived default SHOULD pass `block_lens`); an entry at or beyond the count is NEVER read, valid-looking or not. A negative
 or oversized `block_lens` value is clamped, never faulted.
 
-**The open tail block is the kernel's -- never list it.** The query's own, incomplete block -- the `(pos + 1) % 4` tokens
-from `4 x floor((pos + 1) / 4)` to `pos` -- is always visible and derived from the position; a list carries complete blocks
-only. A listed block at or past the open one contributes nothing (its keys are masked one by one against the position and
-the KV length; never a fault).
+**The open tail block is the kernel's -- never list it.** The incomplete block that closes the query's visible range
+`n_vis = min(pos + 1, seq_lens[b])` -- the `n_vis % 4` tokens from `4 x floor(n_vis / 4)` to `n_vis - 1`; for a query
+inside its sequence, the `(pos + 1) % 4` tokens from `4 x floor((pos + 1) / 4)` to `pos` -- is always visible and
+derived on device from the position and the KV length; a list carries complete blocks only. A listed block lying
+entirely past the visible range (strictly past the open one) contributes nothing: its keys are masked one by one against
+the position and the KV length, never a fault. The open block itself, listed inside the count, is the violation below --
+attended twice.
 
 **A list is a SET of distinct complete-block ids; what happens on a violation.** The contract: distinct ids, each a
 complete block of the query's visible range (`4k + 3 <= pos`), the valid prefix then `-1`. The kernel does not check it
@@ -310,7 +313,8 @@ approximations of a per-row re-selection. The reference oracle takes the step-0 
 is the same paged-READ mode with one list per new row (`[T, top_k]`) at positions `prefix_len + s`.
 
 **Inert indexer fields.** `QsaSpec.index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` size the fifth
-band of `W_qkvg` only; no kernel reads them today (the in-block indexer that scores with them is a follow-up).
+band of `W_qkvg` -- and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool `index_k_raw` (next
+section); no kernel SCORES with them today (the in-block indexer is a follow-up).
 
 **The CuTe DSL floor.** The Rubin sparse core needs the public `nvidia-cutlass-dsl` 4.8.0 wheel (the `sm_107a`
 target); below it `check_support()` raises a typed `NotImplementedError` that names the installed version, BEFORE any
