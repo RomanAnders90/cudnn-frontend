@@ -61,6 +61,72 @@ Bytes per launch: ``B x floor(S / POOL) x POOL x D x 2`` in and
 ``B x floor(S / POOL) x D x 2`` out -- 10 MiB per layer at S = 32768.  The
 roofline term of this kernel is HBM bytes; no perf claim is made here until
 one is measured on an exclusive GPU.
+
+The DECODE form -- ``frost_qsa_compress_step`` and the serving contract
+-------------------------------------------------------------------------
+
+A decode step appends ``S_q`` tokens per sequence (one, or one plus a few
+speculative drafts).  A block completes when its 4th token arrives, so the
+step must compress the groups its new tokens complete, from raw keys that
+partly belong to EARLIER steps.  The compressor state is a per-sequence
+RING of raw keys, ``raw_key_ring [B, RING, D]`` in the io dtype:
+
+* the ring is POSITION-indexed: the raw key of token position ``p`` lives in
+  row ``p % RING`` (a bit copy of the io-dtype row; the ring never holds a
+  compressed or converted value);
+* ``pos0 [B]`` int32 is the position of the step's first row (``= kv_len``
+  BEFORE the step; row ``j`` sits at ``pos0 + j``); ``n_commit [B]`` int32
+  (optional; ``None`` = every row) is the ACCEPTED PREFIX of the step's rows:
+  rows ``j < n_commit[b]`` are committed, the others are drafts awaiting
+  verification and leave no trace;
+* for every committed row the kernel (1) writes its raw key into the ring at
+  ``(pos0 + j) % RING`` and (2) if the row completes a block (``(pos0 + j) %
+  POOL == POOL - 1``) pools the block's rows -- positions below ``pos0`` from
+  the ring, positions at or above it from this step's ``k_raw`` -- through
+  the SAME fp32 chain as the prefill kernel (same op order: the result is
+  bitwise the prefill compress of the same tokens) and stores the compressed
+  key at ``out[b, blk]``, ``blk = (pos0 + j) // POOL`` (the compressed-key
+  cache is indexed by block id, so a recompute of a block lands on the same
+  row);
+* ``compressed_slot [B, S_q]`` int32 reports per row: the block id written,
+  ``-1`` = this row completes no block (or is an uncommitted draft), ``-2`` =
+  the row would complete a block the compressed-key cache or the RoPE table
+  cannot hold (``blk >= out.shape[1]`` or ``blk * POOL >= cos.shape[1]``;
+  nothing is written -- size both for the context);
+* ``RING >= S_q + POOL - 1`` (``min_ring_rows``), validated on the host: a
+  completing row of this step reads ring positions down to ``pos0 - POOL +
+  1`` while the step's committed rows write positions ``pos0 .. pos0 + S_q -
+  1``; with that many rows no write of this launch aliases a read of this
+  launch, and no committed key a later step still needs is overwritten by a
+  draft (the hazard a 4-row ring has).  ``RING = 8`` serves ``S_q <= 5``.
+
+MTP rollback contract (the two-phase commit).  Draft tokens may be rejected,
+and a compressed row or a ring row written for a rejected draft would
+poison the sequence's state.  The kernel therefore commits ONLY the accepted
+prefix, and a serving step calls it twice:
+
+1. at the start of the step with ``n_commit = 1``: row 0 (the accepted token
+   whose K is computed in this step) enters the ring and completes its block
+   if it is a 4th token -- the block the step-0 selection must see;
+2. after verification with ``n_commit = 1 + accepted``: the accepted drafts
+   enter the ring and complete their blocks; the rejected ones never touch
+   the ring or the cache.  Row 0 is re-committed by the second call -- a
+   bit-identical rewrite of the same ring row and (if any) the same block
+   row, so the two calls compose to one call with the final ``n_commit``.
+
+Under this contract every ring row and every compressed row holds a value
+computed from accepted tokens only, so no rollback is ever needed; a stack
+that commits eagerly (all ``S_q`` rows at the step start) must instead
+recompute the blocks touched by rejected rows at the next step (the same
+kernel, since a block recompute lands on its own row) and keep the ring wide
+enough that a rejected draft cannot overwrite a committed key the next step
+pools -- ``RING >= S_q + POOL - 1`` covers that too.  ``norm_weight_offset``
+is threaded identically to the prefill form (0.0 = the pre-folded ``(1 + w)``,
+1.0 = the zero-centred checkpoint weight).
+
+Degenerate rows of the decode form: ``n_commit = 0`` (a finished sequence in
+the batch) -> no ring write, no block, every slot ``-1``; ``pos0 < 0`` is
+clamped to 0; a ragged last CTA computes on clamped loads and stores nothing.
 """
 
 from typing import NamedTuple, Optional
@@ -76,7 +142,7 @@ from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global_v4
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v4
 
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, validate_shape, vec_chunks
 
@@ -503,4 +569,432 @@ def moved_bytes(batch: int, seq_len: int, d: int, *, pool: int = DEFAULT_POOL, e
     return batch * n_full * (pool + 1) * d * elem_bytes
 
 
+# ---------------------------------------------------------------------------
+# The decode form: raw-key ring + this step's rows -> the blocks they complete
+# ---------------------------------------------------------------------------
+
+SLOT_NO_BLOCK = -1
+"""``compressed_slot`` value: this row completes no block, or is an uncommitted draft."""
+SLOT_CAPACITY = -2
+"""``compressed_slot`` value: the row completes a block past the compressed-key cache or the RoPE table; nothing written."""
+
+
+def min_ring_rows(rows_per_step: int, pool: int = DEFAULT_POOL) -> int:
+    """The smallest raw-key ring that serves a step of ``rows_per_step`` tokens per sequence: a completing row pools
+    ring positions down to ``pos0 - pool + 1`` while the step writes positions ``pos0 .. pos0 + rows - 1``; with
+    ``rows + pool - 1`` rows no write of a launch aliases one of its reads, and no committed key a later step pools is
+    overwritten by a draft."""
+    return int(rows_per_step) + int(pool) - 1
+
+
+@cute.kernel
+def frost_qsa_compress_step(
+    mKnew: cute.Tensor,  # [B, S_q, D] io dtype; batch / token strides symbolic (a column slice of the projection slab is fine)
+    mRing: cute.Tensor,  # [B, RING, D] io dtype, compact: row p % RING holds the raw key of position p
+    mOut: cute.Tensor,  # [B, NB, D] io dtype, compact: the compressed-key cache, row blk = block blk
+    mW: cute.Tensor,  # [D] io dtype
+    mCos: cute.Tensor,  # [Bc, S_pos, ROPE_DIM] 16-bit, Bc in {1, B}
+    mSin: cute.Tensor,  # same shape and dtype as mCos
+    mPos0: cute.Tensor,  # [B] int32: the position of row 0 (= the KV length before the step)
+    mNCommit: Optional[cute.Tensor],  # [B] int32: the accepted prefix of the step's rows, or None (= every row)
+    mSlot: cute.Tensor,  # [B, S_q] int32 out: the block id written by the row, -1 (none) or -2 (capacity)
+    eps: cutlass.Float32,
+    w_offset: cutlass.Float32,
+    d: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    pool: cutlass.Constexpr[int],
+    threads_per_cta: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+) -> None:
+    """One lane group (``lanes_per_row(d)`` lanes) per NEW ROW of the step.
+
+    Grid ``(ceil(S_q / groups_per_cta), B)``: ``block_idx.y`` is the sequence, ``block_idx.x * groups_per_cta +
+    grp`` the row ``j`` within the step.  A committed row copies its raw key into the ring; a committed row that
+    completes a block pools the block's ``pool`` rows (positions below ``pos0`` from the ring, the rest from this
+    step's rows) and runs the prefill kernel's fp32 chain -- the same operations in the same order.  Every other
+    group runs the arithmetic on clamped, in-bounds loads (so every lane of the warp reaches the butterfly
+    shuffles) and stores nothing.  The ring writes and the ring reads of one launch never alias (host rule
+    ``RING >= S_q + pool - 1``), so there is no intra-launch ordering requirement.
+    """
+    if cutlass.const_expr(use_pdl):
+        wait_on_dependent_grids()
+
+    has_n_commit = cutlass.const_expr(mNCommit is not None)
+    lanes = cutlass.const_expr(lanes_per_row(d))
+    chunks = cutlass.const_expr(vec_chunks(d))
+    groups_per_cta = cutlass.const_expr(threads_per_cta // lanes)
+    rope_lanes = cutlass.const_expr(rope_dim // ELEMS_PER_ACCESS)
+    half_lanes = cutlass.const_expr(rope_lanes // 2)
+    bpe = cutlass.Int64(2)
+
+    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane = tidx % cutlass.Int32(lanes)
+    grp = tidx // cutlass.Int32(lanes)
+    b = cutlass.Int32(cute.arch.block_idx()[1])
+    j = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(groups_per_cta) + grp
+
+    s_q = cutlass.Int32(mKnew.shape[1])
+    ring_n = cutlass.Int32(mRing.shape[1])
+    n_cap = cutlass.Int32(mOut.shape[1])
+    s_pos = cutlass.Int32(mCos.shape[1])
+    b64 = b.to(cutlass.Int64)
+
+    in_row = j < s_q
+    jr = j if in_row else s_q - cutlass.Int32(1)  # the ragged last CTA computes on the last row and stores nothing
+    pos0 = ld_global(mPos0.iterator.toint() + b64 * cutlass.Int64(4), cutlass.Int32)
+    pos0 = pos0 if pos0 > cutlass.Int32(0) else cutlass.Int32(0)
+    n_commit = s_q
+    if cutlass.const_expr(has_n_commit):
+        nc = ld_global(mNCommit.iterator.toint() + b64 * cutlass.Int64(4), cutlass.Int32)
+        nc = nc if nc > cutlass.Int32(0) else cutlass.Int32(0)
+        n_commit = nc if nc < s_q else s_q
+    p = pos0 + jr
+    committed = in_row & (jr < n_commit)
+    completes = (p % cutlass.Int32(pool)) == cutlass.Int32(pool - 1)
+    blk = p // cutlass.Int32(pool)
+    tok0 = blk * cutlass.Int32(pool)
+    fits = blk < n_cap
+    if cutlass.const_expr(rope_dim > 0):
+        fits = fits & (tok0 < s_pos)
+    write_blk = committed & completes & fits
+
+    lane_off = lane.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
+    knew_tok = cutlass.Int64(mKnew.stride[1]) * bpe
+    knew_b = mKnew.iterator.toint() + b64 * cutlass.Int64(mKnew.stride[0]) * bpe
+    ring_row = cutlass.Int64(mRing.stride[1]) * bpe
+    ring_b = mRing.iterator.toint() + b64 * cutlass.Int64(mRing.stride[0]) * bpe
+
+    # --- (1) the committed row's raw key enters the ring: a bit copy, 16 B per lane ----
+    if committed:
+        src = knew_b + jr.to(cutlass.Int64) * knew_tok
+        dst = ring_b + (p % ring_n).to(cutlass.Int64) * ring_row
+        for c in cutlass.range_constexpr(chunks):
+            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+            words = ld_global_v4(src + off, cutlass.Int32)
+            st_global_v4(dst + off, words, cutlass.Int32)
+
+    # --- (2) pool: the block's rows in POSITION order, each from the ring (below pos0) or this step ----
+    acc = []
+    for c in cutlass.range_constexpr(chunks):
+        acc.append([cutlass.Float32(0.0)] * ELEMS_PER_ACCESS)
+    for r in cutlass.range_constexpr(pool):
+        q = tok0 + cutlass.Int32(r)
+        from_new = q >= pos0
+        row_new = q - pos0
+        row_new = row_new if row_new > cutlass.Int32(0) else cutlass.Int32(0)
+        row_new = row_new if row_new < s_q else s_q - cutlass.Int32(1)
+        addr_new = knew_b + row_new.to(cutlass.Int64) * knew_tok
+        addr_ring = ring_b + (q % ring_n).to(cutlass.Int64) * ring_row
+        row_base = addr_new if from_new else addr_ring
+        for c in cutlass.range_constexpr(chunks):
+            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+            pairs = [f16x2_to_f32(wd, dtype=mKnew.element_type) for wd in ld_global_v4(row_base + off, cutlass.Int32)]
+            vals = [v for pair in pairs for v in pair]
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                acc[c][i] = acc[c][i] + vals[i]
+    inv_pool = cutlass.Float32(1.0 / pool)
+    pooled = []
+    for c in cutlass.range_constexpr(chunks):
+        pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+
+    # --- RMSNorm over D (the prefill kernel's chain) ------------------------------
+    ssq = cutlass.Float32(0.0)
+    for c in cutlass.range_constexpr(chunks):
+        for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+            ssq = ssq + pooled[c][i] * pooled[c][i]
+    rstd = rmsnorm_rstd(ssq, lanes, d, eps)
+
+    w_base = mW.iterator.toint()
+    ys = []
+    for c in cutlass.range_constexpr(chunks):
+        off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+        w_pairs = [f16x2_to_f32(wd, dtype=mW.element_type) for wd in ld_global_v4(w_base + off, cutlass.Int32)]
+        w_vals = [v for pair in w_pairs for v in pair]
+        ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset) for i in range(ELEMS_PER_ACCESS)])
+
+    # --- partial RoPE at the block START position (table row clamped in-bounds) ------
+    if cutlass.const_expr(rope_dim > 0):
+        in_rope = lane < cutlass.Int32(rope_lanes)
+        bc = b if cutlass.Int32(mCos.shape[0]) > cutlass.Int32(1) else cutlass.Int32(0)
+        bc64 = bc.to(cutlass.Int64)
+        tok0_r = tok0 if tok0 < s_pos else s_pos - cutlass.Int32(1)
+        pos64 = tok0_r.to(cutlass.Int64)
+        cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+        sin_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+        if in_rope:
+            c_addr = mCos.iterator.toint() + (bc64 * cutlass.Int64(mCos.stride[0]) + pos64 * cutlass.Int64(mCos.stride[1])) * bpe + lane_off
+            s_addr = mSin.iterator.toint() + (bc64 * cutlass.Int64(mSin.stride[0]) + pos64 * cutlass.Int64(mSin.stride[1])) * bpe + lane_off
+            c_pairs = [f16x2_to_f32(wd, dtype=mCos.element_type) for wd in ld_global_v4(c_addr, cutlass.Int32)]
+            s_pairs = [f16x2_to_f32(wd, dtype=mSin.element_type) for wd in ld_global_v4(s_addr, cutlass.Int32)]
+            cos_v = [v for pair in c_pairs for v in pair]
+            sin_v = [v for pair in s_pairs for v in pair]
+        for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+            rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane, half_lanes)
+            ys[0][i] = rotated if in_rope else ys[0][i]
+
+    # --- the ONE rounding, into the block's own cache row ---------------------------
+    if write_blk:
+        out_base = mOut.iterator.toint() + (b64 * cutlass.Int64(mOut.stride[0]) + blk.to(cutlass.Int64) * cutlass.Int64(mOut.stride[1])) * bpe
+        for c in cutlass.range_constexpr(chunks):
+            off = cutlass.Int64((c * lanes) * ACCESS_BYTES) + lane_off
+            y = ys[c]
+            packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mOut.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+            st_global_v4(out_base + off, packed, cutlass.Int32)
+
+    # --- the per-row report: the block id written, -1 (no block / draft), -2 (capacity) ----
+    slot_val = cutlass.Int32(SLOT_CAPACITY) if (committed & completes) else cutlass.Int32(SLOT_NO_BLOCK)
+    slot_val = blk if write_blk else slot_val
+    if in_row & (lane == cutlass.Int32(0)):
+        slot_addr = mSlot.iterator.toint() + (b64 * cutlass.Int64(mSlot.stride[0]) + jr.to(cutlass.Int64) * cutlass.Int64(mSlot.stride[1])) * cutlass.Int64(4)
+        st_global(slot_addr, slot_val, cutlass.Int32)
+
+    if cutlass.const_expr(use_pdl):
+        launch_dependent_grids()
+
+
+@cute.jit
+def qsa_compress_step_launch(
+    k_new: cute.Tensor,
+    ring: cute.Tensor,
+    out: cute.Tensor,
+    w: cute.Tensor,
+    cos: cute.Tensor,
+    sin: cute.Tensor,
+    pos0: cute.Tensor,
+    n_commit: Optional[cute.Tensor],
+    slot: cute.Tensor,
+    eps: cutlass.Float32,
+    w_offset: cutlass.Float32,
+    grid_x: cutlass.Int32,
+    grid_y: cutlass.Int32,
+    d: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    pool: cutlass.Constexpr[int],
+    threads_per_cta: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+    stream: cuda.CUstream,
+):
+    frost_qsa_compress_step(k_new, ring, out, w, cos, sin, pos0, n_commit, slot, eps, w_offset, d, rope_dim, pool, threads_per_cta, use_pdl).launch(
+        grid=(grid_x, grid_y, 1), block=(threads_per_cta, 1, 1), stream=stream, use_pdl=use_pdl
+    )
+
+
+step_compiled_cache = {}
+
+
+class QsaCompressStepRecipe(NamedTuple):
+    """Build-time facts of one decode-step compress launch (a legal compile key): dtypes, head dim, rope dim, pool,
+    whether an accepted-prefix vector is bound.  Batch, rows per step, ring depth and the cache capacity are
+    ``cute.sym_int`` and ride in as runtime shapes: one artifact serves every step shape and every ring."""
+
+    compiled: object
+    d: int
+    rope_dim: int
+    pool: int
+    rows_per_cta: int
+    has_n_commit: bool
+    dtype: object
+    table_dtype: object
+
+
+def compile_qsa_compress_step(
+    *,
+    dtype,
+    d: int,
+    rope_dim: int,
+    pool: int = DEFAULT_POOL,
+    has_n_commit: bool = True,
+    table_dtype=None,
+    threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
+    use_pdl: bool = False,
+) -> QsaCompressStepRecipe:
+    """Build the decode-step artifact from SHAPES ALONE -- no device allocation, no launch (see
+    :func:`compile_qsa_compress` for the io / table dtype rules, which are the same here)."""
+    too_old = cutedsl_requirement_error("qsa_compress_step")
+    if too_old is not None:
+        raise NotImplementedError(too_old)
+    validate_compress_shape(d, rope_dim, pool, threads_per_cta)
+    if dtype not in _IO_DTYPES:
+        raise ValueError(f"qsa_compress_step serves bf16/f16 io only, got dtype={dtype}")
+    table_dtype = dtype if table_dtype is None else table_dtype
+    if table_dtype not in _IO_DTYPES:
+        raise ValueError(f"qsa_compress_step takes 16-bit cos / sin tables (bf16/f16), got table_dtype={table_dtype}")
+
+    key = (str(dtype), str(table_dtype), int(d), int(rope_dim), int(pool), int(threads_per_cta), bool(has_n_commit), bool(use_pdl), current_device())
+    if key not in step_compiled_cache:
+        batch = cute.sym_int()
+        rows = cute.sym_int()
+        k_new = _fake_strided(dtype, (batch, rows, d), (cute.sym_int(), cute.sym_int(), 1))
+        ring = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+        out = _fake_compact(dtype, (batch, cute.sym_int(), d), (2, 1, 0))
+        w = _fake_compact(dtype, (d,), (0,))
+        table_dim = rope_dim if rope_dim else 1
+        tables = [_fake_strided(table_dtype, (cute.sym_int(), cute.sym_int(), table_dim), (cute.sym_int(), cute.sym_int(), 1)) for _ in range(2)]
+        pos0 = _fake_compact(torch.int32, (batch,), (0,))
+        n_commit = _fake_compact(torch.int32, (batch,), (0,)) if has_n_commit else None
+        slot = _fake_compact(torch.int32, (batch, rows), (1, 0))
+        step_compiled_cache[key] = cute.compile(
+            qsa_compress_step_launch,
+            k_new,
+            ring,
+            out,
+            w,
+            *tables,
+            pos0,
+            n_commit,
+            slot,
+            cutlass.Float32(1e-6),  # eps       ) runtime values: the literals pin
+            cutlass.Float32(0.0),  # w_offset   ) their TYPE at trace time only
+            cutlass.Int32(1),  # grid_x
+            cutlass.Int32(1),  # grid_y
+            int(d),
+            int(rope_dim),
+            int(pool),
+            int(threads_per_cta),
+            bool(use_pdl),
+            _FAKE_STREAM,
+            options="--enable-tvm-ffi",
+        )
+    return QsaCompressStepRecipe(
+        compiled=step_compiled_cache[key],
+        d=int(d),
+        rope_dim=int(rope_dim),
+        pool=int(pool),
+        rows_per_cta=threads_per_cta // lanes_per_row(d),
+        has_n_commit=bool(has_n_commit),
+        dtype=dtype,
+        table_dtype=table_dtype,
+    )
+
+
+def _check_int32_vector(name: str, x: torch.Tensor, shape: tuple) -> None:
+    if not isinstance(x, torch.Tensor) or x.dtype != torch.int32 or tuple(x.shape) != tuple(shape) or not x.is_contiguous() or not x.is_cuda:
+        got = None if not isinstance(x, torch.Tensor) else f"{x.dtype} {tuple(x.shape)} contiguous={x.is_contiguous()} cuda={x.is_cuda}"
+        raise ValueError(f"{name} must be a contiguous int32 CUDA tensor of shape {tuple(shape)}, got {got}")
+
+
+def run_qsa_compress_step(
+    r: QsaCompressStepRecipe,
+    k_new: torch.Tensor,
+    ring: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    pos0: torch.Tensor,
+    slot_out: torch.Tensor,
+    n_commit: Optional[torch.Tensor] = None,
+    *,
+    eps: float,
+    norm_weight_offset: float = 0.0,
+    stream,
+) -> None:
+    """The lowered decode-step launch: validation and address arithmetic only -- no conversion, no allocation.
+
+    ``k_new`` ``[B, S_q, D]`` this step's raw keys (any batch / token stride with 16-B aligned rows), ``ring``
+    ``[B, RING, D]`` compact with ``RING >= S_q + pool - 1``, ``out`` ``[B, NB, D]`` compact (the compressed-key
+    cache; a block past ``NB`` is reported ``-2`` and not written), ``w`` ``[D]``, ``cos`` / ``sin`` ``[1 or B, S_pos,
+    rope_dim]`` (a block whose start position is past ``S_pos`` is reported ``-2``), ``pos0`` ``[B]`` int32 (the
+    position of row 0), ``slot_out`` ``[B, S_q]`` int32 (written for every row), ``n_commit`` ``[B]`` int32 iff the
+    recipe traced it (the accepted prefix of the step's rows).  ``norm_weight_offset`` as in the prefill form.
+    """
+    if k_new.ndim != 3:
+        raise ValueError(f"k_new must be [B, S_q, D], got shape {tuple(k_new.shape)}")
+    batch, rows, d = (int(x) for x in k_new.shape)
+    if d != r.d:
+        raise ValueError(f"k_new head dim {d} does not match the recipe's d={r.d}")
+    if rows < 1:
+        raise ValueError("k_new must hold at least one row per sequence")
+    _check_row_tensor("k_new", k_new, dtype=r.dtype, last_dim=r.d)
+    if ring.ndim != 3 or int(ring.shape[0]) != batch or int(ring.shape[2]) != r.d or not ring.is_contiguous():
+        raise ValueError(f"ring must be a compact [B={batch}, RING, D={r.d}] tensor, got shape {tuple(ring.shape)}")
+    need = min_ring_rows(rows, r.pool)
+    if int(ring.shape[1]) < need:
+        raise ValueError(
+            f"ring holds {int(ring.shape[1])} rows per sequence; a step of {rows} rows needs at least {need} (rows + pool - 1 = {rows} + {r.pool} - 1) "
+            "so this launch's ring writes never alias its ring reads and no committed key a later step pools is overwritten by a draft"
+        )
+    _check_row_tensor("ring", ring, dtype=r.dtype, last_dim=r.d)
+    if out.ndim != 3 or int(out.shape[0]) != batch or int(out.shape[2]) != r.d or int(out.shape[1]) < 1 or not out.is_contiguous():
+        raise ValueError(f"out must be a compact [B={batch}, NB >= 1, D={r.d}] tensor, got shape {tuple(out.shape)}")
+    _check_row_tensor("out", out, dtype=r.dtype, last_dim=r.d)
+    if w.ndim != 1 or int(w.shape[0]) != r.d or not w.is_contiguous():
+        raise ValueError(f"w must be a contiguous [{r.d}] norm weight, got shape {tuple(w.shape)}")
+    _check_row_tensor("w", w, dtype=r.dtype, last_dim=r.d)
+    if r.rope_dim:
+        for name, t in (("cos", cos), ("sin", sin)):
+            if t.ndim != 3:
+                raise ValueError(f"{name} must be [1 or B, S_pos, rope_dim], got shape {tuple(t.shape)}")
+            if int(t.shape[0]) not in (1, batch):
+                raise ValueError(f"{name} batch dim must be 1 (broadcast) or B={batch}, got {int(t.shape[0])}")
+            if int(t.shape[1]) < 1:
+                raise ValueError(f"{name} must hold at least one position row")
+            _check_row_tensor(name, t, dtype=r.table_dtype, last_dim=r.rope_dim)
+        if tuple(cos.shape) != tuple(sin.shape):
+            raise ValueError(f"cos and sin must share a shape, got {tuple(cos.shape)} and {tuple(sin.shape)}")
+    _check_int32_vector("pos0", pos0, (batch,))
+    _check_int32_vector("slot_out", slot_out, (batch, rows))
+    if r.has_n_commit:
+        if n_commit is None:
+            raise ValueError("this artifact was compiled WITH an accepted-prefix vector; bind n_commit [B] int32 (no silent commit-everything fallback)")
+        _check_int32_vector("n_commit", n_commit, (batch,))
+    elif n_commit is not None:
+        raise ValueError("this artifact was compiled WITHOUT n_commit (every row of the step is committed); n_commit would be silently ignored -- pass None")
+    grid_x = (rows + r.rows_per_cta - 1) // r.rows_per_cta
+    r.compiled(
+        k_new,
+        ring,
+        out,
+        w,
+        cos,
+        sin,
+        pos0,
+        n_commit,
+        slot_out,
+        cutlass.Float32(eps),
+        cutlass.Float32(norm_weight_offset),
+        cutlass.Int32(grid_x),
+        cutlass.Int32(batch),
+        cuda.CUstream(int(stream)),
+    )
+
+
+def build_qsa_compress_step(
+    k_new: torch.Tensor,
+    ring: torch.Tensor,
+    out: torch.Tensor,
+    w: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    pos0: torch.Tensor,
+    slot_out: torch.Tensor,
+    n_commit: Optional[torch.Tensor] = None,
+    *,
+    rope_dim: int,
+    eps: float,
+    norm_weight_offset: float = 0.0,
+    pool: int = DEFAULT_POOL,
+    threads_per_cta: int = DEFAULT_THREADS_PER_CTA,
+    use_pdl: bool = False,
+    stream,
+) -> QsaCompressStepRecipe:
+    """Compile (cached) and run one decode step -- the convenience form for tests.  Production callers split it:
+    :func:`compile_qsa_compress_step` at plan time, :func:`run_qsa_compress_step` per step."""
+    if k_new.ndim != 3:
+        raise ValueError(f"k_new must be [B, S_q, D], got shape {tuple(k_new.shape)}")
+    r = compile_qsa_compress_step(
+        dtype=k_new.dtype,
+        d=int(k_new.shape[2]),
+        rope_dim=rope_dim,
+        pool=pool,
+        has_n_commit=n_commit is not None,
+        table_dtype=cos.dtype,
+        threads_per_cta=threads_per_cta,
+        use_pdl=use_pdl,
+    )
+    run_qsa_compress_step(r, k_new, ring, out, w, cos, sin, pos0, slot_out, n_commit, eps=eps, norm_weight_offset=norm_weight_offset, stream=stream)
+    return r
+
+
 frost_qsa_compress.set_name_prefix("cudnn", remove_cutlass_symbol=True)
+frost_qsa_compress_step.set_name_prefix("cudnn", remove_cutlass_symbol=True)
