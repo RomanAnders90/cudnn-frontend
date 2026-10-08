@@ -226,7 +226,7 @@ _SNAPSHOT_ARMS = {
     "mxfp8_unfused": dict(inplace_qkv=True, fp8=True, mxfp8=True),
     "mxfp8_fused": dict(inplace_qkv=True, fp8=True, fp8_fused=True, mxfp8=True),
 }
-_ABSENT = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1)
+_ABSENT = dict(gate=-1, o_gated=-1, base_align=256, o4=-1, sf_o=-1, ix_q=-1, ix_kbar=-1, ix_ids=-1, ix_scores=-1, ix_cand=-1)
 _NO_Q8 = dict(q8=-1, k8=-1, v8=-1, o8=-1, gate16=-1)
 _NO_SF = dict(sf_q=-1, sf_k=-1, sf_v=-1)
 _SNAPSHOT = {
