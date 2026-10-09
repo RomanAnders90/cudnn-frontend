@@ -1469,7 +1469,7 @@ _GATED = [
 @pytest.mark.parametrize("geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv", _GATED)
 def test_fuse_gate_under_qsa_matches_the_oracle_and_the_unfused_block(geom_kw, batch, seq_len, dtype, source, top_k, seq_lens, fuse_norm_rope, inplace_qkv):
     """The gated ``QsaSpec`` block (stage (5) inside the sparse core's epilogue) against (a) the oracle on the same list --
-    every standard assertion of the matrix (``isfinite``, no sentinel, dead rows exact, ``cos >= 0.999`` on ``out``, ``atol
+    every standard assertion of the matrix (``isfinite``, no sentinel, dead rows exact, ``cos > 0.999`` on ``out``, ``atol
     2e-2`` on the gated O and the LSE, two launches bitwise) -- and (b) the UNFUSED block on the SAME inputs and list:
     ``gated == unfused-then-gated`` within ONE rounding of the activation dtype per element of the gated O (the unfused
     pipeline rounds O to bf16 / f16 before stage (5); both use the same approximate tanh), the LSE BITWISE the unfused block's

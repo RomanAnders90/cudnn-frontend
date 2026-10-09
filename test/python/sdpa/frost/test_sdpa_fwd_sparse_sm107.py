@@ -273,6 +273,18 @@ def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
     assert (b.template_params().bottom_right, b.template_params().qsa_list_per_sequence) == (True, False)
 
 
+def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
+    """A negative attn_scale is SERVED by the sparse core, not declined: the adapter keeps the sign (``scale`` is what the kernel
+    multiplies every raw score by before its column max) and never raises the dense line's ``TemplateParams.negate_scores``
+    (BMM1 negating Q at |scale|), which the sparse body does not consume -- so neither path drops the sign.  The Rubin cell
+    ``test_a_negative_attn_scale_is_served_by_the_signed_scale`` runs the function; this is the host half of that claim."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    a = SparseGqaFwdDslSm107(**_operands(), scale=-0.0625)
+    assert a.check_support() and a.scale == -0.0625
+    assert a.template_params().negate_scores is False, "the sparse adapter passes the signed scale; negate_scores is the dense line's"
+
+
 @pytest.mark.parametrize(
     "mutate, exc, word",
     [
@@ -568,6 +580,14 @@ def test_sparse_kernel_source_pins():
     # no per-item tile-index parity anywhere (the decode tile's arithmetic form)
     assert "_kv_slot(" not in code and "// cutlass.Int32(2)) & cutlass.Int32(1)" not in code
     assert "EXPLICIT_ABI = True" in code
+    # the S^T / P^T ring depth is read ONCE from the config and spelled at every ring site -- never a literal 2 (a depth changed at some
+    # sites and not others is a stale S^T slot read from the first reuse): every advance() names a depth constant, the four per-tile
+    # MBarriers and the sP tile take STAGES_S, and the only other depths are the CFG ring fields
+    assert "STAGES_S = CFG.STAGES_S" in code and "RED_SLOTS = STAGES_S + 1" in code
+    assert re.search(r"advance\(\w+, \d+\)", code) is None, "every PipelineState advance takes a named ring depth, never a literal"
+    assert set(re.findall(r"advance\(\w+, (\w+)\)", code)) == {"STAGES_S", "STAGES_KV", "STAGES_Q", "STAGES_IDS", "SCHEDULER_STAGES"}
+    assert code.count("_alloc(STAGES_S), stages=STAGES_S") == 4 and "_alloc(2)" not in code and "stages=2" not in code
+    assert "range_constexpr(STAGES_S)" in code and "range_constexpr(2)" not in code and "STAGES_S * pBufferWords" in code
 
 
 def test_sparse_kernel_thd_arm_source_pins():
@@ -876,10 +896,10 @@ def _check(outs, ref_o, ref_lse):
     return max_o, max_lse
 
 
-def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0):
+def _run_cell(*, B, S, H, KH, dtype, top_k, list_kind, kv_lens=None, block_lens=True, seed=0, scale=None):
     q, k, v, g = _inputs(B, S, H, KH, dtype, seed)
     ids, lens = _lists(list_kind, B, S, top_k, g, kv_lens)
-    scale = 1.0 / math.sqrt(D)
+    scale = (1.0 / math.sqrt(D)) if scale is None else float(scale)  # appended: a cell may pass the SIGNED scale it wants served
     outs = _launch(q, k, v, ids, lens if block_lens else None, kv_lens, top_k, scale)
     ref_o, ref_lse = _reference(q, k, v, ids, lens if block_lens else None, kv_lens, scale, top_k)
     return _check(outs, ref_o, ref_lse)
@@ -1310,6 +1330,25 @@ def test_small_top_k_lists(top_k, block_lens):
     """``CFG.BLOCK_TOPK`` in {4, 64}: a 16-B id row (one quad per tile), a random subset per row; with and without the count."""
     max_o, max_lse = _run_cell(B=1, S=300, H=24, KH=2, dtype=torch.bfloat16, top_k=top_k, list_kind="shuffled", block_lens=block_lens)
     print(f"\ntop_k={top_k} block_lens={block_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+def test_a_negative_attn_scale_is_served_by_the_signed_scale(dtype):
+    """``attn_scale = -1 / sqrt(D)``: the kernel multiplies every raw score by the SIGNED scale before the column max, so the
+    function is the reference's softmax over the negated scores within the module's budget -- an ACCEPT cell, not a decline (the
+    dense line serves the same request through ``negate_scores``; the sparse adapter passes the sign through).  Teeth: the same
+    operands at +scale give a different O, so the sign provably reached the kernel."""
+    scale = -1.0 / math.sqrt(D)
+    max_o, max_lse = _run_cell(B=1, S=300, H=24, KH=2, dtype=dtype, top_k=512, list_kind="shuffled", seed=11, scale=scale)
+    q, k, v, g = _inputs(1, 300, 24, 2, dtype, 11)
+    ids, lens = _lists("shuffled", 1, 300, 512, g)
+    ((o_neg, lse_neg),) = _launch(q, k, v, ids, lens, None, 512, scale, launches=1)
+    ((o_pos, lse_pos),) = _launch(q, k, v, ids, lens, None, 512, -scale, launches=1)
+    assert float((o_neg.float() - o_pos.float()).abs().max()) > 10 * ATOL and not torch.equal(lse_neg, lse_pos), "the sign must reach the kernel"
+    print(
+        f"\nnegative attn_scale {dtype}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} (budget {ATOL}); |O(-s) - O(+s)| {float((o_neg.float() - o_pos.float()).abs().max()):.4f}"
+    )
 
 
 @requires_rubin
@@ -1851,8 +1890,18 @@ def test_sparse_kernel_gate_arm_source_pins():
     i_sig = code.index("def _kernel(")
     sig = code[i_sig : code.index(") -> None:", i_sig)]
     assert sig.rstrip().endswith("tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"), "the gate descriptor is the LAST kernel parameter"
-    # the ungated rendering keeps its drains, the gated one its own (STAGES_GATE + 1 waits on mb_gate_empty, none on mb_q_empty)
-    assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" in code
+    # the ungated rendering keeps its drains; the gated one consumes mb_gate_empty in ORDER as well as in count: the exit-path wait
+    # BEFORE the last item's gate (a parity wait two completions behind a single-stage barrier never returns), then x STAGES_GATE
+    assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" not in code, "the drain is STAGES_GATE deep once the exit path waits before the last gate"
+    assert code.count("cutlass.range_constexpr(CFG.STAGES_GATE)") == 1
+    i_exit_wait = code.index("if is_valid <= cutlass.Int32(0):\n                bars.mb_gate_empty.wait(ge_state.phase)")
+    i_last_gate = code.index("qgi, qgp = _tma_issue_gate(")
+    i_drain = code.index("cutlass.range_constexpr(CFG.STAGES_GATE)")
+    assert i_exit_wait < i_last_gate < i_drain, "the exit-path mb_gate_empty wait precedes the last gate's issue, the drain follows the loop"
+    # the gate barriers' parities come from PipelineStates advanced by the ring depth like every other ring (P2) -- never a scalar toggle
+    assert "_phase ^ cutlass.Int32(1)" not in code, "a gate barrier's parity is a PipelineState advanced by CFG.STAGES_GATE, never a scalar toggle"
+    assert code.count("advance(ge_state, CFG.STAGES_GATE)") == 2 and code.count("advance(gf_state, CFG.STAGES_GATE)") == 1
+    assert "ge_state = PipelineState.start(phase=1)" in code and "gf_state = PipelineState.start(phase=0)" in code
 
 
 # ============================================================================ Rubin: the fused epilogue gate
