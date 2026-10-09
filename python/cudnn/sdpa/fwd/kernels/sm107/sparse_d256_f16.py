@@ -50,8 +50,10 @@ WARP MAP (16 warps = 512 threads; every warpgroup is role-homogeneous because ``
     warp 12     WG3    MMA issue (+ tmem_alloc / dealloc once per CTA): 4 commits per tile (s_full, kv_empty[K], bmm2_done,
                        kv_empty[V]) + 1 per item (q_empty)
     warp 13     WG3    TMA-LDG: Q^T(i+1) (4 subtiles, Q_TX_BYTES = the BOX bytes), the BLOCK_TOPK x 4 B ids bulk copy of
-                       item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; drains mb_q_empty /
-                       mb_ids_empty / mb_gate_empty at exit
+                       item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
+                       mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated: the exit-path mb_gate_empty wait
+                       BEFORE the last item's gate (the wait Q(n_items) would have taken), then mb_gate_empty x STAGES_GATE
+                       (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
     warp 14     WG3    scheduler (scheduler_warp_loop for BSHD; the persistent claim-counter form for THD) -- never credits
     warp 15     WG3    spare: passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one in the body)
 
@@ -88,7 +90,10 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                          Q_TX_BYTES = Q_BOX_ROWS x TILE_K x BPE = G x 512 B (6144 at G=12; the BOX, never the 8 KiB slot)
                                                                                                         1 == 1       MMA before the item's first BMM1     0      q_state(2), once per item
     2  mb_q_empty[2]        MMA_COMMIT   warp 12, arrive(cta_group=1, pred=elect_p) once per item after the item's LAST BMM1
-                                                                                                        1 == 1       warp 13 before gate(i) / Q(i+2)      1      per item; drained at exit by warp 13
+                                                                                                        1 == 1       warp 13 before gate(i) / Q(i+2)      1 | 0  per item.  UNGATED: the pre-armed qe_state (start 1) waits
+                                                                                                                                                                 before Q(j), the last STAGES_Q commits drained at exit.  GATED: the
+                                                                                                                                                                 wait-then-arrive qg_state (start 0) consumes commit i before gate(i);
+                                                                                                                                                                 n commits, n waits -- no drain (the slot's WAR gate for Q(i+2) is row 12)
     3  mb_ids_full[2]       TMA_LOAD     warp 13, arrive(n_bytes=IDS_TX_BYTES, pred=elect_sync()); bulk_copy(sIds[slot], block_ids[item_row], IDS_TX_BYTES)
                                          IDS_TX_BYTES = BLOCK_TOPK x 4 (a 16-B multiple); the copy runs for EVERY item, dead ones included
                                          (item_row = the token's flat row, or the SEQUENCE under CFG.LIST_PER_SEQUENCE: one row copied by every item of it)
@@ -111,9 +116,14 @@ nothing in tile_dsl.barrier elects for you; cga1: every commit is cta_group::1, 
                                                                                                                                                                  WAR gate: P^T(t) -> sP[t % 2] is stored AFTER the wait on bmm2_done(t-2) taken at iteration t-1
    11  mb_gate_full[1]      TMA_LOAD     warp 13, arrive(n_bytes=GATE_TX_BYTES, pred=elect_sync()); the gate box (1, 1 token, G heads, 64) x 4 subtiles
                                          into the freed sQ[i % 2]; GATE_TX_BYTES = Q_BOX_ROWS x TILE_O x GATE_BPE = G x 512 B (the BOX)   [gated arm]
-                                                                                                        1 == 1       128 softmax lanes, epilogue(i)       0      gate_state(1), once per item
+                                                                                                        1 == 1       128 softmax lanes, epilogue(i)       0      gf_state(1), once per item
    12  mb_gate_empty[1]     THREAD       bare arrive() from 128 lanes after the item's last gate LDS     [gated arm]
-                                                                                                        128 == 128   warp 13 before Q(i+2) into the slot 1      per item; drained at exit by warp 13
+                                                                                                        128 == 128   warp 13 before Q(i+2) into the slot 1      ge_state(1) pre-armed, per item: Q(1)'s wait is the pass, Q(j) waits
+                                                                                                                                                                 epilogue(j - 2); the exit path waits epilogue(n - 2) BEFORE gate(n - 1)
+                                                                                                                                                                 is issued (the wait Q(n) would have taken; the pass itself at n = 1),
+                                                                                                                                                                 then drains x STAGES_GATE = epilogue(n - 1).  Never 2 behind: completion i
+                                                                                                                                                                 needs gate(i), issued only after the wait that consumed i - 1 (Q(i + 1)'s
+                                                                                                                                                                 in the loop, the exit-path one for the last item)
    13  sched.mb_scheduler[2]  TMA_LOAD (CLC response form) | THREAD (persistent form)
                                          the scheduler warp's elected arrive_expect_tx(16) + the CLC response (CLC) / its elected arrive after the
                                          4 payload stores (persistent; no expect_tx at cga1)
@@ -133,14 +143,19 @@ every producer fire / consumer wait -- NEVER recomputed from a per-item tile ind
 barriers per unit); in a persistent CTA they HANG at n_tiles = 1 with two items (s_empty), read a stale S^T slot at
 n_tiles = 3 (s_full) and read a stale K/V slot whenever 2 x n_tiles % 3 != 0.  Every item runs >= 1 tile, so the per-item
 rings (1-4, 11-14) advance exactly once per item and the per-tile rings (5-10) at least once; the epilogue runs for every item.
-Exit drains (every arrive has a reachable wait): warp 13 waits mb_ids_empty x STAGES_IDS and, ungated, mb_q_empty x STAGES_Q
-(pre-armed state); gated, every mb_q_empty commit is consumed by its item's gate load (nothing left) and mb_gate_empty is
-drained x (STAGES_GATE + 1) = 2: n_items completions, n_items - 1 loop waits of which ONE is the pre-armed pass -> 2
-unconsumed for every n_items >= 1 (n_items = 1: the first drain wait IS the pass); every gather warp waits mb_kv_empty x
-STAGES_KV -- each with its carried state.  Gated arm, the slot's order: Q(i) -> MMA reads -> mb_q_empty(i) -> gate(i) ->
-mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); warp 13 issues gate(i) AFTER queuing Q(i + 1) / ids(i + 1)
-(their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's LAST BMM1) and before its next
-credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
+Exit drains (every arrive has a reachable wait, and the waiter is never TWO completions behind a barrier: wait() returns when the
+parity differs from the waited one, so parity(k) == parity(k + 2) parks it forever -- a hang with correct numerics): warp 13 waits
+mb_ids_empty x STAGES_IDS and, ungated, mb_q_empty x STAGES_Q (pre-armed state); gated, every mb_q_empty commit is consumed by its
+item's gate load (nothing left) and mb_gate_empty is consumed in ORDER as well as in count -- n_items completions against n_items
+waits: n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass, Q(j)'s = epilogue(j - 2)), the exit-path wait taken
+BEFORE the last item's gate is issued (= epilogue(n_items - 2); the pass itself at n_items = 1, taken while nothing can have
+arrived), the exit drain x STAGES_GATE (= epilogue(n_items - 1)); completion i needs gate(i), and gate(i) is issued only after the
+wait that consumed completion i - 1, so the consumer is never two behind (a drain of STAGES_GATE + 1 waits with no exit-path wait
+was right in count and wrong in order: epilogue(n_items - 1) could land before the first drain wait and alias its parity); every
+gather warp waits mb_kv_empty x STAGES_KV -- each with its carried state.  Gated arm, the slot's order: Q(i) -> MMA reads ->
+mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); warp 13 issues gate(i) AFTER
+queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
+LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
 
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
@@ -246,7 +261,8 @@ after the P^T generic stores (before mb_p_full), after the once-per-CTA sQ tail-
 tcgen05_fence + the commits; the sIds bulk copy -> LDS and gate TMA -> LDS edges are ordered by their mbarrier waits.
 
 TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 columns): S^T slot 0 at [0, 16), slot 1 at
-[16, 32), O^T d-block 0 at [32, 48), d-block 1 at [48, 64).  No TMEM slot is assumed zero: BMM2(0) of every item overwrites
+[16, 32), O^T d-block 0 at [32, 48), d-block 1 at [48, 64).  The S^T slot count IS the depth of rows 7-10 and of sP: CFG.STAGES_S
+(= len(S_ACC_OFF) = 2, pinned by the config), read once as STAGES_S and spelled at every ring site -- never a literal 2.  No TMEM slot is assumed zero: BMM2(0) of every item overwrites
 (accumulate=False) and every dead column ends in the SELECT, never residue * 0.
 
 GATHER TENSOR MAP: one 2-D map per operand, tokens OUTER, the token's FULL ROW inner, box (64 elems, 1 row) = one 128-B
@@ -387,6 +403,12 @@ BPE = CFG.BPE
 STAGES_KV = CFG.STAGES_KV
 STAGES_Q = CFG.STAGES_Q
 STAGES_IDS = CFG.STAGES_IDS
+# The S^T / P^T ring depth (barrier rows 7-10 and the sP buffers): the S^T TMEM slots of the map, read ONCE here and spelled at every
+# ring site below -- the four MBarriers, every advance() of s_state / s_empty_state / p_state / bmm2_state / t_state, the sP Array and
+# SmemTile, the init loop, the red scratch's parity slots.  Never a literal: a depth changed at some sites and not others is a stale S^T
+# slot read from the first reuse (frost-kernels.md section 6).  The config pins STAGES_S == len(S_ACC_OFF) == 2; the check below is the
+# trace-time twin for a direct template load.
+STAGES_S = CFG.STAGES_S
 SCHEDULER_STAGES = CFG.SCHEDULER_STAGES
 BLOCK_SIZE = CFG.BLOCK_SIZE
 BLOCKS_PER_TILE = CFG.BLOCKS_PER_TILE
@@ -455,8 +477,10 @@ STRIDE_BYTE_OFFSET_VT = 8 * CFG.V_SWZ_BYTES
 # P^T as the MN-major B of BMM2: one atom wide (N_Q * 2 B), SBO = 8 key rows.
 STRIDE_BYTE_OFFSET_P = 8 * CFG.P_SWZ_BYTES
 
-# TMEM: two S^T slots then the two O^T d-blocks, N_Q fp32 columns each (CFG.S_ACC_OFF / CFG.O_OFF, allocated once per CTA).
+# TMEM: STAGES_S S^T slots then the two O^T d-blocks, N_Q fp32 columns each (CFG.S_ACC_OFF / CFG.O_OFF, allocated once per CTA).
 S_ACC_OFF = CFG.S_ACC_OFF
+if len(S_ACC_OFF) != STAGES_S:
+    raise ValueError(f"sparse_d256_f16: STAGES_S={STAGES_S} must equal the number of S^T TMEM slots (len(S_ACC_OFF)={len(S_ACC_OFF)})")
 O_OFF = CFG.O_OFF
 TMEM_COLS = CFG.TMEM_COLS
 O_BLOCKS = TILE_O // 128
@@ -476,8 +500,8 @@ _BAR_TMEM = 1
 _BAR_SOFTMAX = 2
 BAR_TMEM_THREADS = CFG.BAR_TMEM_THREADS
 BAR_SOFTMAX_THREADS = CFG.BAR_SOFTMAX_THREADS
-# Cross-warp reduction scratch: [2 tile parities + 1 epilogue][softmax warp][COLS].
-RED_SLOTS = 3
+# Cross-warp reduction scratch: [STAGES_S tile parities + 1 epilogue][softmax warp][COLS]; the epilogue slot is index STAGES_S.
+RED_SLOTS = STAGES_S + 1
 RED_WORDS = RED_SLOTS * SOFTMAX_WARPS * COLS
 
 LOG2E = 1.4426950408889634
@@ -519,10 +543,10 @@ def make_sparse_bars() -> SparseBars:
         mb_ids_empty=MBarrier(_alloc(STAGES_IDS), stages=STAGES_IDS, init_count=CFG.IDS_EMPTY_ARRIVERS, producer=Producer.THREAD),
         mb_kv_full=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.KV_FULL_ARRIVERS, producer=Producer.TMA_LOAD),
         mb_kv_empty=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_s_full=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
-        mb_s_empty=MBarrier(_alloc(2), stages=2, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
-        mb_p_full=MBarrier(_alloc(2), stages=2, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
-        mb_bmm2_done=MBarrier(_alloc(2), stages=2, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_s_full=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
+        mb_s_empty=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_p_full=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
+        mb_bmm2_done=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
         mb_gate_full=gate_full,
         mb_gate_empty=gate_empty,
@@ -716,6 +740,7 @@ def _tma_issue_item(
     i_phase,
     ie_idx,
     ie_phase,
+    ge_idx,
     ge_phase,
     first: cutlass.Constexpr[bool],
 ):
@@ -727,7 +752,9 @@ def _tma_issue_item(
     4, pre-armed).  The Q slot's wait is the arm's: ungated, ``mb_q_empty[slot]`` (row 2, pre-armed: Q(0), Q(1) pass fresh);
     gated, ``mb_gate_empty`` (row 12, pre-armed, ONE stage: Q(1) passes fresh, Q(j) waits epilogue(j - 2) -- the consumer of
     gate(j - 2) in this same slot), skipped for the prologue's Q(0) (``first``: a fresh slot, and the pre-armed pass is
-    Q(1)'s).  Returns the advanced PipelineStates as (idx, phase) pairs plus the gate-empty phase."""
+    Q(1)'s); the wait Q(n_items) would have taken is the caller's exit-path wait before the last gate.  Returns the advanced
+    PipelineStates as (idx, phase) pairs, the gate-empty consumer's (``ge``, one stage = CFG.STAGES_GATE, advanced per wait like
+    every other ring -- never a scalar parity toggle) included."""
     # --- the list (row 4 wait -> row 3 arm + copy)
     bars.mb_ids_empty[ie_idx].wait(ie_phase)
     bars.mb_ids_full[i_idx].arrive(n_bytes=IDS_TX_BYTES, pred=nvvm.elect_sync())
@@ -738,7 +765,8 @@ def _tma_issue_item(
     if cutlass.const_expr(CFG.EPILOGUE_GATE):
         if cutlass.const_expr(not first):
             bars.mb_gate_empty.wait(ge_phase)
-            ge_phase = ge_phase ^ cutlass.Int32(1)
+            ge_state = advance(PipelineState(idx=ge_idx, phase=ge_phase), CFG.STAGES_GATE)
+            ge_idx, ge_phase = ge_state.idx, ge_state.phase
     else:
         bars.mb_q_empty[qe_idx].wait(qe_phase)
     bars.mb_q_full[q_idx].arrive(n_bytes=Q_TX_BYTES, pred=nvvm.elect_sync())
@@ -747,7 +775,7 @@ def _tma_issue_item(
     qe_state = advance(PipelineState(idx=qe_idx, phase=qe_phase), STAGES_Q)
     i_state = advance(PipelineState(idx=i_idx, phase=i_phase), STAGES_IDS)
     ie_state = advance(PipelineState(idx=ie_idx, phase=ie_phase), STAGES_IDS)
-    return q_state.idx, q_state.phase, qe_state.idx, qe_state.phase, i_state.idx, i_state.phase, ie_state.idx, ie_state.phase, ge_phase
+    return q_state.idx, q_state.phase, qe_state.idx, qe_state.phase, i_state.idx, i_state.phase, ie_state.idx, ie_state.phase, ge_idx, ge_phase
 
 
 @cute.jit
@@ -777,18 +805,18 @@ def _tmaldg_warp_group(
     # Producer states (slot to fill next) and the pre-armed consumer states of the matching _empty rings (P5b: Q(0), Q(1)
     # and ids(0), ids(1) pass fresh barriers) -- all four carried across items.  Gated arm: qg_state is the gate's
     # wait-then-arrive consumer state of mb_q_empty (every commit consumed by its item's gate load, nothing left to drain) and
-    # ge_phase the pre-armed single-stage mb_gate_empty consumer (Q(1) passes fresh; Q(j) waits epilogue(j - 2)); the ungated
-    # arm's qe_state keeps its role there and is unused here.
+    # ge_state the pre-armed mb_gate_empty consumer (one stage = CFG.STAGES_GATE, advanced per wait like every other ring: Q(1)
+    # passes fresh; Q(j) waits epilogue(j - 2)); the ungated arm's qe_state keeps its role there and is unused here.
     q_state = PipelineState.start(phase=0)
     qe_state = PipelineState.start(phase=1)
     i_state = PipelineState.start(phase=0)
     ie_state = PipelineState.start(phase=1)
     qg_state = PipelineState.start(phase=0)
-    ge_phase = cutlass.Int32(1)
+    ge_state = PipelineState.start(phase=1)
 
     # Prologue: the first item's loads (its coordinates are this CTA's grid position, decoded like every later payload).
     _tok, head, _batch, item_row, _kvb, _sq, out_tok, out_batch, _split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
-    qi, qp, qei, qep, ii, ip, iei, iep, ge_phase = _tma_issue_item(
+    qi, qp, qei, qep, ii, ip, iei, iep, gei, gep = _tma_issue_item(
         tma_q,
         sQ,
         sIds_raw,
@@ -806,13 +834,15 @@ def _tmaldg_warp_group(
         i_state.phase,
         ie_state.idx,
         ie_state.phase,
-        ge_phase,
+        ge_state.idx,
+        ge_state.phase,
         True,
     )
     q_state = PipelineState(idx=qi, phase=qp)
     qe_state = PipelineState(idx=qei, phase=qep)
     i_state = PipelineState(idx=ii, phase=ip)
     ie_state = PipelineState(idx=iei, phase=iep)
+    ge_state = PipelineState(idx=gei, phase=gep)
 
     # The CURRENT item's output coordinate (the gate's: O-shaped, (out_tok, out_batch) of _decode_item -- the packed token row
     # and batch 0 under THD); the payload below names the NEXT one.
@@ -829,7 +859,7 @@ def _tmaldg_warp_group(
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
         if is_valid > cutlass.Int32(0):
-            qi, qp, qei, qep, ii, ip, iei, iep, ge_phase = _tma_issue_item(
+            qi, qp, qei, qep, ii, ip, iei, iep, gei, gep = _tma_issue_item(
                 tma_q,
                 sQ,
                 sIds_raw,
@@ -847,17 +877,29 @@ def _tmaldg_warp_group(
                 i_state.phase,
                 ie_state.idx,
                 ie_state.phase,
-                ge_phase,
+                ge_state.idx,
+                ge_state.phase,
                 False,
             )
             q_state = PipelineState(idx=qi, phase=qp)
             qe_state = PipelineState(idx=qei, phase=qep)
             i_state = PipelineState(idx=ii, phase=ip)
             ie_state = PipelineState(idx=iei, phase=iep)
+            ge_state = PipelineState(idx=gei, phase=gep)
         if cutlass.const_expr(CFG.EPILOGUE_GATE):
             # The gate of the CURRENT item, after the next item's prefetch was queued (the Q / ids prefetch keeps its place
             # under this item's KV loop; the gate's wait is the item's LAST BMM1 -- the late one) and before the next credit
             # (which the softmax warps give only after epilogue(i), later than this issue).
+            if is_valid <= cutlass.Int32(0):
+                # The LAST item (row 12's exit path): no Q(i + 1) is issued, so the mb_gate_empty wait Q(i + 1) would have taken --
+                # the one that consumes epilogue(i - 1)'s release of the other slot -- is taken HERE, before gate(i) exists.  ORDER,
+                # not count: wait() returns when the barrier's parity differs from the waited one, so a consumer that falls TWO
+                # completions behind a single-stage barrier spins forever (parity(i - 1) == parity(i + 1)) -- a hang with correct
+                # numerics.  Taken here, completion i cannot land before this wait (it needs gate(i)), so the consumer is never more
+                # than one completion behind, and the exit drain below consumes exactly STAGES_GATE = 1 completion (epilogue(i)).
+                # n_items = 1: this is the pre-armed pass, taken while nothing can have arrived (gate(0) is issued after it).
+                bars.mb_gate_empty.wait(ge_state.phase)
+                ge_state = advance(ge_state, CFG.STAGES_GATE)
             qgi, qgp = _tma_issue_gate(tma_gate, sQ, bars, cur_out_tok, cur_head, cur_out_batch, qg_state.idx, qg_state.phase)
             qg_state = PipelineState(idx=qgi, phase=qgp)
         cur_out_tok, cur_head, cur_out_batch = out_tok, head, out_batch
@@ -867,12 +909,14 @@ def _tmaldg_warp_group(
         bars.mb_ids_empty[ie_state.idx].wait(ie_state.phase)
         ie_state = advance(ie_state, STAGES_IDS)
     if cutlass.const_expr(CFG.EPILOGUE_GATE):
-        # Row 12: n_items completions, n_items - 1 loop waits of which ONE was the pre-armed pass -> exactly STAGES_GATE + 1
-        # = 2 unconsumed for every n_items >= 1 (n_items = 1: the first drain wait IS the pass, the second consumes
-        # epilogue(0)).  Row 2 needs no drain here: every mb_q_empty commit was consumed by its item's gate load.
-        for _ in cutlass.range_constexpr(CFG.STAGES_GATE + 1):
-            bars.mb_gate_empty.wait(ge_phase)
-            ge_phase = ge_phase ^ cutlass.Int32(1)
+        # Row 12: n_items completions against n_items waits -- n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass,
+        # Q(j)'s = epilogue(j - 2)) plus the exit-path wait taken above BEFORE the last gate (= epilogue(n_items - 2); the pass
+        # itself at n_items = 1) -> exactly STAGES_GATE = 1 unconsumed (epilogue(n_items - 1)) for every n_items >= 1, and the
+        # consumer never two completions behind the single-stage barrier.  Row 2 needs no drain here: every mb_q_empty commit
+        # was consumed by its item's gate load.
+        for _ in cutlass.range_constexpr(CFG.STAGES_GATE):
+            bars.mb_gate_empty.wait(ge_state.phase)
+            ge_state = advance(ge_state, CFG.STAGES_GATE)
     else:
         # The last STAGES_Q q_empty commits need a waiter.
         for _ in cutlass.range_constexpr(STAGES_Q):
@@ -1197,8 +1241,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
         bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p)
         bars.mb_q_empty[q_state.idx].arrive(cta_group=1, pred=elect_p & (n_tiles == cutlass.Int32(1)))
         kv_state = advance(kv_state, STAGES_KV)
-        s_state = advance(s_state, 2)
-        s_empty_state = advance(s_empty_state, 2)
+        s_state = advance(s_state, STAGES_S)
+        s_empty_state = advance(s_empty_state, STAGES_S)
 
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             # BMM1(i + 1) ahead of BMM2(i): the softmax of tile i overlaps the next score tile, and the K slot is released as
@@ -1213,8 +1257,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
                 bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p1)
                 bars.mb_q_empty[q_state.idx].arrive(cta_group=1, pred=elect_p1 & ((i + cutlass.Int32(2)) == n_tiles))
                 kv_state = advance(kv_state, STAGES_KV)
-                s_state = advance(s_state, 2)
-                s_empty_state = advance(s_empty_state, 2)
+                s_state = advance(s_state, STAGES_S)
+                s_empty_state = advance(s_empty_state, STAGES_S)
 
             # BMM2(i): V(i) is the next load of the ring, P^T(i) the softmax's publish.
             bars.mb_kv_full[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
@@ -1234,8 +1278,8 @@ def _mma_warp_group(sQ, sK, sVt, sP, tmem_ptr_i32, bars, sched, block_lens_tenso
             bars.mb_bmm2_done[bmm2_state.idx].arrive(cta_group=1, pred=elect_p2)
             bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=elect_p2)
             kv_state = advance(kv_state, STAGES_KV)
-            p_state = advance(p_state, 2)
-            bmm2_state = advance(bmm2_state, 2)
+            p_state = advance(p_state, STAGES_S)
+            bmm2_state = advance(bmm2_state, STAGES_S)
 
         q_state = advance(q_state, STAGES_Q)
 
@@ -1316,10 +1360,11 @@ def _softmax_warp_group(
     t_state = PipelineState.start(phase=0)
     bmm2_state = PipelineState.start(phase=0)
     ids_state = PipelineState.start(phase=0)
-    # Gated arm (barrier rows 11 / 12): gf_phase = the mb_gate_full wait (wait-then-arrive, one stage: the k-th wait returns on
-    # gate(k)), qslot_state = the item's Q^T slot (i % 2, the same item sequence the TMA and MMA warps walk) that holds its gate.
+    # Gated arm (barrier rows 11 / 12): gf_state = the mb_gate_full consumer state (wait-then-arrive, one stage = CFG.STAGES_GATE,
+    # advanced per wait like every other ring: the k-th wait returns on gate(k)), qslot_state = the item's Q^T slot (i % 2, the same
+    # item sequence the TMA and MMA warps walk) that holds its gate.
     # The gate's per-lane address parts: lane = d, so sub (the 64-wide subtile) and c (the column inside it) are item-invariant.
-    gf_phase = cutlass.Int32(0)
+    gf_state = PipelineState.start(phase=0)
     qslot_state = PipelineState.start(phase=0)
 
     tok, head, batch, item_row, _kvb, eff_seqlen_q, out_tok, out_batch, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
@@ -1420,7 +1465,7 @@ def _softmax_warp_group(
             # on top.  Skipped when no column's max moved.
             if i > cutlass.Int32(0):
                 bars.mb_bmm2_done[bmm2_state.idx].wait(bmm2_state.phase, spin=SPIN_RING_WAITS)
-                bmm2_state = advance(bmm2_state, 2)
+                bmm2_state = advance(bmm2_state, STAGES_S)
                 nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
                 if ~all_one:
                     for blk_o in cutlass.range_constexpr(O_BLOCKS):
@@ -1433,7 +1478,7 @@ def _softmax_warp_group(
             # Publish P^T(t) (and the rescaled O^T) to the MMA warp.
             nvvm.tcgen05_fence(nvvm.Tcgen05Fence.BEFORE_THREAD_SYNC)
             bars.mb_p_full[par].arrive()
-            t_state = advance(t_state, 2)
+            t_state = advance(t_state, STAGES_S)
 
         # The last read of this item's list slot (row 4: ONE lane per consuming warp).
         if nvvm.elect_sync():
@@ -1442,15 +1487,15 @@ def _softmax_warp_group(
 
         # --- epilogue: the item's last BMM2 must land before O^T is read (one wait per tile: this is the last tile's).
         bars.mb_bmm2_done[bmm2_state.idx].wait(bmm2_state.phase)
-        bmm2_state = advance(bmm2_state, 2)
+        bmm2_state = advance(bmm2_state, STAGES_S)
         nvvm.tcgen05_fence(nvvm.Tcgen05Fence.AFTER_THREAD_SYNC)
 
         # Column sums over the 128 lanes (once per item), via the epilogue slot.
-        red_epi = cutlass.Int32(2 * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
+        red_epi = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS) + sm_warp * cutlass.Int32(COLS)
         for j in cutlass.range_constexpr(COLS):
             (red_ptr + (red_epi + cutlass.Int32(j))).store(_warp_reduce_sum(cutlass.Float32(l_vec[j])))
         nvvm.barrier_cta_sync(barrier_id=_BAR_SOFTMAX, thread_count=BAR_SOFTMAX_THREADS)
-        red_epi_read = cutlass.Int32(2 * SOFTMAX_WARPS * COLS)
+        red_epi_read = cutlass.Int32(STAGES_S * SOFTMAX_WARPS * COLS)
 
         lse_cols = []
         inv_cols = []
@@ -1503,8 +1548,8 @@ def _softmax_warp_group(
         half_opaque = ZERO
         if cutlass.const_expr(CFG.EPILOGUE_GATE):
             half_opaque = gate_half_opaque()
-            bars.mb_gate_full.wait(gf_phase)
-            gf_phase = gf_phase ^ cutlass.Int32(1)
+            bars.mb_gate_full.wait(gf_state.phase)
+            gf_state = advance(gf_state, CFG.STAGES_GATE)
             gate_slot_elems = qslot_state.idx * cutlass.Int32(qBufferElems)
             qslot_state = advance(qslot_state, STAGES_Q)
 
@@ -1614,7 +1659,7 @@ def _kernel(
 
     # SMEM in the header table's order: the descriptor-read operands first (1024-B aligned), the register-addressed buffers last.
     sQ_raw = cutlass.Array(STORAGE_DTYPE, STAGES_Q * qBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
-    sP_raw = cutlass.Array(cutlass.Int32, 2 * pBufferWords, alignment=1024, space=cutlass.AddressSpace.smem)
+    sP_raw = cutlass.Array(cutlass.Int32, STAGES_S * pBufferWords, alignment=1024, space=cutlass.AddressSpace.smem)
     sKV_raw = cutlass.Array(STORAGE_DTYPE, STAGES_KV * kvBufferElems, alignment=1024, space=cutlass.AddressSpace.smem)
     sIds_raw = cutlass.Array(cutlass.Int32, STAGES_IDS * IDS_SLOT_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
     red_smem = cutlass.Array(cutlass.Float32, RED_WORDS, alignment=16, space=cutlass.AddressSpace.smem)
@@ -1654,11 +1699,11 @@ def _kernel(
         layout=SMEM_LAYOUT_QK,
         desc_version=DESC_VERSION,
     )
-    # P^T: the MN-major B operand of BMM2, two buffers of TILE_N key rows.
+    # P^T: the MN-major B operand of BMM2, STAGES_S buffers of TILE_N key rows.
     sP = SmemTile(
         base=sP_raw,
         elems_per_stage=pBufferWords,
-        stages=2,
+        stages=STAGES_S,
         leading_byte_offset=0,
         stride_byte_offset=STRIDE_BYTE_OFFSET_P,
         layout=SMEM_LAYOUT_P,
@@ -1689,7 +1734,7 @@ def _kernel(
             for s in cutlass.range_constexpr(STAGES_KV):
                 bars.mb_kv_full[s].init()
                 bars.mb_kv_empty[s].init()
-            for p in cutlass.range_constexpr(2):
+            for p in cutlass.range_constexpr(STAGES_S):
                 bars.mb_s_full[p].init()
                 bars.mb_s_empty[p].init()
                 bars.mb_p_full[p].init()

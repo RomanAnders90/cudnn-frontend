@@ -347,6 +347,8 @@ _DECLINES = [
         id="write_through_x_thd",
     ),
     pytest.param(dict(is_causal=False), QsaSpec(), {}, torch.bfloat16, ValueError, "is_causal=True", id="bidirectional"),
+    # a negative attn_scale: the block's geometry refuses it by name for every pipeline (the standalone sparse adapter SERVES it signed)
+    pytest.param(dict(attn_scale=-0.0625), QsaSpec(), {}, torch.bfloat16, ValueError, "attn_scale must be > 0", id="negative_attn_scale"),
     pytest.param(dict(window_left=64), QsaSpec(), {}, torch.bfloat16, ValueError, "sliding window", id="window"),
     pytest.param({}, QsaSpec(top_k=516), {}, torch.bfloat16, ValueError, "top_k", id="top_k_516"),
     pytest.param({}, QsaSpec(top_k=0), {}, torch.bfloat16, ValueError, "top_k", id="top_k_0"),
