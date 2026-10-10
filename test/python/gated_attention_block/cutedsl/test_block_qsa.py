@@ -20,6 +20,7 @@ import sys
 import pytest
 import torch
 
+from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import (
     GatedAttentionBlockBwd,
     GatedAttentionBlockFwd,
@@ -50,6 +51,13 @@ pytestmark = pytest.mark.L0
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 
 _DEV = "cuda" if torch.cuda.is_available() else "cpu"
+
+# The sibling block modules skip as a WHOLE below FROST's CuTe DSL floor (``cutedsl_requirement_error``).  This module's
+# declaration cells need no DSL at all, so they keep running on a release DSL below the floor; only the arms that ask the
+# block's stages, the sparse adapter or the in-block indexer's declaration to answer (they import their CuTe DSL kernels, or
+# read the scorer's package) skip there -- ``_needs_dsl_floor`` on the test, or a ``pytest.skip`` ahead of the one such arm.
+_CUTEDSL_REQUIREMENT = cutedsl_requirement_error("the gated attention block's stages")  # None at or above the floor
+_needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
 
 # The 24-query-head / 2-KV-head d256 geometry of the block-sparse model at TP 1 (d_model 2560, rope 64), with the
 # indexer band: (4 + 1) x 128 = 640 columns below V -> N = 13312 + 640 = 13952.
@@ -434,6 +442,7 @@ def test_thd_under_qsa_declares_the_packed_sparse_stage():
             st.execute(q, kv, kv, o, lse=lse, seq_lens=lens, block_ids=ids)
 
 
+@_needs_dsl_floor
 def test_an_indexer_declaration_builds_the_indexer_stage_and_the_execute_contract_flips():
     """``QsaSpec(index_source="indexer")`` CONSTRUCTS (no host sync): the indexer stage sits right before the sparse SDPA in the
     stage list; below the identity bound it reserves nothing (the carve is the caller-list block's, the selection a plan-time
@@ -581,10 +590,13 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
     with _no_host_sync():
         blk = GatedAttentionBlockFwd(**kw, geometry=geom)
         assert isinstance(blk._sdpa, _SparseSdpa) and blk.qsa is geom.qsa
-        assert blk._stages[-1 - 2] is blk._sdpa or blk._sdpa in blk._stages  # in pipeline order, before the gate and the out projection
+        i = blk._stages.index(blk._sdpa)  # in pipeline order: the sparse stage, then the gate, then the out projection
+        assert blk._stages[i + 1 :] == (blk._gate, blk._out_proj)
         assert blk._sdpa.token_stride == geom.n_qkvg == 5760  # the slab's stride, like the dense stage would read it
         blk._check_declaration()  # the five-band W_qkvg [5760, 512] and every descriptor pass
         if torch.cuda.is_available():
+            if _CUTEDSL_REQUIREMENT is not None:
+                pytest.skip(str(_CUTEDSL_REQUIREMENT))  # the stages ahead import their CuTe DSL kernels to answer check_support()
             cc = tuple(torch.cuda.get_device_capability())
             if cc != (10, 7):
                 with pytest.raises(NotImplementedError, match=rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}"):
@@ -718,6 +730,7 @@ def _adapter_request(**over):
     return SparseGqaFwdDslSm107(**kw)
 
 
+@_needs_dsl_floor
 def test_adapter_accept_decline_set_equals_the_record():
     """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
     the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
@@ -809,6 +822,7 @@ def test_adapter_accept_decline_set_equals_the_record():
         req._bind("seq_kv_lens", SparseOperandDesc((1,), (1,), torch.int32), None, required=False)
 
 
+@_needs_dsl_floor
 def test_the_dsl_floor_declines_through_the_block_before_any_kernel_import(monkeypatch):
     """AGENTS.md Rule 7 through the BLOCK: a too-old DSL is a typed version decline from the sparse stage's ``check_support``
     (the adapter's first check), raised before the kernel module is loaded -- never a ``KeyError('sm_107a')`` from inside the

@@ -400,19 +400,26 @@ def test_sm107_paged_cga1_domain_is_distinct_from_dense_and_quantized(monkeypatc
 @requires_dsl
 @pytest.mark.parametrize("splits", [2, 3, 8])
 @pytest.mark.parametrize("cga", [None, 2])
-def test_paged_d256_split_explicit_contract(monkeypatch, splits, cga):
-    """The D256 packed ABI requires CGA2, paged half storage and its native binder."""
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 3), (10, 7)])
+@pytest.mark.parametrize("paged", [False, True])
+def test_d256_thd_split_explicit_contract(monkeypatch, splits, cga, device_cc, paged):
+    """The D256 packed ABI requires CGA2, half storage and its native binder."""
     from cudnn.frost import buffers
 
     monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
-    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
-    facts = _paged_split_facts(device_cc=(10, 7), d_qk=256, d_v=256)
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _paged_split_facts(device_cc=device_cc, d_qk=256, d_v=256, has_paged_kv=paged, page_size=16 if paged else 0)
     knobs = heur.SdpaFwdKnobs(cga=cga, split_kv=splits, pack_gqa=False)
     assert mismatch(spec.capabilities, facts, knobs) is None
     assert heur.SdpaFwdKnobs.from_public({int(k): v for k, v in knobs.to_public().items()}) == knobs
     for invalid in (replace(knobs, cga=1), replace(knobs, pack_gqa=True)):
         assert mismatch(spec.capabilities, facts, invalid) is not None
-    for invalid in (replace(facts, has_paged_kv=False), replace(facts, thd=False), replace(facts, has_sink=True), replace(facts, has_epilogue_gate=True)):
+    for invalid in (
+        replace(facts, has_sink=True),
+        replace(facts, has_epilogue_gate=True),
+        replace(facts, attn_scale_prefolded=True),
+        replace(facts, wants_stats=True, stats_t=SimpleNamespace(ragged_offset=None)),
+    ):
         assert mismatch(spec.capabilities, invalid, knobs) is not None
     previous = type("PreviousNativeBinder", (), {"supports_paged_packed_split": True})
     monkeypatch.setattr(cudnn._pybind_module, "_SdpaThdBinder", previous)
@@ -482,6 +489,37 @@ def test_d128_thd_grid_bound_matches_all_ragged_partitions(batch, max_q, group):
         bounded = replace(facts, max_total_seq_len_q=total)
         assert heur._d128_thd_split_units(bounded, group) == worst
     assert heur._d128_thd_split_units(facts, group) == worst
+
+
+@requires_dsl
+@pytest.mark.parametrize("device_cc", [(10, 0), (10, 7)])
+@pytest.mark.parametrize("group", [1, 4, 8])
+@pytest.mark.parametrize("shape_overrides", [False, True])
+@pytest.mark.parametrize("wants_stats", [False, True])
+def test_paged_split_redundant_sequence_bound_preserves_geometry(device_cc, group, shape_overrides, wants_stats):
+    """A total-token bound already limits every sequence; extra rectangular slack adds no work."""
+    spec = next(s for s in ENGINE_SPECS if s.name == ("sdpa_fwd_prefill_sm107" if device_cc == (10, 7) else "sdpa_fwd_prefill_sm100"))
+    facts = _paged_split_facts(
+        device_cc=device_cc,
+        device_sm_count=204,
+        b=3,
+        h_q=4 * group,
+        h_kv=4,
+        s_q=127,
+        max_total_seq_len_q=127,
+        shape_overrides=shape_overrides,
+        wants_stats=wants_stats,
+    )
+    # Both declarations admit exactly the same query-length distributions.
+    # Compare them to each other, without pinning a winning split or packing.
+    assert heur.paged_thd_split_choice(spec.capabilities, facts) == heur.paged_thd_split_choice(spec.capabilities, replace(facts, s_q=1024))
+
+
+@requires_dsl
+def test_paged_split_empty_declared_capacity_has_no_division():
+    spec = next(s for s in ENGINE_SPECS if s.name == "sdpa_fwd_prefill_sm107")
+    facts = _paged_split_facts(device_cc=(10, 7), max_total_seq_len_q=0)
+    assert heur.paged_thd_split_choice(spec.capabilities, facts)[0] == 1
 
 
 @requires_dsl
