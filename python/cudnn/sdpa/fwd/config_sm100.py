@@ -776,7 +776,7 @@ def cga_tile_m(d_qk: int, cta_mma: Optional[int] = None) -> int:
     CGA-width knob (D192). This keeps scheduler and heuristic geometry tied to
     the configuration the launcher actually uses.
     """
-    cls = {64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
     if d_qk == 128 and cta_mma == 1:
         # cga1 on the d128 f16/bf16 flavor IS the decode tile (sm100/decode_d128_f16.py,
         # TILES_Q=1): one 128-row Q tile per CTA, not the prefill kernel's two.
@@ -790,7 +790,7 @@ def cga_ctas(d_qk: int, cta_mma: Optional[int] = None) -> int:
     Public CGA selects the MMA width. It is not a physical launch count for
     the role-split D512 flavor, whose CGA_M/CTA_MMA ratio is two.
     """
-    cls = {64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
+    cls = {32: CfgD32, 64: CfgD64, 128: CfgD128, 192: CfgD192, 256: CfgD256, 512: CfgD512}[d_qk]
     return cls.CGA_M // cls.CTA_MMA * (cls.CTA_MMA if cta_mma is None else cta_mma)
 
 
@@ -2547,6 +2547,11 @@ SM100_ARCH = D128FamilyArch(name="SM100", smem_usable_bytes=_SM100_MAX_DYN_SMEM,
 # operand would be a 16-column atom no shipped kernel runs -- declined until measured.
 SM100_F16_SMALL_D_SHAPES = frozenset({(32, 32), (64, 64)})
 SM100_SMALL_D_CGAS = {(32, 32): frozenset({1}), (64, 64): frozenset({1, 2})}
+# The small shape that carries the row's DENSE leg only on SM100 (the engine row's ``dense_only_d_shapes`` and the adapter's flavor pool read
+# ONE constant, rule 8b'): the 32-wide tile -- a graph that asks for THD, paged KV, split-KV, PackGQA, the score side outputs or a cga outside
+# {1} walks PAST it onto the native d64 flavor (which, unlike its Rubin twin, carries those legs itself) or the d128 one.  (64, 64) is NOT in
+# the set on SM100: the native d64 flavor serves THD / paged / split / PackGQA natively and keeps every leg it served before the small-tile seams.
+SM100_DENSE_ONLY_D_SHAPES = frozenset({(32, 32)})
 # The KV tile widths each small shape renders (TemplateParams.tile_n): 64 / 128, as on Rubin; 256 is refused by the TMEM predicate.
 SM100_TILE_NS_BY_D_SHAPE = (((32, 32), frozenset({64, 128})), ((64, 64), frozenset({64, 128})))
 # The K / V ring depth of the SM100 small tiles: 4 = the shipped sm100 d64 flavor's depth (its ncu read long_scoreboard as the dominant
