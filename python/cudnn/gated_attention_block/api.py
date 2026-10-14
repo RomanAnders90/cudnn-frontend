@@ -549,6 +549,7 @@ _KV_SOURCES = (KV_SOURCE_SELF, KV_SOURCE_PAGED)
 # bf16 d256 DECODE tile runs over that scratch; the sparse core is never taught fp8).  bf16 Q over an e4m3 pool ONLY: an fp8 Q is
 # a different function (the per-tensor FP8 SDPA rows take e4m3 Q / K / V together) and is not a form of this block.
 KV_CACHE_E4M3 = torch.float8_e4m3fn
+INDEX_CACHE_E4M3 = torch.float8_e4m3fn  # the fp8 INDEXER cache's element type (QsaSpec.index_cache_dtype): plain e4m3, no scales
 """``kv_cache_dtype``: e4m3 pools with per-tensor fp32 ``k_scale`` / ``v_scale`` at execute (the serving stacks' fp8 KV cache)."""
 _UPCAST_ROWS = (
     2176  # rows per (token, KV head) item of the gathered-cast scratch: 17 x the decode tile's 128-row KV tile (qsa_kv_upcast.ROWS, pinned at check_support)
@@ -807,6 +808,17 @@ class QsaSpec:
         names the two).  ``index_kv_heads`` is 1 (one raw key head, the checkpoint's own validator pins it);
         ``index_head_dim`` is a multiple of ``QKVG_TILE_ALIGN`` so every indexer head keeps the band tile-aligned.
 
+    index_cache_dtype
+        The INDEXER CACHE's element type under ``index_source="indexer"`` (appended): ``None`` -- the activation dtype, bf16:
+        the compressed keys and the indexer queries as the compress kernel writes them -- or ``torch.float8_e4m3fn``, the fp8
+        indexer cache: both as plain e4m3 of the same RMSNormed + rotated values (no scales), scored through the scorer's
+        MXFP8 arm with unit scale factors (``cudnn.gated_attention_block.qsa_select``'s e4m3 arm), the caller's
+        ``index_k_compressed`` then an e4m3 buffer.  NUMERICS-CHANGING (3 mantissa bits move the weakest selected blocks at
+        the k-th boundary: the selection agrees with the bf16 one on 99.0 % of the blocks at S = 4096, 97.4 % at 32768 and
+        96.5 % at 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute of ``QsaSpec`` itself, never
+        a knob; bf16 stays the default and the reference.  Refused under ``index_source="caller"``: nothing of the block
+        reads or writes an indexer cache there.
+
     Fixed semantics that are deliberately NOT fields: the open tail block is always visible, the causal mask is always
     applied, and the id dtype is int32 (one legal value; an int64 list is refused at ``execute``).  A dense route below
     the identity bound (:attr:`identity_bound` visible tokens -- 2051 at the defaults -- below which every query's
@@ -823,6 +835,13 @@ class QsaSpec:
     index_kv_heads: int = 1
     index_head_dim: int = 128
     index_norm_eps: float = 1e-6
+    index_cache_dtype: Optional[torch.dtype] = None  # appended: None = the activation dtype; torch.float8_e4m3fn = the fp8 indexer cache
+
+    @property
+    def index_cache_e4m3(self) -> bool:
+        """True under the fp8 indexer cache (``index_cache_dtype=torch.float8_e4m3fn``): the scorer reads e4m3 casts of the compressed keys
+        and the queries, and ``index_k_compressed`` is an e4m3 buffer."""
+        return self.index_cache_dtype == INDEX_CACHE_E4M3
 
     @property
     def index_band_cols(self) -> int:
@@ -871,6 +890,17 @@ class QsaSpec:
             )
         if not self.index_norm_eps > 0.0:
             raise ValueError(f"QsaSpec.index_norm_eps must be > 0, got {self.index_norm_eps}")
+        if self.index_cache_dtype is not None and self.index_cache_dtype not in (torch.bfloat16, INDEX_CACHE_E4M3):
+            raise ValueError(
+                f"QsaSpec.index_cache_dtype must be None (the activation dtype), torch.bfloat16 or torch.float8_e4m3fn (the fp8 indexer cache: plain "
+                f"e4m3 compressed keys and indexer queries through the scorer's MXFP8 arm with unit scales), got {self.index_cache_dtype}"
+                + (" -- e5m2 has no scorer arm (a different storage numerics)" if self.index_cache_dtype == torch.float8_e5m2 else "")
+            )
+        if self.index_cache_dtype == INDEX_CACHE_E4M3 and self.index_source != "indexer":
+            raise ValueError(
+                "QsaSpec.index_cache_dtype=torch.float8_e4m3fn requires index_source='indexer': under caller lists nothing of the block reads or writes "
+                "an indexer cache (the compressed keys and the queries are the stack's), so the declaration would be silently meaningless -- refused by name"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1578,6 +1608,11 @@ class _Intermediates:
     kv_inv: int = -1  # [2] fp32: 1 / k_scale, 1 / v_scale
     kv_gathered: int = -1  # [B x S_q x H_kv, 2, 2176, 256] bf16
     kv_len_t: int = -1  # [B x S_q x H_kv] int32
+    # fp8 indexer cache (``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``) only (-1 otherwise): the e4m3 indexer queries and compressed
+    # keys the scorer's MXFP8 arm reads, cast from ``ix_q`` / ``ix_kbar`` (below the identity bound only ``ix_kbar`` is reserved, as the
+    # cache cast's bf16 staging slot).  Appended LAST: every layout without the attribute is byte-identical to before.
+    ix_q8: int = -1  # [T, index_heads, index_head_dim] e4m3
+    ix_kbar8: int = -1  # [B, floor(S / block_size), index_head_dim] e4m3
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -1632,6 +1667,7 @@ def _plan_workspace(
     qsa_indexer_cand_floats: Optional[int] = None,
     kv_cache_e4m3: bool = False,
     upcast_items: int = 0,
+    qsa_indexer_e4m3: bool = False,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
 
@@ -1683,6 +1719,11 @@ def _plan_workspace(
     scratch sized at that many fp32) at the END of the unfused layout; every layout
     without it is byte-identical to before.
 
+    ``qsa_indexer_e4m3`` (appended; the fp8 indexer cache, ``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``): past the identity
+    bound the two e4m3 slots ``ix_q8`` / ``ix_kbar8`` follow the indexer's seven; below it ONE bf16 staging slot ``ix_kbar`` (the
+    cache cast's source) is reserved.  Only a declaration with the attribute reaches either: every layout without it is
+    byte-identical to before.
+
     Reserved in the order the stages write them, so a future fusion that deletes
     one leaves a contiguous prefix rather than a hole — forking stage (1) to
     write four compact buffers deletes ``proj`` and stage (3b) together.
@@ -1717,6 +1758,8 @@ def _plan_workspace(
             "qsa_indexer_cand_floats (the in-block indexer's workspace slots) belongs to the bf16 inference pipeline: the block declines the "
             "indexer under quant / save_for_backward at declaration, so a quantized or training carve never reserves them"
         )
+    if qsa_indexer_e4m3 and (fp8_fused or fp8 or want_saved):
+        raise ValueError("qsa_indexer_e4m3 (the fp8 indexer cache's slots) belongs to the bf16 inference pipeline, like the indexer's own slots")
     if kv_cache_e4m3 and fp8:
         raise ValueError(
             "kv_cache_e4m3 (the e4m3 KV cache) is a form of the bf16 pipeline: the quantized pipelines' K / V are e4m3 codes of another "
@@ -1835,8 +1878,13 @@ def _plan_workspace(
         # fp4 O (rows 8 / 9): the quantize_fp4 stage's packed codes + the out_proj GEMM's scale blob, at the END.
         slots += _o_fp4_slots(geom, t, o_fp4)
     if qsa_indexer_cand_floats is not None:
-        # The in-block indexer: its queries, compressed keys, selection and the scorer's scratch, after everything else.
-        slots += _qsa_indexer_slots(geom, b, s, e, qsa_indexer_cand_floats)
+        # The in-block indexer: its queries, compressed keys, selection and the scorer's scratch, after everything else (+ the two e4m3
+        # slots of the fp8 indexer cache).
+        slots += _qsa_indexer_slots(geom, b, s, e, qsa_indexer_cand_floats, e4m3=qsa_indexer_e4m3)
+    elif qsa_indexer_e4m3:
+        # The fp8 indexer cache below the identity bound: the bf16 staging slot of the cache cast only (the compress writes bf16, the e4m3
+        # cache is its cast); there is no scorer to feed.
+        slots += [("ix_kbar", b * (s // geom.qsa.block_size) * geom.qsa.index_head_dim * e)]
     if kv_cache_e4m3:
         # e4m3 KV cache (kv_cache_dtype): the quantizing write-through's compact e4m3 K / V rows and the two inverse scales; on the
         # block-sparse decode mode the gathered-cast scratch + its per-item lengths.  At the END: every layout without the attribute
@@ -1880,6 +1928,8 @@ def _plan_workspace(
         kv_inv=offsets.get("kv_inv", -1),
         kv_gathered=offsets.get("kv_gathered", -1),
         kv_len_t=offsets.get("kv_len_t", -1),
+        ix_q8=offsets.get("ix_q8", -1),
+        ix_kbar8=offsets.get("ix_kbar8", -1),
     )
 
 
@@ -1923,15 +1973,16 @@ def _qsa_cand_floats(batch: int, seq_len: int, block_size: int) -> int:
     return int(batch) * (int(block_size) * q * (q - 1) // 2 + q * (r + 1))
 
 
-def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, cand_floats: int) -> list:
+def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, cand_floats: int, e4m3: bool = False) -> list:
     """The in-block indexer's workspace slots, in the order its launches write them: the normed + rotated indexer
     queries ``ix_q`` ``[T, index_heads, index_head_dim]``, the compressed keys ``ix_kbar`` ``[B, floor(S / bs), index_head_dim]``
     (the scorer's key operand), the selection ``ix_ids`` / ``ix_scores`` ``[T, top_k]`` int32 / fp32 and the scorer's
     compact-logits scratch ``ix_cand`` (``cand_floats`` fp32).  Reserved only when the scorer runs (``S`` past the
-    identity bound); below it the block has nothing to select and the carve is the dense one."""
+    identity bound); below it the block has nothing to select and the carve is the dense one.  ``e4m3`` (appended; the fp8 indexer
+    cache) adds the two e4m3 slots ``ix_q8`` / ``ix_kbar8`` the scorer's MXFP8 arm reads, after the seven."""
     q = geom.qsa
     t = b * s
-    return [
+    slots = [
         ("ix_q", t * q.index_heads * q.index_head_dim * e),
         ("ix_kbar", b * (s // q.block_size) * q.index_head_dim * e),
         ("ix_ids", t * q.top_k * _itemsize(torch.int32)),
@@ -1940,6 +1991,9 @@ def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int
         ("ix_ids_sorted", t * q.top_k * _itemsize(torch.int32)),
         ("ix_sort_idx", min(t, _QSA_SORT_ROWS) * q.top_k * _itemsize(torch.int64)),
     ]
+    if e4m3:
+        slots += [("ix_q8", t * q.index_heads * q.index_head_dim), ("ix_kbar8", b * (s // q.block_size) * q.index_head_dim)]
+    return slots
 
 
 _QSA_SORT_ROWS = 4096
@@ -5645,7 +5699,8 @@ class _Indexer(_Stage):
     per-query selection stage (4) consumes, derived from the slab's fifth band instead of handed in by the caller.
 
     **Five launches at ``T <= 4096`` -- two compress, the scorer GEMM, the radix top-k, the row sort -- one more sort window
-    per further 4096 rows (:meth:`launches_per_execute`); no kernel of its own.**
+    per further 4096 rows (:meth:`launches_per_execute`); no kernel of its own.**  Two launches more under the fp8 indexer cache
+    (the paragraph below).
 
     1. The indexer QUERIES -- the band's ``index_heads`` x ``index_head_dim`` query columns of every token, RMSNormed
        (``w_iq_norm``, ``index_norm_eps``) and partially rotated at the token's position -- through the block-compress
@@ -5683,6 +5738,19 @@ class _Indexer(_Stage):
     -- and the sparse core masks every key past the length anyway.  The caller's ``index_k_compressed`` is NOT
     zero-filled: its rows past a sequence's blocks are the caller's.
 
+    **The fp8 indexer cache (``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``).**  The two compress launches keep writing bf16
+    (the one-rounding chain above); the FP8 pipeline's per-tensor cast (``kernels/quantize.py``, ``sat_e4m3(row x 1.0)`` -- the
+    plan-constant scale word 1.0 makes the code exactly the saturating round-to-nearest-even e4m3 of the bf16 value, never a NaN
+    from an out-of-range value) then writes the e4m3 queries into ``ix_q8`` and the e4m3 compressed keys into ``ix_kbar8``, and
+    :func:`qsa_select` scores the e4m3 pair through the DSA MXFP8 scorer with unit scale blobs
+    (``sum_h relu(e4m3(q_h) . e4m3(kbar_j)) / sqrt(D_i)``).  The caller's ``index_k_compressed`` is an e4m3 buffer written by one
+    more cast from the bf16 slot over the ``floor(S / bs)`` rows of every sequence -- under ``seq_lens`` the rows
+    ``[floor(S_b / bs), floor(S / bs))`` of a padded sequence receive ZEROS (the slot is zero-filled per execute, so the cast
+    writes a defined value, never stale bytes; the bf16 form leaves them untouched), rows at or past ``floor(S / bs)`` stay the
+    caller's in both forms.  Below the identity bound only the cache runs: the bf16 compress into a staging ``ix_kbar`` slot, the
+    cast into the cache (two launches where the bf16 form runs one).  The compress kernel's e4m3 store arm would fold the casts
+    away (a lever, not built).  No new kernel: the cast kernel has no SMEM and no mbarrier (its module docstring).
+
     **What it costs.**  ``ix_q`` ``T x H_i x D_i x 2`` B, ``ix_kbar`` ``B x S / bs x D_i x 2`` B, the list
     ``T x top_k x 8`` B, and the scorer's compact-logits scratch ``~ B x S^2 / (2 bs)`` fp32 (512 MiB per 32K-token
     sequence) -- the price of never materializing the dense ``[T, n_blocks]`` score tensor in one launch pair; a
@@ -5717,13 +5785,21 @@ class _Indexer(_Stage):
         self._q_recipe = self._k_recipe = None
         self._const = None  # plan-time device constants (compile): counts [T]; identity_ids [T, top_k] | cu_seqlens_q [B+1], cand_batch_offsets [B+1]
         self.launches = 0  # launches issued so far (a test pin of the short-circuit; the block never reads it)
+        # The indexer cache's dtype (QsaSpec.index_cache_dtype; None = the activation dtype).  e4m3 = the fp8 indexer cache (the class
+        # docstring): the scorer reads e4m3 casts of the bf16 slots and the caller's cache is e4m3.
+        self.cache_dtype = q.index_cache_dtype if q.index_cache_dtype is not None else dtype
+        self.fp8 = self.cache_dtype == INDEX_CACHE_E4M3
+        self._q8 = self._k8 = None  # the two cast recipes (fp8 only; _k8 None when S < block_size: no complete block)
+        self._one = None  # the casts' scale word, the plan constant 1.0 (fp8 only)
 
     def launches_per_execute(self, cache: bool) -> int:
         """Launches one ``execute`` issues: the cache compress iff a caller passes ``index_k_compressed``; past the identity
         bound also the key compress, the query norm, the scorer GEMM, the radix top-k and the row sort's windows."""
         if not self.selects:
-            return 1 if cache else 0
-        return (1 if cache else 0) + 4 + -(-(self.batch * self.seq_len) // _QSA_SORT_ROWS)
+            if not cache:
+                return 0
+            return (2 if self.n_blocks > 0 else 1) if self.fp8 else 1  # fp8: the staging compress + the cache cast
+        return (1 if cache else 0) + (6 if self.fp8 else 4) + -(-(self.batch * self.seq_len) // _QSA_SORT_ROWS)
 
     def check_support(self) -> None:
         """The scorer's contract (device-free, re-run so the stage is honest on its own), the CuTe DSL floor / target
@@ -5747,6 +5823,10 @@ class _Indexer(_Stage):
 
         for pool in (1, q.block_size):
             validate_compress_shape(q.index_head_dim, g.rope_dim, pool, DEFAULT_THREADS_PER_CTA)
+        if self.fp8:
+            from .kernels.quantize import validate_shape as validate_cast_shape
+
+            validate_cast_shape(q.index_head_dim, _ELEMENTWISE_THREADS)  # the per-tensor cast's row geometry at the indexer head dim
 
     def compile(self) -> None:
         """The two compress recipes, the plan-time constants, and -- when the scorer runs -- its warm-up at the real shape."""
@@ -5758,6 +5838,17 @@ class _Indexer(_Stage):
         self._k_recipe = compile_qsa_compress(
             dtype=self.dtype, d=q.index_head_dim, rope_dim=g.rope_dim, pool=q.block_size, has_seq_lens=self.seq_lens_present, table_dtype=self.dtype
         )
+        if self.fp8:
+            from .kernels.quantize import compile_quantize
+
+            # The casts of the fp8 indexer cache: the queries as [T, H_i, D_i] (past the bound) and the compressed keys as [B, n_blocks, D_i]
+            # (one recipe serves the workspace slot and the caller's cache, whose token stride is the cache's own; the cast kernel reads
+            # both in place); the scale word is the plan constant 1.0 -- x * 1.0 is exact, so the code is sat_e4m3(bf16 value).
+            self._one = torch.ones(1, dtype=torch.float32, device=dev)
+            if self.n_blocks > 0:
+                self._k8 = compile_quantize(dtype_in=self.dtype, h=self.n_blocks, d=q.index_head_dim, threads_per_cta=_ELEMENTWISE_THREADS)
+            if self.selects:
+                self._q8 = compile_quantize(dtype_in=self.dtype, h=q.index_heads, d=q.index_head_dim, threads_per_cta=_ELEMENTWISE_THREADS)
         pos = torch.arange(s, dtype=torch.int64, device=dev).repeat(b)  # [T]: row s of every batch entry sits at position s
         counts = torch.minimum(torch.div(pos + 1, q.block_size, rounding_mode="floor"), torch.full_like(pos, top_k))
         const = dict(counts=counts.to(torch.int32).contiguous())
@@ -5783,8 +5874,8 @@ class _Indexer(_Stage):
         self._const = const
         # Warm the scorer GEMM and the radix top-k at the REAL (B, S, n_blocks): their compile keys carry the shape, so a smaller
         # warm-up would leave a compile on the execute path.  Temporaries of the slot sizes, freed after one synchronous run.
-        qi = torch.zeros(t, q.index_heads, q.index_head_dim, dtype=self.dtype, device=dev)
-        kbar = torch.zeros(b, self.n_blocks, q.index_head_dim, dtype=self.dtype, device=dev)
+        qi = torch.zeros(t, q.index_heads, q.index_head_dim, dtype=self.cache_dtype, device=dev)  # e4m3 under the fp8 indexer cache
+        kbar = torch.zeros(b, self.n_blocks, q.index_head_dim, dtype=self.cache_dtype, device=dev)
         ids = torch.empty(t, top_k, dtype=torch.int32, device=dev)
         scores = torch.empty(t, top_k, dtype=torch.float32, device=dev)
         cand = torch.empty(self.cand_floats, dtype=torch.float32, device=dev)
@@ -5817,7 +5908,7 @@ class _Indexer(_Stage):
         if not self.selects:
             return None
         q, b, t = self.geom.qsa, self.batch, self.batch * self.seq_len
-        return dict(
+        v = dict(
             qi=_view(workspace, lay.ix_q, (t, q.index_heads, q.index_head_dim), self.dtype),
             kbar=_view(workspace, lay.ix_kbar, (b, self.n_blocks, q.index_head_dim), self.dtype),
             ids=_view(workspace, lay.ix_ids, (t, q.top_k), torch.int32),
@@ -5826,6 +5917,24 @@ class _Indexer(_Stage):
             ids_sorted=_view(workspace, lay.ix_ids_sorted, (t, q.top_k), torch.int32),
             sort_idx=_view(workspace, lay.ix_sort_idx, (min(t, _QSA_SORT_ROWS), q.top_k), torch.int64),
         )
+        if self.fp8:
+            v.update(
+                qi8=_view(workspace, lay.ix_q8, (t, q.index_heads, q.index_head_dim), INDEX_CACHE_E4M3),
+                kbar8=_view(workspace, lay.ix_kbar8, (b, self.n_blocks, q.index_head_dim), INDEX_CACHE_E4M3),
+            )
+        return v
+
+    def _staging(self, workspace: torch.Tensor, lay: "_Intermediates") -> torch.Tensor:
+        """The fp8 indexer cache BELOW the identity bound: the bf16 ``ix_kbar`` staging slot the cache cast reads (the only slot reserved)."""
+        q = self.geom.qsa
+        return _view(workspace, lay.ix_kbar, (self.batch, self.n_blocks, q.index_head_dim), self.dtype)
+
+    def _cast_cache(self, kbar16: torch.Tensor, cache: torch.Tensor, stream: int) -> None:
+        """The caller's e4m3 ``index_k_compressed``: ``sat_e4m3`` of the bf16 compressed keys over the ``n_blocks`` rows of every sequence,
+        the destination the cache's own ``[B, n_blocks, D_i]`` prefix at the cache's token stride (read and written in place)."""
+        from .kernels.quantize import run_quantize
+
+        run_quantize(self._k8, kbar16, cache[:, : self.n_blocks], self._one, stream=stream)
 
     def execute(
         self,
@@ -5858,11 +5967,22 @@ class _Indexer(_Stage):
         eps = float(q.index_norm_eps)
         # The raw indexer key: the band's last head, [B, S, D_i] at the slab's token stride (no copy); block j pools rows 4j .. 4j + 3.
         k_raw = torch.as_strided(proj, (b, s, d_i), (s * n, n, 1), proj.storage_offset() + g.index_k_raw_offset)
-        if index_k_compressed is not None:
-            # The caller's cache: rows [0, floor(S_b / bs)) of every sequence; the rest stays the caller's.
+        if index_k_compressed is not None and not self.fp8:
+            # The caller's bf16 cache: rows [0, floor(S_b / bs)) of every sequence; the rest stays the caller's.
             run_qsa_compress(self._k_recipe, k_raw, index_k_compressed, w_ik_norm, cos, sin, seq_lens, eps=eps, norm_weight_offset=0.0, stream=stream)
             self.launches += 1
         if not self.selects:
+            if index_k_compressed is not None and self.fp8:
+                # The caller's e4m3 cache below the bound: the bf16 compress into the staging slot (zero-filled under seq_lens, so a padded
+                # sequence's tail rows cast to ZEROS, never to stale bytes), then the cast into the cache -- two launches.
+                kb = self._staging(workspace, lay)
+                if self.seq_lens_present:
+                    _cu_check(cuda.cuMemsetD8Async(kb.data_ptr(), 0, kb.numel() * _itemsize(self.dtype), hs)[0], f"{self.name}: staging slot memset")
+                run_qsa_compress(self._k_recipe, k_raw, kb, w_ik_norm, cos, sin, seq_lens, eps=eps, norm_weight_offset=0.0, stream=stream)
+                self.launches += 1
+                if self._k8 is not None:
+                    self._cast_cache(kb, index_k_compressed, stream)
+                    self.launches += 1
             ids = self._const["identity_ids"]
             if block_ids_out is not None:
                 dst = block_ids_out.view(t, q.top_k)
@@ -5883,7 +6003,19 @@ class _Indexer(_Stage):
             cos_q = cos.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
             sin_q = sin.view(t, 1, g.rope_dim).expand(t, h_i, g.rope_dim)
             run_qsa_compress(self._q_recipe, q_raw, v["qi"], w_iq_norm, cos_q, sin_q, None, eps=eps, norm_weight_offset=0.0, stream=stream)
-            self._select(v["qi"], v["kbar"], v["ids"], v["scores"], v["cand"], stream=stream)
+            if self.fp8:
+                # The fp8 indexer cache: the e4m3 casts of both slots feed the scorer's MXFP8 arm; the caller's cache is one more cast.
+                from .kernels.quantize import run_quantize
+
+                run_quantize(self._q8, v["qi"], v["qi8"], self._one, stream=stream)
+                run_quantize(self._k8, v["kbar"], v["kbar8"], self._one, stream=stream)
+                self.launches += 2
+                if index_k_compressed is not None:
+                    self._cast_cache(v["kbar"], index_k_compressed, stream)
+                    self.launches += 1
+                self._select(v["qi8"], v["kbar8"], v["ids"], v["scores"], v["cand"], stream=stream)
+            else:
+                self._select(v["qi"], v["kbar"], v["ids"], v["scores"], v["cand"], stream=stream)
             # The canonical order: the top-k's slot order is unspecified (atomics), the core accumulates in list order, so each
             # row is sorted descending (ids descending, -1 last) in row windows of _QSA_SORT_ROWS into preallocated outputs --
             # torch's small-segment sort runs in place on the output, no temporaries (Rule 1), on the block's stream.
@@ -6528,6 +6660,16 @@ class GatedAttentionBlockFwd(APIBase):
     the in-kernel dequant arm), ``S_q > 4``, ``return_lse``, ``decode_split_kv > 1``, ``fuse_norm_rope`` / ``inplace_qkv=True``;
     pools of the wrong dtype (at declaration and at execute, both ways); the scales missing under the attribute or given
     without it.  The envelope says ``decode.kv_cache_dtypes``.
+
+    **The fp8 indexer cache (``QsaSpec(index_source="indexer", index_cache_dtype=torch.float8_e4m3fn)``; 2026-10-14)** -- the
+    in-block indexer's compressed keys and queries as plain e4m3 of the RMSNormed + rotated values (no scales; the caller's
+    ``index_k_compressed`` is then an e4m3 buffer), scored through :func:`qsa_select`'s e4m3 arm (the DSA MXFP8 scorer with unit
+    scale blobs).  A declaration attribute of ``QsaSpec`` itself, never a knob (3 mantissa bits move the weakest selected blocks at the
+    k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic
+    activations; bf16 stays the default and the reference).  No new kernel: the compress launches write bf16 as before and the
+    FP8 pipeline's per-tensor cast writes the e4m3 operands (two launches more; :class:`_Indexer`).  Typed declines: e5m2 and any
+    other dtype; the attribute under ``index_source="caller"``; f16 activations (the indexer's row); a cache of the other dtype at
+    execute, both ways; THD and the decode mode as for the bf16 indexer.
 
     **MXFP8** (an :class:`MxQuantSpec` + e4m3 codes + F8_128x4 SF blobs for ``h`` /
     ``W_qkvg``), UNFUSED (9 stages = 9 kernel launches)::
@@ -7389,9 +7531,12 @@ class GatedAttentionBlockFwd(APIBase):
                         f"index_k_compressed must be [B={self.batch}, >= {n_blocks} (the complete {q.block_size}-token blocks of S={self.seq_len}), "
                         f"{q.index_head_dim}] -- the compressed-key cache whose rows [0, floor(S_b / {q.block_size})) the block writes; got {shape}"
                     )
-                if x.dtype != self.act_dtype or not x.is_contiguous() or x.device != h.device:
+                cache_dtype = q.index_cache_dtype if q.index_cache_dtype is not None else self.act_dtype
+                if x.dtype != cache_dtype or not x.is_contiguous() or x.device != h.device:
                     raise ValueError(
-                        f"index_k_compressed must be a contiguous {self.act_dtype} tensor on h's device {h.device}, got {x.dtype} on {x.device}, "
+                        f"index_k_compressed must be a contiguous {cache_dtype} tensor (QsaSpec.index_cache_dtype={q.index_cache_dtype}: "
+                        f"{'the fp8 indexer cache' if cache_dtype == INDEX_CACHE_E4M3 else 'the activation dtype'}) on h's device {h.device}, got {x.dtype} on "
+                        f"{x.device}, "
                         f"strides {tuple(x.stride())}"
                     )
             if block_ids_out is not None:
@@ -8255,6 +8400,7 @@ class GatedAttentionBlockFwd(APIBase):
             qsa_indexer_cand_floats=self._indexer.cand_floats if (self._indexer is not None and self._indexer.selects) else None,
             kv_cache_e4m3=self.kv_cache_e4m3,
             upcast_items=(self.batch * self.seq_len * self.geom.h_kv) if self.upcast_decode else 0,
+            qsa_indexer_e4m3=(self._indexer is not None and self._indexer.fp8),
         )
 
     def get_workspace_size(self) -> int:

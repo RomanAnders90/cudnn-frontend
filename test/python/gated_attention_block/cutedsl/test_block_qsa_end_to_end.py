@@ -176,14 +176,16 @@ def _run(
     indexer=False,
     indexer_outputs=False,
     fuse_gate=False,
+    index_cache_dtype=None,
 ) -> _Cell:
     """Declare, check, compile and run a QsaSpec block ``launches`` times on sentinel-filled outputs; the oracle on the same
     inputs and list.  ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp`` / ``ref`` reuse another cell's.
     ``indexer=True`` declares ``index_source="indexer"`` (the band implied): the block derives the selection and the oracle
     runs on the KERNEL's list (``ix`` records it); ``indexer_outputs`` hands the three optional caller buffers in;
-    ``fuse_gate`` folds stage (5) into the sparse core's epilogue (the gated O is then the SDPA's own output in the same slot)."""
+    ``fuse_gate`` folds stage (5) into the sparse core's epilogue (the gated O is then the SDPA's own output in the same slot);
+    ``index_cache_dtype`` (appended) declares the indexer cache's dtype (``torch.float8_e4m3fn`` = the fp8 indexer cache)."""
     band = index_band or indexer
-    qsa = QsaSpec(top_k=top_k, index_band=band, index_source="indexer" if indexer else "caller")
+    qsa = QsaSpec(top_k=top_k, index_band=band, index_source="indexer" if indexer else "caller", index_cache_dtype=index_cache_dtype)
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=band))
     geom = GatedAttentionBlockGeometry(**geom_kw, qsa=qsa)
     if inp is None:
@@ -240,7 +242,7 @@ def _run(
             ix = dict(
                 ids_out=torch.full((t, top_k), -7, dtype=torch.int32, device="cuda"),
                 lens_out=torch.full((t,), -7, dtype=torch.int32, device="cuda"),
-                kbar_out=torch.full((batch, seq_len // BS + 3, geom.qsa.index_head_dim), float("nan"), dtype=dtype, device="cuda"),
+                kbar_out=torch.full((batch, seq_len // BS + 3, geom.qsa.index_head_dim), float("nan"), dtype=index_cache_dtype or dtype, device="cuda"),
             )
             ix_kw.update(block_ids_out=ix["ids_out"], block_lens_out=ix["lens_out"], index_k_compressed=ix["kbar_out"])
     runs = []
@@ -282,6 +284,8 @@ def _run(
             kernel_lens=k_lens,
             qi=None if v is None else v["qi"].clone(),
             kbar=None if v is None else v["kbar"].clone(),
+            qi8=None if (v is None or "qi8" not in v) else v["qi8"].clone(),  # the fp8 indexer cache's e4m3 operands
+            kbar8=None if (v is None or "kbar8" not in v) else v["kbar8"].clone(),
         )
         ids, lens_arg = k_ids, k_lens
         if ref is None:
@@ -1036,6 +1040,238 @@ def test_indexer_block_with_write_through_is_bitwise_the_one_without():
     live = slot >= 0
     s_ = slot[live].long()
     assert torch.equal(_bits(index_cache[s_ // ps, s_ % ps, :]), _bits(raw[0, live, 0]))
+
+
+# ============================================================================ the fp8 indexer cache (QsaSpec.index_cache_dtype)
+E4M3 = torch.float8_e4m3fn
+_E4M3_TOP_FRACTION = 0.08  # every flipped block within 8 % of the row's top bf16 score of the k-th (the standalone selector suite's bound)
+# per S: the floor of the e4m3-vs-bf16 set agreement over the sparse rows, set 0.5 % UNDER the lowest measured number (Rubin, 2026-10-14: 99.54 % at
+# S = 2560, 99.71 % at 2300 (B = 2, padded), 99.04 % at 4096 on the TP-1 geometry; the standalone selector's 12-seed spread at 4096 is 0.015 %) -- a
+# measured bound, never tuned upward; the agreement FALLS with S (the boundary density grows), so a longer S needs its own measured entry
+_E4M3_AGREEMENT_FLOOR = {2560: 0.985, 2300: 0.985, 4096: 0.985}
+
+
+def _bits8(x: torch.Tensor) -> torch.Tensor:
+    return x.view(torch.uint8)
+
+
+def _e4m3_cache_rows(kb8: torch.Tensor, kb16: torch.Tensor, nb: int, seq_lens, label: str) -> None:
+    """The caller's e4m3 ``index_k_compressed`` against the bf16 block's: the written rows are ``sat_e4m3`` of the bf16 cache rows
+    (the same compress kernel on the same inputs, then the cast), a padded sequence's tail rows ``[floor(S_b / 4), floor(S / 4))``
+    are ZEROS (the e4m3 form's contract), the rows past ``floor(S / 4)`` the caller's NaN sentinel in both forms."""
+    b = kb8.shape[0]
+    assert torch.isnan(kb8[:, nb:].float()).all() and torch.isnan(kb16[:, nb:].float()).all(), f"{label}: a row past the prompt's complete blocks was written"
+    for bi in range(b):
+        nb_b = nb if seq_lens is None else min(nb, int(seq_lens[bi]) // BS)
+        assert torch.equal(_bits8(kb8[bi, :nb_b]), _bits8(kb16[bi, :nb_b].to(E4M3))), f"{label}: entry {bi}: the e4m3 cache is not the cast of the bf16 one"
+        assert (kb8[bi, nb_b:nb].float() == 0).all(), f"{label}: entry {bi}: a padded sequence's tail rows are not zeros"
+        if nb_b < nb:
+            assert torch.isnan(kb16[bi, nb_b:nb].float()).all(), f"{label}: entry {bi}: the bf16 form wrote a padded sequence's tail rows"
+
+
+def _indexer_e4m3_two_stage(cell8: _Cell, cell16: _Cell, label: str) -> dict:
+    """Stage 1 of the two-stage oracle on an fp8-indexer-cache cell, beside the bf16 indexer block on the SAME inputs: the count rule,
+    the prefix form and the canonical order on every row; the launch census; the e4m3 operands BITWISE the e4m3 rounding of the
+    kernel's own bf16 slots; past the bound (a) the selection as a set == the top-k of the fp64 scores of the kernel's OWN e4m3
+    operands up to the fp32 tie budget (the arm computes its function), (b) against the fp32-operand oracle under the margin rule
+    with ``tol`` = the MEASURED e4m3 perturbation of the scores (+ the tie budget), (c) against the bf16 block's selection: the
+    agreement over the SPARSE rows (count == top_k) at or above the measured floor, every flipped block within 8 % of the row's top
+    bf16 score of the bf16 k-th score (a rank-boundary flip, never a dropped dominant block); the caller's cache rows pinned."""
+    geom, inp, ix8, ix16 = cell8.geom, cell8.inp, cell8.ix, cell16.ix
+    q = geom.qsa
+    b, s = inp["h"].shape[:2]
+    bs, top_k, d_i, h_i = q.block_size, q.top_k, q.index_head_dim, q.index_heads
+    dev = inp["h"].device
+    seq_lens = inp["seq_lens"]
+    lengths = torch.full((b,), s, dtype=torch.long, device=dev) if seq_lens is None else seq_lens.to(dev).long()
+    pos = torch.arange(s, device=dev)
+    counts = torch.minimum(torch.div(pos + 1, bs, rounding_mode="floor"), torch.tensor(top_k, device=dev)).expand(b, s)
+    k_ids, k_lens = ix8["kernel_ids"], ix8["kernel_lens"]
+    valid = k_ids >= 0
+    assert torch.equal(k_lens.long(), counts), f"{label}: the counts are not min(top_k, floor((pos + 1) / 4))"
+    assert torch.equal(valid, torch.arange(top_k, device=dev)[None, None, :] < counts[..., None]), f"{label}: the valid ids are not a prefix of the count"
+    n_exec = len(cell8.runs)
+    cache = "kbar_out" in ix8
+    assert ix8["launches"] == n_exec * cell8.blk._indexer.launches_per_execute(cache), f"{label}: {ix8['launches']} launches over {n_exec} executes"
+    assert cell8.blk._indexer.launches_per_execute(cache) == cell16.blk._indexer.launches_per_execute(cache) + (2 if ix8["selects"] else (1 if cache else 0))
+    nb = s // bs
+    m = dict(identity=not ix8["selects"], launches=ix8["launches"], executes=n_exec)
+    if cache:
+        _e4m3_cache_rows(ix8["kbar_out"], ix16["kbar_out"], nb, None if seq_lens is None else seq_lens.tolist(), label)
+    if not ix8["selects"]:
+        j = torch.arange(top_k, device=dev, dtype=torch.int32).expand(b, s, top_k)
+        assert torch.equal(torch.where(valid, k_ids, torch.full_like(k_ids, -1)), torch.where(valid, j, torch.full_like(j, -1))), f"{label}: not the identity"
+        assert torch.equal(k_ids, ix16["kernel_ids"])
+        print(f"\n{label}: the identity list (S <= {q.identity_bound}), {ix8['launches']} indexer launch(es) over {n_exec} executes (cache={cache})")
+        return m
+    diffs = (k_ids[..., :-1] - k_ids[..., 1:]).masked_fill(~valid[..., 1:], 1)
+    assert bool((diffs > 0).all()), f"{label}: a row's list is not in descending order"
+    # the operands: the kernel's e4m3 queries / compressed keys are the e4m3 rounding of ITS OWN bf16 slots (nothing near the e4m3 range)
+    for nm in ("qi", "kbar"):
+        x16, x8 = ix8[nm], ix8[nm + "8"]
+        assert float(x16.float().abs().max()) < 448.0, f"{label}: a {nm} value at or past the e4m3 range"
+        assert torch.equal(_bits8(x8), _bits8(x16.to(E4M3))), f"{label}: {nm}8 is not the e4m3 rounding of the bf16 slot"
+    # the bf16 block on the same inputs: its slots are bitwise this block's bf16 slots (one compress kernel, one set of inputs)
+    assert torch.equal(_bits(ix8["qi"]), _bits(ix16["qi"])) and torch.equal(
+        _bits(ix8["kbar"]), _bits(ix16["kbar"])
+    ), f"{label}: the bf16 slots differ between the two blocks"
+    ref_geom = RefQsaGeometry(**{k: getattr(geom, k) for k in ("d_model", "h_q", "h_kv", "d_head", "rope_dim")}, qsa=RefQsaSpec(top_k=top_k, index_band=True))
+    scores_o = qsa_indexer_reference(
+        inp["h"], inp["w_i"], inp["w_iq_norm"], inp["w_ik_norm"], None, None, inp["cos"], inp["sin"], ref_geom.qsa, ref_geom, seq_lens=seq_lens
+    )[0]
+    live = pos[None, :] < lengths[:, None]
+    limit = torch.arange(nb, device=dev)[None, None, :] < torch.div(pos + 1, bs, rounding_mode="floor")[None, :, None]
+
+    def own_scores(qi, kbar):
+        sc = torch.relu(torch.einsum("bshd,bjd->bshj", qi.view(b, s, h_i, d_i).double(), kbar.double())).sum(2) / math.sqrt(d_i)
+        return sc.masked_fill(~limit, float("-inf"))
+
+    s8, s16 = own_scores(ix8["qi8"].float(), ix8["kbar8"].float()), own_scores(ix16["qi"], ix16["kbar"])
+    in8 = _membership(k_ids.reshape(b * s, top_k), nb).view(b, s, nb)
+    in16 = _membership(ix16["kernel_ids"].reshape(b * s, top_k), nb).view(b, s, nb)
+    # (a) the set == the top-k of the kernel's own e4m3 operand scores up to ties
+    fl_a, rows_a, gap_a = _set_vs_topk(in8[live], s8[live], top_k, _TIE_TOL)
+    # (b) the margin rule vs the fp32-operand oracle: tol = the measured e4m3 perturbation of the scores
+    vis_live = torch.isfinite(scores_o) & live[..., None]
+    tol8 = float((scores_o.double() - s8).abs()[vis_live].max()) + _TIE_TOL
+    fl_b, rows_b, gap_b = _set_vs_topk(in8[live], scores_o[live].double(), top_k, tol8)
+    # (c) vs the bf16 block's selection on the SPARSE live rows: the agreement and the flipped blocks' distance from the bf16 k-th score
+    sparse = live & (counts == top_k)
+    n_sparse = int(sparse.sum())
+    agree = float(((in8 & in16).sum(-1).double() / top_k)[sparse].mean()) if n_sparse else 1.0
+    flipped = (in8 ^ in16) & sparse[..., None]
+    n_flip = int(flipped.sum())
+    max_rel_gap = 0.0
+    if n_flip:
+        kth16 = torch.where(in16, s16, torch.full_like(s16, float("inf"))).amin(-1)  # the bf16 k-th selected score per row
+        top16 = s16.amax(-1)
+        rel = ((s16 - kth16[..., None]).abs() / top16[..., None].clamp_min(1e-30))[flipped]
+        assert torch.isfinite(rel).all(), f"{label}: a flipped block outside the row's visible range"
+        max_rel_gap = float(rel.max())
+        assert (
+            max_rel_gap <= _E4M3_TOP_FRACTION
+        ), f"{label}: a flipped block {max_rel_gap:.3f} x the row's top score away from the bf16 k-th (bound {_E4M3_TOP_FRACTION})"
+    floor = _E4M3_AGREEMENT_FLOOR.get(s, 0.0)
+    assert agree >= floor, f"{label}: e4m3-vs-bf16 set agreement {100 * agree:.3f} % below the floor {100 * floor:.1f} % over {n_sparse} sparse rows"
+    m.update(
+        rows_live=int(live.sum()),
+        flips_vs_own=fl_a,
+        gap_vs_own=gap_a,
+        tol_oracle=tol8,
+        flips_vs_oracle=fl_b,
+        rows_vs_oracle=rows_b,
+        gap_vs_oracle=gap_b,
+        sparse_rows=n_sparse,
+        agreement_vs_bf16=agree,
+        flips_vs_bf16=n_flip,
+        max_rel_gap_vs_bf16=max_rel_gap,
+    )
+    print(
+        f"\n{label}: {int(live.sum())} live rows, {n_sparse} sparse; vs the kernel's own e4m3 operands {fl_a} flips ({rows_a} rows, gap {gap_a:.2e}); "
+        f"vs the fp32-operand oracle {fl_b} flips ({rows_b} rows, gap {gap_b:.3e} <= tol {tol8:.3e}); vs the bf16 block {100 * agree:.3f} % set agreement "
+        f"({n_flip} flipped blocks, max gap {100 * max_rel_gap:.2f} % of the row's top score; floor {100 * floor:.1f} %)"
+    )
+    return m
+
+
+# (id, geometry, B, S, seq_lens, caller outputs)
+_INDEXER_E4M3_MATRIX = [
+    pytest.param(GEOM_SMALL, 1, 2560, None, True, id="small8-2-s2560-e4m3-indexer-outputs"),
+    pytest.param(GEOM_SMALL, 2, 2300, (2300, 2100), True, id="small8-2-s2300-b2-e4m3-indexer-lens-2100-outputs"),
+    pytest.param(GEOM_FLASH_NEXT, 1, 4096, None, False, id="fn24-2-s4096-e4m3-indexer"),
+    pytest.param(GEOM_SMALL, 2, 2051, (2051, 1500), True, id="small8-2-s2051-b2-e4m3-identity-cache"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, batch, seq_len, seq_lens, outputs", _INDEXER_E4M3_MATRIX)
+def test_indexer_e4m3_cache_block_matches_the_two_stage_oracle_and_the_bf16_block(request, geom_kw, batch, seq_len, seq_lens, outputs):
+    """One fp8-indexer-cache cell beside the bf16 indexer block on the same inputs: stage 1 (``_indexer_e4m3_two_stage``), stage 2
+    (attention exact given the kernel's list, ``_check``), the list contract on every live row; below the identity bound the block
+    is bitwise the bf16 indexer block (the same identity list, the same core) and only the cache launches run."""
+    lens_t = None if seq_lens is None else _i32(list(seq_lens))
+    label = request.node.callspec.id
+    cell8 = _run(geom_kw, batch, seq_len, indexer=True, indexer_outputs=outputs, seq_lens=lens_t, seed=seq_len + 7 * batch + 1, index_cache_dtype=E4M3)
+    cell16 = _run(geom_kw, batch, seq_len, indexer=True, indexer_outputs=outputs, seq_lens=lens_t, inp=cell8.inp)
+    m1 = _indexer_e4m3_two_stage(cell8, cell16, label)
+    pos = torch.arange(seq_len, device="cuda").expand(batch, seq_len).reshape(-1)
+    kv = torch.full((batch * seq_len,), seq_len, dtype=torch.long, device="cuda") if lens_t is None else lens_t.long().repeat_interleave(seq_len)
+    live = pos < kv
+    bad = block_ids_contract_violations(
+        cell8.ids.reshape(batch * seq_len, -1)[live], pos[live], kv[live], block_size=BS, block_lens=cell8.lens.reshape(-1)[live], top_k=cell8.geom.qsa.top_k
+    )
+    assert bad == [], bad
+    m2 = _check(cell8, label)
+    if m1["identity"]:
+        assert torch.equal(_bits(cell8.runs[0][0]), _bits(cell16.runs[0][0])) and torch.equal(
+            cell8.runs[0][1], cell16.runs[0][1]
+        ), f"{label}: the identity path differs from the bf16 indexer block"
+    print(f"{label}: {m1} | {m2}")
+
+
+@requires_rubin
+def test_indexer_e4m3_cache_execute_captured_replays_bitwise_eager():
+    """The replay pin of the fp8 indexer cache: a FRESH e4m3-indexer declaration runs ONE eager execute on a new stream (the FROST GEMM's
+    graph route creates its handle there -- the route's own capture rule), then its next execute is captured in ``torch.cuda.graph`` on
+    that stream under ``set_sync_debug_mode("error")`` (no host sync inside: the casts' scale word, the unit scale blobs and the padded
+    prefixes are plan constants or sync-free device math); the capture launches nothing, the replay is bitwise the eager run of the
+    same declaration on ``out`` / the LSE, the list, the counts and the e4m3 cache, and a second replay is bitwise the first."""
+    geom_kw, B, S, top_k = GEOM_SMALL, 1, 2560, 512
+    eager = _run(geom_kw, B, S, indexer=True, indexer_outputs=True, seed=31, index_cache_dtype=E4M3, launches=1)
+    _indexer_e4m3_two_stage(eager, _run(geom_kw, B, S, indexer=True, indexer_outputs=True, inp=eager.inp), "small8-2 S=2560 e4m3 (eager twin)")
+    inp, geom = eager.inp, eager.geom
+    t = B * S
+    out = torch.empty(B, S, geom.d_model, device="cuda", dtype=BF16)
+    blk = GatedAttentionBlockFwd(inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, geom, return_lse=True)
+    assert blk.check_support()
+    blk.compile()
+    ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
+    lse = torch.empty(B, geom.h_q, S, device="cuda", dtype=torch.float32)
+    ids_out = torch.full((t, top_k), -7, dtype=torch.int32, device="cuda")
+    lens_out = torch.full((t,), -7, dtype=torch.int32, device="cuda")
+    kbar_out = torch.full((B, S // BS + 3, geom.qsa.index_head_dim), float("nan"), dtype=E4M3, device="cuda")
+    kw = dict(lse=lse, w_iq_norm=inp["w_iq_norm"], w_ik_norm=inp["w_ik_norm"], block_ids_out=ids_out, block_lens_out=lens_out, index_k_compressed=kbar_out)
+    args = (inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], out, ws)
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        blk.execute(*args, **kw)  # the one eager execute on the capture stream (the GEMM route's handle), its results checked below too
+    torch.cuda.synchronize()
+    warm = (out.clone(), lse.clone(), ids_out.clone(), lens_out.clone(), kbar_out.clone())
+    e_out, e_lse, _ = eager.runs[0]
+    assert (
+        torch.equal(_bits(warm[0]), _bits(e_out)) and torch.equal(warm[1], e_lse) and torch.equal(warm[2], eager.ix["ids_out"])
+    ), "the stream run differs from the eager twin"
+    out.fill_(float("nan"))
+    lse.fill_(float("nan"))
+    ids_out.fill_(-7)
+    kbar_out.fill_(float("nan"))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                blk.execute(*args, **kw)  # the second execute of this declaration, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(out).all() and (ids_out == -7).all(), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        rep = (out.clone(), lse.clone(), ids_out.clone(), lens_out.clone(), kbar_out.clone())
+        assert torch.isfinite(rep[0].float()).all()
+        assert torch.equal(_bits(rep[0]), _bits(e_out)) and torch.equal(rep[1], e_lse), "the replay differs from the eager e4m3 block on out / LSE"
+        assert torch.equal(rep[2], eager.ix["ids_out"]) and torch.equal(rep[3], eager.ix["lens_out"]), "the replay's list differs from the eager one"
+        assert torch.equal(_bits8(rep[4]), _bits8(eager.ix["kbar_out"])), "the replay's e4m3 cache differs from the eager one"
+        # a second replay over the same pointers is bitwise the first (no state leaks between replays)
+        out.fill_(float("nan"))
+        ids_out.fill_(-7)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(out), _bits(rep[0])) and torch.equal(ids_out, rep[2])
+    finally:
+        graph.reset()
 
 
 # ============================================================================ THD: packed sequences through the sparse stage
