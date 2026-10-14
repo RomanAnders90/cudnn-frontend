@@ -528,15 +528,6 @@ PAGED_KV_PAGE_ALIGN = 16
 """``paged_kv_page_size`` must be a positive multiple of this: the serving stacks allocate pages in multiples of 16 tokens,
 and 4 | 16 keeps every 4-token sparse block inside one page (a block never straddles a page boundary)."""
 
-# A DECLARATION ATTRIBUTE of the serving surface sits beside QsaSpec, on ``GatedAttentionBlockFwd`` itself, as a compile-key
-# field that never enters a knob dataclass or an autotuner: ``paged_kv_page_size`` changes the INPUT CONTRACT -- the post-RoPE
-# K / V are written through into paged pools at a slot mapping, so ``execute`` takes pools and a slot mapping it otherwise
-# refuses.  (A cache dtype other than the activation dtype would be a NUMERICS change -- fp8 rounding of the cached K / V -- so
-# it too arrives as an attribute, never a knob.)
-PAGED_KV_PAGE_ALIGN = 16
-"""``paged_kv_page_size`` must be a positive multiple of this: the serving stacks allocate pages in multiples of 16 tokens,
-and 4 | 16 keeps every 4-token sparse block inside one page (a block never straddles a page boundary)."""
-
 # The SECOND serving attribute: where stage (4) reads K / V from.  ``"self"`` (the default) is the block as it always was --
 # attention over the step's own K / V (the slab bands or the compact buffers).  ``"paged"`` is the EXTEND form: the step's
 # tokens are written through into the pools first (the write-through above, which it therefore requires) and the SDPA reads
