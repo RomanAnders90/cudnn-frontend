@@ -1525,9 +1525,9 @@ def test_fuse_gate_under_qsa_matches_the_oracle_and_the_unfused_block(geom_kw, b
 # ============================================================================ fuse_gate x THD under QsaSpec: the gated packed cells
 def test_fuse_gate_with_thd_under_qsa_declares_the_gated_packed_sparse_stage():
     """Host: ``thd=True`` together with ``fuse_gate=True`` under a ``QsaSpec`` CONSTRUCTS -- the sparse core's epilogue gate composes
-    with its packed arm (the GATE is the packed ``[1, T, H_q, D]`` slab slice like O), so the dense pipeline's 'no THD gate
-    descriptor' decline is the dense SDPA's alone and keeps firing there: the sparse stage carries both arms, stage (5) is not
-    built, the declared GATE operand is the slab slice at the fused projection's token stride beside the packed lengths."""
+    with its packed arm (the GATE is the packed ``[1, T, H_q, D]`` slab slice like O): the sparse stage carries both arms, stage (5)
+    is not built, the declared GATE operand is the slab slice at the fused projection's token stride beside the packed lengths.
+    The DENSE packed block folds its gate too (the SDPA's THD gate descriptor), so neither pipeline builds stage (5) under thd."""
     geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec())
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     z = lambda *shape, dt=BF16: torch.zeros(*shape, dtype=dt, device=dev)  # noqa: E731
@@ -1547,8 +1547,8 @@ def test_fuse_gate_with_thd_under_qsa_declares_the_gated_packed_sparse_stage():
     assert ops["gate"] is not None and ops["gate"].shape == (1, 8, geom.h_q, geom.d_head) and ops["gate"].strides[1] == geom.n_qkvg
     assert ops["seq_q_lens"] is not None and ops["seq_q_lens"].shape == (2,)
     dense = GatedAttentionBlockGeometry(**GEOM_SMALL)
-    with pytest.raises(NotImplementedError, match="no THD gate descriptor"):
-        GatedAttentionBlockFwd(*args(dense), dense, thd=True, num_sequences=2, max_seq_len=8, fuse_gate=True)
+    dblk = GatedAttentionBlockFwd(*args(dense), dense, thd=True, num_sequences=2, max_seq_len=8, fuse_gate=True)
+    assert dblk.fuse_gate and dblk.gate_fused and dblk.thd and dblk._gate is None and not isinstance(dblk._sdpa, _SparseSdpa)
 
 
 def test_fuse_gate_with_bottom_right_under_qsa_is_the_decode_modes_typed_decline():
