@@ -206,6 +206,39 @@ def test_recommend_every_set_is_admissible():
 
 
 @pytest.mark.L0
+@pytest.mark.parametrize("b,h", [(65536, 1), (1, 65536)], ids=["batch", "heads"])
+def test_grid_past_65535_rides_the_flat_lpt_grid(b, h):
+    """#1573: NATURAL launches heads and batch on gridDim.y/z, capped at 65535 by CUDA."""
+    facts = _facts(b=b, h_q=h, h_kv=h, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    natural = engines.SdpaFwdKnobs(sched_policy=SCHED_NATURAL, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=1)
+    assert "gridDim.y/z" in engines.mismatch(caps, facts, natural)
+    # The split-KV combine launches heads and batch on y/z whatever the scheduler.
+    split_lpt = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    assert "split-KV combine" in engines.launch_grid_mismatch(caps, facts, split_lpt)
+    for kind in ("A", "FALLBACK"):
+        plans = [p for p in recommend(kind, facts, _OFFERED) if p.engine_id == 20500]
+        assert plans, kind
+        assert all(p.knobs.sched_policy in (SCHED_LPT, SCHED_LPT_L2) and (p.knobs.split_kv or 1) == 1 for p in plans), [p.knobs for p in plans]
+    control = _facts(b=65535, h_q=1, h_kv=1, s_q=128, s_kv=64, d_qk=64, d_v=64, causal=False)
+    assert engines.mismatch(caps, control, natural) is None
+    assert recommend("A", control, _OFFERED)[0].knobs.sched_policy == SCHED_NATURAL
+
+
+@pytest.mark.L0
+def test_packed_thd_split_keeps_batch_off_the_grid():
+    """#1573: the packed THD combine launches ((t_q+3)//4, heads, 1), so only heads meet the 65535 cap."""
+    caps = next(s for s in engines.ENGINE_SPECS if s.name == _F16).capabilities
+    split = engines.SdpaFwdKnobs(sched_policy=SCHED_LPT, tile_m=128, tile_n=128, cga=1, pack_gqa=False, split_kv=2)
+    thd = dict(s_q=8, s_kv=2048, causal=False, thd=True, max_total_seq_len_q=8)
+    facts = _facts(b=65536, h_q=1, h_kv=1, **thd)
+    assert engines.packed_thd_split(caps, facts, split)
+    assert engines.launch_grid_mismatch(caps, facts, split) is None
+    heads = _facts(b=1, h_q=65536, h_kv=65536, **thd)
+    assert "packed split-KV combine" in engines.launch_grid_mismatch(caps, heads, split)
+
+
+@pytest.mark.L0
 @pytest.mark.parametrize(
     "engine_name,dtype,is_fp8",
     [
@@ -231,6 +264,31 @@ def test_sm120_d192_keeps_sm120_cga_domain(engine_name, dtype, is_fp8):
     assert all(plan.knobs.cga == 1 for plan in plans)
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == engine_name)
     assert all(engines.mismatch(spec.capabilities, facts, plan.knobs) is None for plan in plans)
+
+
+@pytest.mark.L0
+@pytest.mark.parametrize("d_qk,d_v", [(64, 64), (128, 128), (192, 128), (256, 256), (80, 112)], ids=lambda d: str(d))
+def test_sm120_mxfp8_proposals_are_admissible_cga1_sets(d_qk, d_v):
+    """The SM120 MXFP8 row rides the SM120 tile rule, and no rule measured on another row (the SM100
+    MXFP8 d128 cga1 / cga2 choice) hands it a set outside its own domain."""
+    name = "sdpa_fwd_prefill_sm120_mxfp8"
+    spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
+    facts = _facts(
+        s_q=2048,
+        s_kv=2048,
+        d_qk=d_qk,
+        d_v=d_v,
+        dtype=cudnn.data_type.FP8_E4M3,
+        dtype_o=cudnn.data_type.BFLOAT16,
+        is_mxfp8=True,
+        device_cc=(12, 0),
+        device_sm_count=84,
+    )
+    plans = recommend("A", facts, {name: 20518})
+    assert plans
+    for plan in plans:
+        assert plan.knobs.cga == 1
+        assert engines.mismatch(spec.capabilities, facts, plan.knobs) is None
 
 
 @pytest.mark.L0
@@ -352,7 +410,10 @@ def test_sm120_fp8_dense_layouts_and_split_output(dim):
     ("mxfp8", "d_qk", "d_v", "expected_cga"),
     # Per-tensor FP8 d128 runs its unsplit leg at cga1 (one 256-row CTA, the
     # geometry cuDNN's fp8 kernel uses; B200: llama causal S=2K 1.18x -> 1.14x,
-    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair.
+    # AR-DiT no-split 1.07x -> 1.05x); MXFP8 d128 keeps the cga2 pair on a dense
+    # unsplit graph -- its cga1 serves only the packed-GQA banded leg while the
+    # per-tile K/V walk is at most _SM100_MXFP8_D128_CGA1_MAX_WALK keys; the split
+    # leg and the unpacked legs keep the pair (heuristics._auto_sched_cga).
     [(False, 128, 128, 1), (True, 128, 128, 2), (False, 256, 256, 1), (True, 256, 256, 1)],
     ids=["per_tensor-d128", "block_scale-d128", "per_tensor-d256", "block_scale-d256"],
 )
@@ -372,9 +433,10 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     assert plans
     unsplit = [plan for plan in plans if (plan.knobs.split_kv or 1) == 1]
     assert unsplit and {plan.knobs.cga for plan in unsplit} == {expected_cga}, [plan.knobs for plan in plans]
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        # Per-tensor FP8 d128 offers both widths; the split leg stays on the cga2
-        # pair (split_cgas_by_d_shape), so the plan list may carry both.
+    if (d_qk, d_v) == (128, 128):
+        # Both d128 quantized rows offer both widths (per-tensor: the split leg
+        # stays on the cga2 pair; MXFP8: cga1 only for the short-walk packed banded
+        # leg, the split leg keeps the pair), so the plan list may carry both.
         assert {plan.knobs.cga for plan in plans} <= {1, 2}
     else:
         assert {plan.knobs.cga for plan in plans} == {expected_cga}
@@ -382,8 +444,8 @@ def test_quantized_cga_follows_selected_native_flavor(mxfp8, d_qk, d_v, expected
     spec = next(spec for spec in engines.ENGINE_SPECS if spec.name == name)
     assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=expected_cga)) is None
     wrong_cga = 1 if expected_cga == 2 else 2
-    if not mxfp8 and (d_qk, d_v) == (128, 128):
-        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "per-tensor FP8 d128 builds at both widths"
+    if (d_qk, d_v) == (128, 128):
+        assert engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga)) is None, "the quantized d128 rows build at both widths"
     else:
         assert "outside this engine's domain" in engines.mismatch(spec.capabilities, facts, engines.SdpaFwdKnobs(cga=wrong_cga))
 
@@ -489,7 +551,8 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
     """The measured D256 picker says LPT for a masked block-scale graph; the cc 10.7 MXFP8 row claims NATURAL only at
     (256, 256), so every proposed set must be clamped into that domain -- the FALLBACK block had no entry at all and
     the A block kept only its NATURAL runner (test_d256_quantized_primary_uses_measured_scheduler keeps the SM100 row's
-    LPT, which that row's domain honours)."""
+    LPT, which that row's domain honours).  The width is the 2-CTA pair: the graph is a dense unsplit d256 MXFP8
+    leg on cc 10.7 (config_sm100.d256_mxfp8_pair_leg)."""
     name = engines.engine_name(mxfp8=True, arch="sm107")
     spec = next(s for s in engines.ENGINE_SPECS if s.name == name)
     facts = _facts(
@@ -509,7 +572,9 @@ def test_rubin_d256_mxfp8_masked_sets_stay_in_the_flavor_sched_domain(kind, sm10
     plans = recommend(kind, facts, {name: 20516})
     assert plans, f"{kind}: the row admits the graph (mismatch={engines.mismatch(spec.capabilities, facts)!r}) and must propose a set"
     assert all(engines.mismatch(spec.capabilities, facts, p.knobs) is None for p in plans)
-    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 1, 1)
+    # the dense unsplit d256 MXFP8 graph leads with the 2-CTA pair (config_sm100.d256_mxfp8_pair_leg); the policy stays
+    # clamped to NATURAL and the leg unsplit
+    assert (plans[0].knobs.sched_policy, plans[0].knobs.cga, plans[0].knobs.split_kv) == (SCHED_NATURAL, 2, 1)
 
 
 @pytest.mark.L0
@@ -841,7 +906,7 @@ def test_d128_width_rule_is_one_rule_for_graph_and_adapter():
     decode tile's rows decide (cga_tile_m(128, 1) == _D128_DECODE_TILE_ROWS);
     a ragged graph keeps cga2 unless it is the decode tile's ragged-Q leg.
     (The adapter's cga DOMAIN is #1094's
-    test_standalone_cga_domain_admits_cga1_on_d128_f16_only.)"""
+    test_standalone_cga_domain_cga1_is_a_decode_tile_only_on_d128_f16.)"""
     from cudnn.sdpa.fwd.config_sm100 import cga_tile_m, pack_gqa_group_size
     from cudnn.sdpa.fwd.heuristics import _D128_DECODE_TILE_ROWS, _d128_decode_tile_fits, select_d128_auto_cga
 

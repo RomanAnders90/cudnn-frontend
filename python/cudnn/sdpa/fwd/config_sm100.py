@@ -334,6 +334,15 @@ def supports_paged_d256_pack_gqa(d_shape, *, device_cc, fp8, thd, paged, cga, sp
     return device_cc == (10, 7) and d_shape == (256, 256) and not fp8 and thd and paged and cga in (None, 2) and split_kv == 1
 
 
+def d256_mxfp8_pair_leg(*, device_cc, pertensor, thd, paged, split_kv) -> bool:
+    """The d256 MXFP8 legs that run the 2-CTA pair (cta_group::2, K/V halved per CTA) on cc 10.7: dense queries,
+    unsplit, not THD, not paged.  Measured 2026-10-12 on cc 10.7 (B1 H32/8 GQA, CUDA-graph replay interleaved with the
+    one-CTA build, O bitwise identical between the widths): dense S=8k / 16k / 32k -8.5 / -10.1 / -13.3 %, causal (LPT)
+    -5.9 / -6.6 / -7.4 %.  The kernel's THD arm at the pair is untested, the split leg keeps one-CTA partials and the
+    paged loader was not measured at the pair, so those legs stay at cga1; per-tensor FP8 d256 keeps cga1 as well."""
+    return tuple(device_cc or ()) == (10, 7) and not pertensor and not thd and not paged and (split_kv or 1) == 1
+
+
 def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: bool = False) -> None:
     if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
         # The loader routes an index-list record (qsa_block_topk != 0) to the cc 10.7 sparse kernel
@@ -2078,8 +2087,8 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
         (cfg.TOTAL_WARPS == 16 and cfg.THREADS_PER_CTA == 512, "d128 (llama): 16 warps / 512 threads"),
         (cfg.READ_TILE_ARRIVERS == 15, f"d128 llama: expected READ_TILE_ARRIVERS=15, got {cfg.READ_TILE_ARRIVERS}"),
         (
-            cfg.STAGES_KV == ((2 if cfg.CTA_MMA == 1 else 4) if _fp8 else 2),
-            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 at cga1 — "
+            (cfg.STAGES_KV in (2, 3) if cfg.CTA_MMA == 1 else cfg.STAGES_KV == 4) if _fp8 else cfg.STAGES_KV == 2,
+            "d128 SM100: STAGES_KV must be 2 (f16/bf16) or, for fp8/mxfp8, 4 at cga2 and 2 or 3 at cga1 — "
             "the stage depth scales with the cluster width so stages x per-CTA-buffer stays constant",
         ),
         (
@@ -2108,7 +2117,9 @@ def _validate_cfg_d128(cfg: CfgD128) -> None:
             raise ValueError(msg)
 
 
-def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
+def make_cfg_d128(params: TemplateParams, *, cga1_kv_stages: int = 2) -> Tuple[CfgD128, TmaIters]:
+    """``cga1_kv_stages``: K/V ring depth of the fp8 family's single-CTA (cga1) configuration -- 2 by default (the
+    per-tensor fp8 kernel's verified geometry); the MXFP8 kernel asks for 3 (see STAGES_KV below)."""
     _validate_params("d128", params)
     b = bpe(params.dtype_qkv)
     fp8 = params.dtype_qkv <= 1  # E4M3/E5M2 inputs → MXFP8 kernel
@@ -2149,7 +2160,10 @@ def make_cfg_d128(params: TemplateParams) -> Tuple[CfgD128, TmaIters]:
         # cga1 configuration keeps STAGES_KV=2.  mxfp8 additionally stages E8M0
         # scale factors that the SMEM model cannot see, and at STAGES_KV=4 that
         # pushed a cga1 CTA to 237024 B against the 232448 B cap.
-        STAGES_KV=(2 if params.cta_mma == 1 else 4) if fp8 else 2,
+        # The MXFP8 kernel takes a THIRD full-width stage at cga1 (cga1_kv_stages=3): Q and O already share a slab
+        # there, so 3 x (16 K + 16 V) KiB plus the scale factors still fit, and the deeper prefetch covers the
+        # tile boundary of the short packed GQA legs that run cga1.
+        STAGES_KV=(cga1_kv_stages if params.cta_mma == 1 else 4) if fp8 else 2,
         MASK_FLAGS=_mask_flags_from(params),
         WINDOW_LEFT=params.window_left or 0,
         WINDOW_RIGHT=params.window_right or 0,

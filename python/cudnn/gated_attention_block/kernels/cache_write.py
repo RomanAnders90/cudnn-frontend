@@ -26,6 +26,8 @@ Traffic per launch: ``n_ops * T * H * D * elem`` read + the same written, plus `
 HBM bytes; no perf claim is made here until one is measured on an exclusive GPU.
 """
 
+import hashlib
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -33,10 +35,12 @@ import cutlass
 import cutlass.cute as cute
 import torch
 
+from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global_v4
 
+from ..cache_write_contract import _SLOT_DTYPES, check_pool, check_slot_mapping
 from .elementwise import validate_shape
 from .qk_norm_rope import ACCESS_BYTES, fake_rowmajor_dynamic_token_stride, lanes_per_row, vec_chunks
 
@@ -47,8 +51,11 @@ DEFAULT_CONST_HEAD_COUNT = True
 re-measure per arch before changing them."""
 
 _IO_DTYPES = (torch.bfloat16, torch.float16)
-_SLOT_DTYPES = (torch.int32, torch.int64)
 _FAKE_STREAM = None
+# Imported normally (not through the template loader), so the module names its own source identity: ``template_key`` joins
+# it with a compile site's key to name the persistent object (``compiled_cache``); the cache's environment manifest covers
+# every other ``.py`` the kernel is traced from.
+FROST_SOURCE_DIGEST = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 
 
 def validate_cache_write_shape(d: int, page_size: int, threads_per_cta: int) -> None:
@@ -224,7 +231,7 @@ def _fake_pool(dtype, h: int, page_size: int, d: int):
     return cute.runtime.make_fake_tensor(
         dtype=_convert_to_cutlass_data_type(dtype),
         shape=(cute.sym_int(), h, page_size, d),
-        stride=(cute.sym_int(), cute.sym_int(), cute.sym_int(), 1),
+        stride=(cute.sym_int(width=64), cute.sym_int(width=64), cute.sym_int(width=64), 1),
         assumed_align=16,
     )
 
@@ -276,12 +283,15 @@ def compile_cache_write(
         current_device(),
     )
     if key not in compiled_cache:
+        # The dict stays the in-process memo; behind it sits the persistent compiled-plan cache (``cudnn.frost.compiled_cache``),
+        # keyed by this file's digest + the dict key's plain values: a second process reloads the object instead of re-tracing.
+        cache_key = template_key(globals(), {"key": key}, "compile_cache_write")
         tok = cute.sym_int()
         src_a = fake_rowmajor_dynamic_token_stride(dtype, tok, h, d)
         src_b = fake_rowmajor_dynamic_token_stride(dtype, tok, h, d) if two_operands else None
         pool_a = _fake_pool(dtype, h, page_size, d)
         pool_b = _fake_pool(dtype, h, page_size, d) if two_operands else None
-        compiled_cache[key] = cute.compile(
+        compiled_cache[key] = compile_cached(
             cache_write_launch,
             src_a,
             src_b,
@@ -302,6 +312,8 @@ def compile_cache_write(
             bool(use_pdl),
             _FAKE_STREAM,
             options="--enable-tvm-ffi",
+            cache_key=cache_key,
+            symbol="cudnn_block_cache_write",
         )
     return CacheWriteRecipe(
         compiled=compiled_cache[key],
@@ -313,44 +325,6 @@ def compile_cache_write(
         dtype=dtype,
         slot_dtype=slot_dtype,
     )
-
-
-def check_pool(pool: torch.Tensor, name: str, *, h: int, page_size: int, d: int, dtype, device=None) -> None:
-    """One pool against the kernel's contract, typed and naming the operand (no device read): a 4-D ``[P, H, page_size, D]``
-    tensor of ``dtype`` with ``D`` contiguous, ``P >= 1``, every other stride a whole number of 16-byte vectors and a 16-byte
-    aligned base (a ``st.global.v4`` target), on ``device`` when given.  HND compact and NHD strides both pass."""
-    if not isinstance(pool, torch.Tensor):
-        raise ValueError(f"{name} must be a [num_pages, {h}, {page_size}, {d}] {dtype} tensor, got {type(pool).__name__}")
-    if pool.dtype != dtype:
-        raise ValueError(f"{name} must be {dtype} (the activation dtype the K / V rows are written in), got {pool.dtype}")
-    if pool.dim() != 4 or tuple(int(x) for x in pool.shape[1:]) != (h, page_size, d) or int(pool.shape[0]) < 1:
-        raise ValueError(f"{name} must be [num_pages >= 1, H={h}, page_size={page_size}, D={d}] (HND compact, or NHD by strides), got {tuple(pool.shape)}")
-    strides = tuple(int(s) for s in pool.stride())
-    if strides[3] != 1:
-        raise ValueError(f"{name} must be contiguous along D (stride 1 on the last axis), got strides {strides}")
-    es = pool.element_size()
-    for ax, s in enumerate(strides[:3]):
-        if (s * es) % 16:
-            raise ValueError(f"{name} stride[{ax}] = {s} elements ({s * es} bytes) must be a multiple of 16 bytes (each row is written in 16-byte vectors)")
-    if device is not None and pool.device != torch.device(device):
-        raise ValueError(f"{name} must live on {device}, got {pool.device}")
-    if pool.data_ptr() % 16:
-        raise ValueError(f"{name} must be 16-byte aligned (a 16-byte vector-store target), got data_ptr={pool.data_ptr():#x}")
-
-
-def check_slot_mapping(slot: torch.Tensor, name: str, *, t: int, device=None) -> None:
-    """``slot_mapping`` against the kernel's contract, typed (no device read): a contiguous 1-D int32 / int64 tensor of
-    exactly ``T`` entries (one flat slot per token; the VALUES are device data the kernel range-checks), on ``device``."""
-    if not isinstance(slot, torch.Tensor):
-        raise ValueError(f"{name} must be a [{t}] int32 / int64 tensor (one flat slot per token), got {type(slot).__name__}")
-    if slot.dtype not in _SLOT_DTYPES:
-        raise ValueError(f"{name} must be int32 or int64, got {slot.dtype}")
-    if slot.dim() != 1 or int(slot.numel()) != t:
-        raise ValueError(f"{name} must be 1-D with exactly T={t} entries (one flat slot per token of this launch), got shape {tuple(slot.shape)}")
-    if not slot.is_contiguous():
-        raise ValueError(f"{name} must be contiguous, got strides {tuple(slot.stride())}")
-    if device is not None and slot.device != torch.device(device):
-        raise ValueError(f"{name} must live on {device}, got {slot.device}")
 
 
 def run_cache_write(r: CacheWriteRecipe, src_a, src_b, pool_a, pool_b, slot, *, stream) -> None:

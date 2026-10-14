@@ -68,10 +68,10 @@ both forward and backward APIs.
 
 ### FROST GATHER support
 
-The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER in
-both SM100 orientations, token-by-weight and weight-by-token (`SWAP_AB=1`),
-and in the SM120 token-by-weight path. Enable it with
-`CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before planning.
+The opt-in `frost_gemm` engine supports ordinary and block-scaled GATHER on
+SM100 and SM120, in both orientations: token-by-weight and weight-by-token
+(`SWAP_AB=1`). Enable it with `CUDNN_FRONTEND_ENABLE_FROST_ENGINES=1` before
+planning.
 
 Let `T` be the source token count and `R` the routed row count. Supply token
 `[1,T,K]`, weight `[E,K,N]`, INT32 `token_index` `[1,R,1]` with contiguous rows,
@@ -88,6 +88,15 @@ uses source-token order and is gathered with the same `token_index` as the
 token data. Token SFA in `F8_128x4` is not supported for GATHER. Weight scale
 factors (SFB) retain the per-expert `F8_128x4` layout. These public operand
 roles and layout requirements also apply with `SWAP_AB=1`.
+
+For all block-scaled FROST MoE modes, bind weight SF as a rank-3 byte buffer
+with E as its outermost axis. Each expert plane must be a dense packed
+`F8_128x4` blob containing at least
+`512 * ceil(N/128) * ceil((K/block)/4)` bytes. Its two inner axes may be
+permuted. The expert stride must be a multiple of 16 bytes and at least the
+full inner-plane byte span; padding between experts is supported. The base
+pointer must also be 16-byte aligned. Views that interleave experts, overlap
+planes, or expose insufficient plane capacity raise `ValueError` before launch.
 
 ```python
 fc1 = graph.moe_grouped_matmul(
@@ -107,16 +116,16 @@ needed. With `SWAP_AB=1`, tokens are the internal B operand and GATHER4 loads
 the token columns of the transposed matmul; the public tensors and routed
 output order stay the same. SM120 uses the `shared::cta` GATHER4 instruction
 with its existing warp-MMA mainloop and STG epilogue; its workspace remains
-the 128-byte scheduler counter. SM100 supports parallel GEMMs, including the
-gate/up pair for SwiGLU, sharing the same offsets and indices. SM120 retains
-its existing single-GEMM fusion support, including activation epilogues.
+the 128-byte scheduler counter. Both SM100 and SM120 support parallel GEMMs,
+including the gate/up pair for SwiGLU, sharing the same offsets and indices,
+in both orientations and for ordinary and block-scaled inputs.
 Output rows and row-wise epilogue auxiliaries use routed order.
 The existing dtype, layout, alignment, and fusion support gates still apply.
 
 ### FROST SCATTER support
 
-FROST supports SCATTER for ordinary and block-scaled MoE in both SM100
-orientations (`SWAP_AB=0/1`) and the SM120 token-by-weight path. The input and
+FROST supports SCATTER for ordinary and block-scaled MoE on SM100 and SM120,
+in both orientations (`SWAP_AB=0/1`). The input and
 its block scales keep their expert-grouped layout. The epilogue writes each
 routed row `r` to the expanded token slot:
 

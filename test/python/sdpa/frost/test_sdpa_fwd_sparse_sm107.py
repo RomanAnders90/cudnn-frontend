@@ -147,6 +147,14 @@ class _T:
         return True
 
 
+@pytest.fixture
+def sm107_host_target(monkeypatch):
+    """Model the compiler target for host contracts; native execution and target-decline tests use their own gates."""
+    import cudnn.frost.buffers as buffers
+
+    monkeypatch.setattr(buffers, "_cutedsl_has_sm107", lambda: True)
+
+
 def _operands(B=1, S=8, H=24, KH=2, SKV=None, dtype="torch.bfloat16", top_k=512):
     SKV = S if SKV is None else SKV
     q = _T((B, S, H, D), (S * H * D, H * D, D, 1), dtype)
@@ -158,6 +166,212 @@ def _operands(B=1, S=8, H=24, KH=2, SKV=None, dtype="torch.bfloat16", top_k=512)
 def _pool_strides(KH, P, hnd):
     """Strides of a ``[num_pages, KH, P, D]`` pool view: HND compact, or NHD storage ``[num_pages, P, KH, D]`` viewed as that shape."""
     return (KH * P * D, P * D, D, 1) if hnd else (P * KH * D, D, KH * D, 1)
+
+
+@pytest.mark.parametrize("operand", ["k", "v"])
+@pytest.mark.parametrize("KH,head_stride", [(2, 2**32 + D), (3, 2**30 + D)])
+def test_gather_column_range_checks_each_operand(operand, KH, head_stride, sm107_host_target):
+    """Both the stride itself and the head-index product must fit the gather descriptor's Int32 column coordinate."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    args = _operands(B=1, S=1, H=KH, KH=KH, top_k=4)
+    args[operand] = _T((1, 1, KH, D), (KH * head_stride, KH * head_stride, head_stride, 1), "torch.bfloat16")
+    with pytest.raises(NotImplementedError, match="Int32"):
+        SparseGqaFwdDslSm107(**args).check_support()
+
+
+@pytest.mark.parametrize("kind", ["expanded", "strided", "overlapping"])
+@pytest.mark.parametrize("thd", [False, True])
+def test_workspace_requires_contiguous_backing_storage(kind, thd, sm107_host_target):
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    args = _operands(B=1, S=1, H=2, KH=1, top_k=64)
+    if thd:
+        args.update(thd=True, seq_q_lens=_T((1,), (1,), "torch.int32"), seq_kv_lens=_T((1,), (1,), "torch.int32"))
+    else:
+        args.update(split_kv=2)
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    need = plan.scratch_workspace_bytes()
+    if kind == "expanded":
+        ws = torch.empty(1, dtype=torch.uint8).expand(need)
+    elif kind == "strided":
+        ws = torch.empty(2 * need, dtype=torch.uint8)[::2]
+    else:
+        ws = torch.empty(need, dtype=torch.uint8).as_strided((2, need // 2), (1, 1))
+    with pytest.raises(ValueError, match="workspace.*contiguous"):
+        plan._check_workspace(ws, 1)
+    # A contiguous suballocation is valid, but only its remaining bytes count.
+    backing = torch.empty(need + 32, dtype=torch.uint8)
+    plan._check_workspace(backing[16 : 16 + need], 1)
+    with pytest.raises(ValueError, match="workspace of.*bytes"):
+        plan._check_workspace(backing[16 : 16 + need - 1], 1)
+
+
+def _device_validation_plan(operand):
+    """Tiny real buffers, with entry interception below: even the RED test never dispatches an invalid pointer."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = torch.zeros((1, 4, 2, D), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, 4, 1, D), dtype=q.dtype, device=q.device)
+    args = dict(
+        q=q,
+        k=k,
+        v=k.clone(),
+        o=torch.empty_like(q),
+        lse=torch.empty((1, 2, 4), device=q.device),
+        block_ids=torch.zeros((1, 4, 64), dtype=torch.int32, device=q.device),
+        block_lens=torch.zeros((1, 4), dtype=torch.int32, device=q.device),
+        seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device),
+        epilogue_gate=torch.zeros_like(q),
+        top_k=64,
+        device_cc=(10, 7),
+    )
+    if operand == "block_table":
+        args.update(
+            paged_kv=True, page_size=4, k=k.transpose(1, 2), v=k.clone().transpose(1, 2), block_table=torch.zeros((1, 1), dtype=torch.int32, device=q.device)
+        )
+    if operand == "seq_q_lens":
+        args.update(thd=True, seq_q_lens=torch.tensor([4], dtype=torch.int32, device=q.device))
+    if operand == "workspace":
+        args.update(split_kv=2)
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    if plan.thd or plan.split_kv > 1:
+        plan.workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+    return plan
+
+
+@pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
+@pytest.mark.parametrize("binding", ["declared", "rebound"])
+def test_execute_rejects_cpu_storage_before_pointer_lowering(operand, binding, monkeypatch, sm107_host_target):
+    import cutlass.cute.runtime as runtime
+
+    plan = _device_validation_plan(operand)
+    invalid = getattr(plan, operand).cpu()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid operand reached pointer lowering or a kernel entry")
+
+    plan._fns = {False: forbidden, True: forbidden}
+    plan._combine = forbidden
+    monkeypatch.setattr(runtime, "make_ptr", forbidden)
+    if binding == "declared":
+        setattr(plan, operand, invalid)
+        bindings = {}
+    else:
+        bindings = {operand: invalid}
+    with pytest.raises(ValueError, match=operand + ".*CUDA storage"):
+        plan.execute(**bindings)
+
+
+@pytest.mark.parametrize("operand", ["q", "k", "v", "o", "lse", "block_ids", "block_lens", "seq_kv_lens", "block_table", "seq_q_lens", "gate", "workspace"])
+@pytest.mark.parametrize("device", ["cpu", "cuda:1"])
+def test_declarations_reject_non_cuda_or_mixed_devices(operand, device, sm107_host_target):
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
+
+    plan = _device_validation_plan(operand)
+    tensor = getattr(plan, operand)
+    # No second GPU is touched: descriptor device metadata alone must reject this binding.
+    other = SparseOperandDesc(tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, torch.device(device))
+    setattr(plan, operand, other)
+    with pytest.raises(ValueError, match="CUDA storage|execution device"):
+        plan.check_support()
+
+
+@pytest.mark.parametrize("declared_device", [None, "cuda:1"])
+def test_compilation_and_launch_preserve_the_declared_or_resolved_device(declared_device, monkeypatch, sm107_host_target):
+    """Intercept context changes/compilation: no second GPU or invalid launch is needed to prove context ownership."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, SparseOperandDesc
+    import cudnn.frost.template_loader as loader
+
+    args = _operands(B=1, S=1, H=2, KH=1, top_k=4)
+    for key in ("q", "k", "v", "o", "block_ids"):
+        t = args[key]
+        args[key] = SparseOperandDesc(t.shape, t.stride(), t.dtype, declared_device)
+    current, compiled, launched = [0], [], []
+
+    @contextmanager
+    def device_context(index):
+        old, current[0] = current[0], int(index)
+        try:
+            yield
+        finally:
+            current[0] = old
+
+    def compile_entry(**kwargs):
+        compiled.append(current[0])
+        return lambda **kw: None
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", device_context)
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=compile_entry))
+    plan = SparseGqaFwdDslSm107(**args)
+    plan.compile()
+    expected = 0 if declared_device is None else 1
+    current[0] = 1 - expected
+    plan.compile(has_block_lens=True)
+    assert compiled == [expected, expected]
+    assert current[0] == 1 - expected
+
+    bindings = {
+        key: SparseOperandDesc(args[key].shape, args[key].stride(), args[key].dtype, f"cuda:{1 - expected}") for key in ("q", "k", "v", "o", "block_ids")
+    }
+    with pytest.raises(ValueError, match="q.*execution device"):
+        plan.execute(**bindings)
+    # Matching bindings enter the pinned context even when the caller's current device differs.
+    bindings = {key: SparseOperandDesc(args[key].shape, args[key].stride(), args[key].dtype, f"cuda:{expected}") for key in bindings}
+    monkeypatch.setattr(plan, "_execute_on_device", lambda *a: launched.append(current[0]))
+    plan.execute(**bindings)
+    assert launched == [expected]
+    assert current[0] == 1 - expected
+
+
+def test_compilation_bypasses_argument_only_caches_across_devices(monkeypatch, sm107_host_target):
+    from contextlib import contextmanager
+    from functools import lru_cache
+    from types import SimpleNamespace
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107, SparseOperandDesc
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    import cudnn.frost.compiled_cache as cache
+    import cudnn.frost.template_loader as loader
+
+    current, kernels, combines = [0], [], []
+
+    @contextmanager
+    def context(index):
+        old, current[0] = current[0], int(index)
+        try:
+            yield
+        finally:
+            current[0] = old
+
+    @lru_cache(None)
+    def kernel(**kwargs):
+        kernels.append(current[0])
+        return lambda **kw: None
+
+    @lru_cache(None)
+    def combine(**kwargs):
+        combines.append(current[0])
+        return lambda *a: None
+
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: current[0])
+    monkeypatch.setattr(torch.cuda, "device", context)
+    monkeypatch.setattr(loader, "load_template", lambda *a, **kw: SimpleNamespace(compile=kernel))
+    monkeypatch.setattr(split_combine, "compile_ptr", combine)
+    monkeypatch.setattr(cache, "positional_entry", lambda owner: owner)
+    for device in (0, 1):
+        args = _operands(B=1, S=1, H=2, KH=1, top_k=64)
+        for key in ("q", "k", "v", "o", "block_ids"):
+            t = args[key]
+            args[key] = SparseOperandDesc(t.shape, t.stride(), t.dtype, f"cuda:{device}")
+        SparseGqaFwdDslSm107(**args, split_kv=2).compile()
+    assert kernels == [0, 1]
+    assert combines == [0, 1]
+    assert current[0] == 0
 
 
 def _paged_operands(B=1, S=64, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=512, hnd=True, max_pages=None, extra_pages=2):
@@ -177,7 +391,7 @@ def _paged_operands(B=1, S=64, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=5
     return o
 
 
-def test_adapter_accepts_the_record_and_builds_the_params():
+def test_adapter_accepts_the_record_and_builds_the_params(sm107_host_target):
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
 
     a = SparseGqaFwdDslSm107(**_operands())
@@ -189,7 +403,7 @@ def test_adapter_accepts_the_record_and_builds_the_params():
 
 @pytest.mark.parametrize("P", [16, 64, 48])
 @pytest.mark.parametrize("hnd", [True, False], ids=["HND", "NHD"])
-def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd):
+def test_adapter_accepts_the_paged_form_and_derives_the_pool_geometry(P, hnd, sm107_host_target):
     """``paged_kv=True`` with pools, a table and lengths is served (the record claims it); the template is the paged
     specialization with the lengths present; the per-operand row terms the kernel takes come from the strides: an HND pool
     folds the head into the row (``rows_per_head = P``, column head stride 0), an NHD pool keeps it in the column
@@ -230,7 +444,7 @@ def _decode_operands(B=1, S=1, H=24, KH=2, SKV=8192, dtype="torch.bfloat16", top
 
 @pytest.mark.parametrize("split_kv", [1, 2, 17])
 @pytest.mark.parametrize("paged", [False, True], ids=["dense", "paged16"])
-def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
+def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged, sm107_host_target):
     """The decode form (``list_per_sequence=True, bottom_right=True[, split_kv=S]``): accepted at ``S_q`` 1..4 over a dense tensor
     or paged pools, the three arms in the template record, a split's gate routed to the COMBINE (``epilogue_gate`` False in the
     record while the gate operand is kept), the workspace = the two fp32 partial slabs (+ the final-LSE scratch without an LSE),
@@ -273,7 +487,7 @@ def test_adapter_accepts_the_decode_form_and_builds_the_params(split_kv, paged):
     assert (b.template_params().bottom_right, b.template_params().qsa_list_per_sequence) == (True, False)
 
 
-def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
+def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed(sm107_host_target):
     """A negative attn_scale is SERVED by the sparse core, not declined: the adapter keeps the sign (``scale`` is what the kernel
     multiplies every raw score by before its column max) and never raises the dense line's ``TemplateParams.negate_scores``
     (BMM1 negating Q at |scale|), which the sparse body does not consume -- so neither path drops the sign.  The Rubin cell
@@ -390,9 +604,11 @@ def test_adapter_accepts_a_negative_scale_and_hands_it_to_the_kernel_signed():
         ),
         (lambda o: o.update(block_ids=_T((8, 512), (1024, 1), "torch.int64")), ValueError, "int32"),
         (lambda o: o.update(block_ids=_T((8, 256), (256, 1), "torch.int32")), ValueError, "block_ids must be"),
+        # Q is TMA-loaded: a (batch, seq, head) stride off the 16-byte grid (seq stride 24 x 256 + 4) is refused like the gate's
+        (lambda o: o.update(q=_T((1, 8, 24, D), (8 * (24 * D + 4), 24 * D + 4, D, 1), "torch.bfloat16")), ValueError, "multiples of 8 elements"),
     ],
 )
-def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
+def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word, sm107_host_target):
     """Every field of the record has a typed decline naming the feature (NotImplementedError = an unserved feature,
     ValueError = a malformed operand); nothing falls through to the kernel."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -465,7 +681,7 @@ def test_adapter_declines_every_unserved_request_by_name(mutate, exc, word):
         (lambda o: o.update(k=_T((6, 2, 16, D), _pool_strides(2, 16, True), "torch.float16")), ValueError, "dtype"),
     ],
 )
-def test_adapter_paged_form_checks(mutate, exc, word):
+def test_adapter_paged_form_checks(mutate, exc, word, sm107_host_target):
     """Every malformed paged request is refused by name before any kernel import: the page size (the one unserved FORM, a
     NotImplementedError), a missing table or length, a malformed table, and every pool stride the 2-D gather map cannot
     express (the page axis, the KV head count, the token / page / head strides, the head dim, the dtype)."""
@@ -477,7 +693,7 @@ def test_adapter_paged_form_checks(mutate, exc, word):
         SparseGqaFwdDslSm107(**o).check_support()
 
 
-def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
+def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration(sm107_host_target):
     """The mirror image: ``block_table`` / ``page_size`` belong to the paged read; a dense declaration refuses them rather than
     ignoring them, and a dense declaration refuses a table at execute (never a silent re-specialization)."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -496,7 +712,7 @@ def test_adapter_refuses_the_table_and_the_page_size_on_a_dense_declaration():
         a._bind("block_table", _T((1, 2), (2, 1), "torch.int32"), a.block_table, required=False)
 
 
-def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace():
+def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace(sm107_host_target):
     """``thd=True`` on packed operands (batch extent 1) with the two length tensors -- per-sequence ``[B]`` or cumulative
     ``[B + 1]`` per flag -- is served: the params carry ``thd_varlen`` (and the per-batch KV lengths the arm forces), the
     workspace is the THD metadata (``4 B + 4`` int32 words, 16-byte rounded), and the dense request keeps ``thd_varlen`` off."""
@@ -522,7 +738,7 @@ def test_adapter_accepts_a_packed_thd_request_and_sizes_its_workspace():
     assert a.check_support() and a.scratch_workspace_bytes() == 0 and not a.template_params().thd_varlen
 
 
-def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
+def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1(sm107_host_target):
     """The gather map is 2-D (tokens of every batch as rows): a batch stride other than S_kv x the token stride has no row
     coordinate -- declined at B >= 2, irrelevant at B == 1."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
@@ -536,6 +752,27 @@ def test_adapter_declines_a_padded_kv_batch_stride_at_B2_but_not_at_B1():
     k1 = _T((1, 8, 2, D), (16 * 2 * D, 2 * D, D, 1), "torch.bfloat16")
     o1.update(k=k1, v=k1)
     assert SparseGqaFwdDslSm107(**o1).check_support()
+
+
+def test_adapter_refuses_a_misaligned_operand_base_by_name():
+    """Every operand pointer reaches the kernel with ``assumed_align=16`` (a TMA tensor map's base, the bulk-copy source of an ids
+    row), so a view that starts a few elements into its storage is refused BY NAME -- at execute for the bound tensors and at
+    check_support for a declared tensor; a storage-free declaration has no address yet and is skipped.  Host-only: the rule is
+    about addresses, not devices."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc, _require_16b_base
+
+    base = torch.empty(64 + 16, dtype=torch.bfloat16)
+    k0 = next(k for k in range(8) if (base.data_ptr() + 2 * k) % 16 == 0)  # the first element on a 16-byte boundary
+    _require_16b_base("Q", base[k0 : k0 + 64].view(1, 1, 8, 8))  # aligned: silent
+    with pytest.raises(ValueError, match="Q must start at a 16-byte aligned address"):
+        _require_16b_base("Q", base[k0 + 1 : k0 + 65].view(1, 1, 8, 8))  # 2 bytes off the boundary
+    _require_16b_base("K", SparseOperandDesc((1, 8, 2, 256), (4096, 512, 256, 1), torch.bfloat16))  # no storage: nothing to check
+    _require_16b_base("the epilogue gate", None)
+    # the call sites: the six pointers of a launch at execute and the declared tensors at check_support
+    src = _adapter_source()
+    assert src.count("_require_16b_base(name, t)") == 2, "execute and check_support each run the alignment rule over the operand list"
+    for name in ('("Q", q)', '("K", k)', '("V", v)', '("O", o)', '("block_ids", ids)', '("the epilogue gate", gate)'):
+        assert name in src, f"execute binds {name} through the alignment rule"
 
 
 def test_adapter_dsl_gate_declines_by_name_before_the_kernel_import(monkeypatch):
@@ -690,7 +927,9 @@ def test_sparse_kernel_decode_form_source_pins():
     # the list reads offset by the chunk's first tile; the stores at the partial batch
     assert "_gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)" in code
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
-    assert "part_batch = out_batch + split * n_batch" in code and code.count("oo[part_batch, out_tok, head_base + cutlass.Int32(j), :]") == 2
+    assert "part_batch = out_batch + split * n_batch" in code
+    # All four gated/ungated store arms widen BEFORE forming an address; a narrow row subview can wrap a legal O stride.
+    assert code.count("cutlass.Int64(part_batch)") == 4 and "oo[part_batch" not in code
     assert "lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]" in code  # col = the group's head row (j at one column group)
     # the host: the grid, the partial slabs, the per-sequence list rows, the fp32 pointer + the LSE requirement
     assert "grid_shape = (SQ * SPLIT_KV, KH, B)" in code and "n_o_batches = B * SPLIT_KV" in code
@@ -871,6 +1110,131 @@ def _launch(q, k, v, ids, lens, kv_lens, top_k, scale, launches=2, o_shape=None,
         torch.cuda.synchronize()
         outs.append((o, lse))
     return outs
+
+
+@requires_rubin
+@pytest.mark.parametrize("mode", ["dense", "split", "thd"])
+@pytest.mark.parametrize("gated", [False, True])
+def test_valid_bindings_remain_capture_safe_with_changed_input_replays(mode, gated):
+    plan = _device_validation_plan({"dense": "o", "split": "workspace", "thd": "seq_q_lens"}[mode])
+    if not gated:
+        plan.gate = None
+    plan.v.fill_(3)
+    plan.compile()
+    plan.execute()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.execute()
+    for value in (4, 6, 8):
+        plan.v.fill_(value)
+        plan.o.fill_(-17)
+        graph.replay()
+        torch.cuda.synchronize()
+        expected = torch.zeros_like(plan.o)
+        expected[:, :3] = value * (0.5 if gated else 1)
+        assert torch.equal(plan.o, expected)
+        assert torch.isneginf(plan.lse[:, :, 3]).all()
+        expected_lse = torch.arange(1, 4, dtype=torch.float32, device=plan.q.device).log().expand(1, 2, 3)
+        torch.testing.assert_close(plan.lse[:, :, :3], expected_lse, atol=ATOL, rtol=0)
+
+
+@requires_rubin
+@pytest.mark.parametrize("layout", ["dense", "paged", "thd"])
+@pytest.mark.parametrize("bad_id", [2**29, 2**30, 2**31 - 1, -(2**31)])
+@pytest.mark.parametrize("softmax_groups", [1, 2])
+def test_extreme_block_ids_cannot_wrap_to_live_keys(layout, bad_id, softmax_groups):
+    """Block IDs are bounded BEFORE multiplying by four, in both the gather and softmax paths."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    q = torch.zeros((1, 4, 2, D), dtype=torch.bfloat16, device="cuda")
+    k = torch.zeros((1, 4, 1, D), dtype=q.dtype, device=q.device)
+    v = torch.full_like(k, 3)
+    o, lse = torch.full_like(q, -17), torch.full((1, 2, 4), -17.0, device=q.device)
+    ids = torch.full((1, 4, 4), -1, dtype=torch.int32, device=q.device)
+    ids[0, 3, 0] = bad_id
+    lens = torch.zeros((1, 4), dtype=torch.int32, device=q.device)
+    lens[0, 3] = 1
+    args = dict(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, top_k=4, softmax_groups=softmax_groups)
+    if layout == "paged":
+        args.update(
+            paged_kv=True,
+            page_size=4,
+            k=k.transpose(1, 2),
+            v=v.transpose(1, 2),
+            block_table=torch.zeros((1, 1), dtype=torch.int32, device=q.device),
+            seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device),
+        )
+    if layout == "thd":
+        args.update(
+            thd=True, seq_q_lens=torch.tensor([4], dtype=torch.int32, device=q.device), seq_kv_lens=torch.tensor([4], dtype=torch.int32, device=q.device)
+        )
+    plan = SparseGqaFwdDslSm107(**args)
+    assert plan.check_support()
+    if plan.thd:
+        plan.workspace = torch.empty(plan.scratch_workspace_bytes(), dtype=torch.uint8, device=q.device)
+    plan.compile()
+    for _ in range(2):
+        o.fill_(-17)
+        lse.fill_(-17)
+        plan.execute(stream=_stream())
+        torch.cuda.synchronize()
+        assert torch.equal(o[0, 3], torch.zeros_like(o[0, 3]))
+        assert torch.isneginf(lse[0, :, 3]).all()
+        assert torch.equal(o[0, :3], torch.full_like(o[0, :3], 3))
+
+
+@requires_rubin
+@pytest.mark.gpu_exclusive
+@pytest.mark.xdist_group(name="gpu_exclusive")
+@pytest.mark.parametrize("gated", [False, True])
+@pytest.mark.parametrize("softmax_groups", [1, 2])
+@pytest.mark.parametrize("wide_stride", [True, False])
+def test_output_address_uses_int64_before_any_subview(gated, softmax_groups, wide_stride):
+    """Exercise a >32-bit stride AND a <31-bit stride whose batch-index product overflows; guard the old wrapped addresses."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    H, KH, S = 12, 1, 1
+    B = 2 if wide_stride else 5
+    stride = (2**32 if wide_stride else 2**30) + H * D
+    offset = 0 if wide_stride else 2**31  # keeps even signed wrapped addresses inside this allocation in the RED run
+    elements = offset + (B - 1) * stride + H * D
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < elements * 2 + (1 << 30):
+        pytest.skip("the wide-output regression needs an 8–12 GiB allocation plus 1 GiB headroom")
+    try:
+        storage = torch.empty(elements, dtype=torch.bfloat16, device="cuda")
+    except torch.OutOfMemoryError:
+        pytest.skip("the wide-output backing allocation no longer fits in available GPU memory")
+    o = storage.as_strided((B, S, H, D), (stride, H * D, D, 1), storage_offset=offset)
+    live_offsets = {offset + b * stride for b in range(B)}
+    wrapped_offsets = set()
+    for b in range(B):
+        unsigned = (b * stride) % 2**32
+        signed = unsigned if unsigned < 2**31 else unsigned - 2**32
+        wrapped_offsets.update((offset + unsigned, offset + signed))
+    guards = [storage[start : start + H * D] for start in sorted(wrapped_offsets - live_offsets)]
+    q = torch.zeros((B, S, H, D), dtype=o.dtype, device=o.device)
+    k = torch.zeros((B, S, KH, D), dtype=o.dtype, device=o.device)
+    v = torch.arange(1, B + 1, device=o.device, dtype=torch.float32).to(o.dtype).view(B, 1, 1, 1).expand_as(k).contiguous()
+    lse = torch.empty((B, H, S), device=o.device)
+    ids = torch.full((B, S, 4), -1, dtype=torch.int32, device=o.device)
+    lens = torch.zeros((B, S), dtype=torch.int32, device=o.device)
+    gate = torch.zeros_like(q) if gated else None
+    plan = SparseGqaFwdDslSm107(q=q, k=k, v=v, o=o, lse=lse, block_ids=ids, block_lens=lens, top_k=4, epilogue_gate=gate, softmax_groups=softmax_groups)
+    assert plan.check_support()
+    plan.compile()
+    for _ in range(2):
+        o.fill_(-17)
+        for guard in guards:
+            guard.fill_(-17)
+        plan.execute(stream=_stream())
+        torch.cuda.synchronize()
+        expected = v.expand_as(q) * (0.5 if gated else 1)
+        assert torch.equal(o, expected), "a valid output row was missed or written at a wrapped address"
+        assert torch.equal(lse, torch.zeros_like(lse))
+        assert all(torch.equal(guard, torch.full_like(guard, -17)) for guard in guards), "wrapped-address guard was overwritten"
 
 
 def _check(outs, ref_o, ref_lse):
@@ -1854,7 +2218,7 @@ def test_thd_block_lens_absent_uses_the_derived_count():
 
 
 # ============================================================================ host: the fused epilogue gate's claims and pins
-def test_adapter_accepts_the_gate_operand_and_selects_the_gated_specialization():
+def test_adapter_accepts_the_gate_operand_and_selects_the_gated_specialization(sm107_host_target):
     """The record claims ``epilogue_gate``: a request WITH the gate operand (O-shaped in Q's dtype at its own strides -- here
     the slab's GATE columns at a padded token stride) is served and compiles the gated specialization
     (``TemplateParams.epilogue_gate``); a request without it compiles the ungated one.  The gate's dtype must be Q's."""

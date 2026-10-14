@@ -81,7 +81,8 @@ from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_depende
 from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
 from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
 
-from .cache_write import _fake_pool, _fake_slot, check_pool, check_slot_mapping
+from ..cache_write_contract import check_pool, check_slot_mapping
+from .cache_write import _fake_pool, _fake_slot
 from .qk_norm_rope import (
     ACCESS_BYTES,
     ELEMS_PER_ACCESS,
