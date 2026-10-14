@@ -293,8 +293,9 @@ Served today:
   an empty sequence owns no rows. Validated on Rubin per sequence against the per-sequence fp32 QSA oracle (bf16 and f16).
   `fuse_gate=True` composes with `thd=True` (the sparse core's epilogue gate on the packed `[1, T, H_q, D]` GATE slice, read in
   place like O; validated on Rubin: the gated packed block within one rounding of the activation dtype of the unfused packed
-  block on O, the LSE bitwise). Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) and the paged
-  write-through -- both typed declines naming the feature.
+  block on O, the LSE bitwise). Not under `thd`: the in-block indexer (the scorer reads dense `[B, S]` prompts) -- a typed
+  decline naming the feature. The paged write-through composes with the packed sparse block (the stage addresses tokens; the
+  packed write-through cell of the end-to-end module).
 - the in-block indexer: a block declared `QsaSpec(index_source="indexer", index_band=True)` derives the selection itself from
   the band -- `execute(..., w_iq_norm=, w_ik_norm=)` instead of `block_ids=` -- and hands it back through the optional
   `block_ids_out` / `block_lens_out` / `index_k_compressed`; the contract is "The in-block indexer" in the serving section
@@ -1374,7 +1375,8 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   (`thd=True`, caller lists with sequence-relative ids), `d_head == 256`,
   `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`) or the in-block indexer
   (`index_source="indexer"`: bf16, the band, `index_head_dim` 128, `index_heads` in the scorer's packed groups; dense only); the indexer
-  band on the UNFUSED projection; `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band,
+  band on the UNFUSED projection; `fuse_gate` (the sparse core's epilogue gate) composes with it, dense or packed;
+  `save_for_backward`, `quant`, `fuse_norm_rope` together with the band,
   `causal_bottom_right` on the block's own K / V (`kv_source="self"`; over the pools it is the block-sparse decode mode), the in-block
   indexer over the pools, and `thd` together with the in-block indexer are typed declines ("Sparse attention (QSA)" above; `thd` together with the paged write-through is served -- the stage addresses tokens); what a serving stack hands in -- the list
   form, the count rule, the decode-mode list, the pools, the indexer's inputs and outputs -- is the contract page "Serving:
