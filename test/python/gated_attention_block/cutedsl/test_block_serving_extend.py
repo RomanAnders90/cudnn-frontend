@@ -2016,11 +2016,20 @@ def test_num_tokens_live_is_the_last_execute_parameter_with_default_none():
     from cudnn.gated_attention_block.cache_write_contract import check_slot_mapping
 
     params = list(inspect.signature(GatedAttentionBlockFwd.execute).parameters.values())
-    assert params[-1].name == "num_tokens_live" and params[-1].default is None
-    # the serving inputs precede it in their appended order (slot_mapping, index_k_raw, ..., num_tokens_live); a tree that carries the
-    # in-block indexer's execute inputs (w_iq_norm .. block_lens_out, appended after index_k_raw) keeps num_tokens_live LAST all the same
+    # the e4m3 KV cache's per-tensor scales (k_scale / v_scale, appended 2026-10-14 after num_tokens_live) are the LAST two; every
+    # appended parameter defaults to None
+    assert [p.name for p in params[-3:]] == ["num_tokens_live", "k_scale", "v_scale"] and all(p.default is None for p in params[-3:])
+    # the serving inputs precede them in their appended order (slot_mapping, index_k_raw, ..., num_tokens_live, k_scale, v_scale); a tree
+    # that carries the in-block indexer's execute inputs (w_iq_norm .. block_lens_out, appended after index_k_raw) keeps that tail all the same
     names = [p.name for p in params]
-    assert names.index("slot_mapping") < names.index("index_k_raw") < names.index("num_tokens_live") == len(names) - 1
+    assert (
+        names.index("slot_mapping")
+        < names.index("index_k_raw")
+        < names.index("num_tokens_live")
+        < names.index("k_scale")
+        < names.index("v_scale")
+        == len(names) - 1
+    )
     slot_params = inspect.signature(check_slot_mapping).parameters
     assert list(slot_params)[-1] == "t_live" and slot_params["t_live"].default is None
 
