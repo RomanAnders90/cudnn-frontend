@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
+from cudnn.frost.tile_dsl.requirements import tma_gather4_requirement_error
 from cudnn.gated_attention_block import (
     GatedAttentionBlockBwd,
     GatedAttentionBlockFwd,
@@ -59,6 +60,12 @@ _DEV = "cuda" if torch.cuda.is_available() else "cpu"
 # read the scorer's package) skip there -- ``_needs_dsl_floor`` on the test, or a ``pytest.skip`` ahead of the one such arm.
 _CUTEDSL_REQUIREMENT = cutedsl_requirement_error("the gated attention block's stages")  # None at or above the floor
 _needs_dsl_floor = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
+# The adapter's TARGET half of the same gate: a DSL at or above the floor may still lack the Rubin target (the public 4.7 wheels do), and the
+# sparse adapter then declines a modeled cc 10.7 request by name.  The host ACCEPTANCE test models that part and asserts acceptance, so it
+# skips exactly where the adapter would decline -- through the adapter's own requirement (the floor, then the ``sm_107a`` target); the
+# dedicated decline test below keeps running on any DSL at the floor (it substitutes the target state itself).
+_SM107_TARGET_REQUIREMENT = tma_gather4_requirement_error((10, 7))  # None when the installed DSL renders the Rubin target
+_needs_sm107_target = pytest.mark.skipif(_SM107_TARGET_REQUIREMENT is not None, reason=str(_SM107_TARGET_REQUIREMENT))
 
 # The 24-query-head / 2-KV-head d256 geometry of the block-sparse model at TP 1 (d_model 2560, rope 64), with the
 # indexer band: (4 + 1) x 128 = 640 columns below V -> N = 13312 + 640 = 13952.
@@ -610,7 +617,8 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
     """The block CONSTRUCTS with the sparse stage in stage (4)'s slot (the five-band geometry accepted by every stage ahead
     of it), with no host sync; ``check_support`` then asks the sparse ADAPTER, whose record names the arch range -- so off
     Rubin the decline is the adapter's typed one naming the found cc (the block keeps no ``(10, 7)`` literal of its own for
-    the sparse path), and on Rubin the block is supported (the end-to-end module runs it)."""
+    the sparse path; below cc 10 the gather4 part floor's decline answers first), and on Rubin the block is supported (the
+    end-to-end module runs it)."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=True))
     kw = _samples(geom)
     with _no_host_sync():
@@ -625,7 +633,10 @@ def test_a_legal_sparse_declaration_builds_the_sparse_stage_and_the_arch_gate_re
                 pytest.skip(str(_CUTEDSL_REQUIREMENT))  # the stages ahead import their CuTe DSL kernels to answer check_support()
             cc = tuple(torch.cuda.get_device_capability())
             if cc != (10, 7):
-                with pytest.raises(NotImplementedError, match=rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}"):
+                # a cc 10.x part other than Rubin hears the record's Rubin-line decline; below cc 10 the gather4 part floor
+                # (tile_dsl.requirements, cc 10.0+) answers one gate EARLIER, naming the instruction's floor, not the record
+                pattern = rf"Rubin-line GPU.*got cc {cc[0]}\.{cc[1]}" if cc[0] >= 10 else r"requires a cc 10\.0\+ part"
+                with pytest.raises(NotImplementedError, match=pattern):
                     blk.check_support()
                 assert not blk._is_supported
                 assert blk._sdpa._impl is not None and blk._sdpa._impl._module is None  # declined before any kernel module was loaded
@@ -756,15 +767,15 @@ def _adapter_request(**over):
     return SparseGqaFwdDslSm107(**kw)
 
 
-@_needs_dsl_floor
+@_needs_sm107_target
 def test_adapter_accept_decline_set_equals_the_record():
     """The record-driven consistency check (Form A): for EVERY arm field of the record, a WELL-FORMED request that asks for
     the arm is accepted by the adapter's ``check_support`` iff the record claims it (a claimed arm's request carries the
     arm's own operands -- the paged read's pools, table and lengths; THD's two length descriptors of a one-sequence packing on
     the batch-extent-1 operands, in the ``[B]`` and, for ``cu_seq_len``, the ``[B + 1]`` form; an unclaimed arm's request is a
     typed decline naming the arm); the served baseline (dense BSHD
-    bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host with the public ``sm_107a`` DSL (the cc is handed
-    in, nothing is launched)."""
+    bf16 / f16, d 256, caller lists, per-batch KV lengths) passes on any host whose DSL renders ``sm_107a`` (the cc is handed
+    in, nothing is launched); where the DSL lacks the target the module skips this test by the adapter's own requirement."""
     from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseOperandDesc
 
     rec = _record()
@@ -921,7 +932,11 @@ def test_execute_form_checks_on_the_index_tensors():
         "rank": (i32(t), r"must be \[16, 512\]"),
         "strided": (i32(top_k, t).t(), "contiguous"),
         "not_a_tensor": ([[0] * top_k] * t, "torch.Tensor"),
+        # a storage-offset view 4 bytes off a 16-byte boundary: contiguous, int32, the right shape -- and refused by the block HERE, before
+        # the first stage runs (the sparse core binds block_ids as a TMA / bulk-copy base; the adapter refuses it too, but at stage (4))
+        "misaligned": (i32(t * top_k + 1)[1:].view(t, top_k), "16-byte"),
     }
+    good_offset16 = i32(t * top_k + 4)[4:].view(t, top_k)  # the control: a 16-byte storage offset is aligned and well-formed
     if torch.cuda.is_available():
         bad["device"] = (torch.zeros(t, top_k, dtype=torch.int32), "device")
     ws = torch.zeros(16, dtype=torch.uint8, device=_DEV)
@@ -965,7 +980,7 @@ def test_execute_form_checks_on_the_index_tensors():
             with pytest.raises(ValueError, match=match):
                 blk.execute(*args, block_ids=good, block_lens=lens_bad)
         # Well-formed lists pass every form check: the next refusal is the plan's (this block compiles only once the core lands).
-        for ids, ln in ((good, None), (good_dense, None), (good, lens), (good_dense, i32(b, s))):
+        for ids, ln in ((good, None), (good_dense, None), (good, lens), (good_dense, i32(b, s)), (good_offset16, None)):
             with pytest.raises(RuntimeError, match="call compile"):
                 blk.execute(*args, block_ids=ids, block_lens=ln)
 

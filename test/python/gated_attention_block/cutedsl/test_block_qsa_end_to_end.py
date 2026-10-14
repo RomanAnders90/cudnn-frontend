@@ -50,7 +50,8 @@ sequence), one block total with ``B x H_kv > 1`` -- across the forms (the prefix
 ``block_lens`` absent, no LSE) and the pipeline knobs (fused norm + RoPE, the compact K / V layout, the indexer band,
 ``top_k`` 4 / 256, the TP and 397B geometries); a one-sequence packing is BITWISE the dense ``B = 1, S = T`` sparse block on
 ``out``, the gated O and the LSE; the workspace carries the packed metadata; the lengths are REQUIRED at execute.  THD
-together with the in-block indexer or the paged write-through stays a typed decline (``test_block_qsa.py``).
+together with the in-block indexer stays a typed decline (``test_block_qsa.py``); the paged write-through composes with the
+packed sparse block (the packed write-through cell below).
 """
 
 import math
