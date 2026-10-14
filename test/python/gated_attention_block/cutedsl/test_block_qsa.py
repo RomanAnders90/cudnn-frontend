@@ -39,6 +39,7 @@ from cudnn.gated_attention_block.api import (
     QSA_TOP_K_ALIGN,
     QSA_TOP_K_MAX,
     _align_up,
+    _CacheWrite,
     _FusedQkvProjection,
     _itemsize,
     _plan_workspace,
@@ -335,7 +336,8 @@ _DECLINES = [
         {}, QsaSpec(index_source="indexer", index_band=True, index_heads=3), {}, torch.bfloat16, NotImplementedError, "head groups", id="indexer_heads"
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
-    # THD composed with what the core does not carry under packed sequences: the in-block indexer, the paged write-through
+    # THD composed with what the core does not carry under packed sequences: the in-block indexer (the paged write-through composes
+    # with the packed sparse block since 2026-10-14: test_write_through_under_thd_builds_the_same_stage_beside_the_packed_sparse_stage)
     pytest.param(
         {},
         QsaSpec(index_source="indexer", index_band=True),
@@ -344,15 +346,6 @@ _DECLINES = [
         NotImplementedError,
         "packed-sequence form",
         id="indexer_x_thd",
-    ),
-    pytest.param(
-        {},
-        QsaSpec(),
-        dict(thd=True, num_sequences=1, max_seq_len=8, paged_kv_page_size=16),
-        torch.bfloat16,
-        NotImplementedError,
-        "paged_kv_page_size with thd=True",
-        id="write_through_x_thd",
     ),
     pytest.param(dict(is_causal=False), QsaSpec(), {}, torch.bfloat16, ValueError, "is_causal=True", id="bidirectional"),
     # a negative attn_scale: the block's geometry refuses it by name for every pipeline (the standalone sparse adapter SERVES it signed)
@@ -390,8 +383,8 @@ def test_thd_under_qsa_declares_the_packed_sparse_stage():
     bound to BOTH length sides, the flat ``[T, top_k]`` list and the head-major ``[1, H_q, T]`` LSE -- at both packed input
     ranks; a dense declaration carries neither length descriptor; the block's own packed contract still holds
     (``seq_lens_present`` exclusive, the knobs refused without ``thd``); the stage's own guards hold without the block; the
-    two compositions the core does not carry under packed sequences stay typed declines naming the feature (rows of
-    ``_DECLINES``: the in-block indexer, the paged write-through)."""
+    one composition the core does not carry under packed sequences stays a typed decline naming the feature (the row of
+    ``_DECLINES``: the in-block indexer; the paged write-through composes -- the next test)."""
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec())
     t, top_k, b = 16, geom.qsa.top_k, 3
     with _no_host_sync():
@@ -440,6 +433,39 @@ def test_thd_under_qsa_declares_the_packed_sparse_stage():
             st.execute(q, kv, kv, o, lse=lse, workspace=z(64, dt=torch.uint8), block_ids=ids)
         with pytest.raises(ValueError, match="requires workspace"):
             st.execute(q, kv, kv, o, lse=lse, seq_lens=lens, block_ids=ids)
+
+
+def test_write_through_under_thd_builds_the_same_stage_beside_the_packed_sparse_stage():
+    """INVERTED 2026-10-14 (the ``write_through_x_thd`` row of ``_DECLINES`` until the write-through served packed sequences):
+    a ``QsaSpec`` block declared ``thd=True`` with ``paged_kv_page_size`` CONSTRUCTS (no host sync) with the write-through stage
+    at the dense block's pipeline position -- after norm + RoPE, right before the packed sparse stage -- sized at the packed
+    token count (the block is ``B = 1, S = T`` inside, so the stage's ``[T, H_kv, D]`` views are the dense arm's), at both
+    packed input ranks and with the indexer band (its raw-key pool rides the same stage); the dense ``QsaSpec`` block builds the
+    same stage (the pools are the caller's: the workspace is unchanged -- the Rubin cell asserts it).  The in-block indexer stays the
+    packed form's one typed decline, with or without the write-through.  The composition's end-to-end acceptance is the packed
+    write-through cell of ``test_block_qsa_end_to_end.py`` (Rubin)."""
+    t, b, ps = 16, 3, 16
+    with _no_host_sync():
+        for band, rank2 in ((False, False), (False, True), (True, False)):
+            geom = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_band=band))
+            kw = _samples(geom, batch=1, seq_len=t)
+            if rank2:
+                for nm in ("sample_h", "sample_cos", "sample_sin", "sample_out"):
+                    kw[nm] = kw[nm][0]
+            blk = GatedAttentionBlockFwd(**kw, geometry=geom, thd=True, num_sequences=b, max_seq_len=8, paged_kv_page_size=ps)
+            plain = GatedAttentionBlockFwd(**kw, geometry=geom, thd=True, num_sequences=b, max_seq_len=8)
+            cw = blk._cache_write
+            assert blk.paged_kv_page_size == ps and isinstance(cw, _CacheWrite) and cw.page_size == ps and cw.index_band is band
+            assert blk.thd and (blk.batch, blk.seq_len) == (1, t) and cw.batch * cw.seq_len == t
+            stages = list(blk._stages)
+            assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd
+            assert stages.index(blk._norm_rope) < stages.index(cw) == stages.index(blk._sdpa) - 1
+            assert plain._cache_write is None  # the workspace equality is the Rubin cell's (the sparse stage's size reads the arch gate)
+        dense = GatedAttentionBlockFwd(**_samples(geom, batch=1, seq_len=t), geometry=geom, paged_kv_page_size=ps)
+        assert isinstance(dense._cache_write, _CacheWrite) and dense._cache_write.batch * dense._cache_write.seq_len == t
+        geom_i = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
+        with pytest.raises(NotImplementedError, match="packed-sequence form"):
+            GatedAttentionBlockFwd(**_samples(geom_i, batch=1, seq_len=t), geometry=geom_i, thd=True, num_sequences=b, max_seq_len=8, paged_kv_page_size=ps)
 
 
 @_needs_dsl_floor

@@ -1094,13 +1094,17 @@ def _run_thd(
     inp=None,
     refs=True,
     fuse_gate=False,
+    paged_kv_page_size=0,
+    pools=None,
 ) -> _ThdCell:
     """Declare, check, compile and run a PACKED (``thd=True``) ``QsaSpec`` block ``launches`` times on sentinel-filled outputs
     and the per-sequence QSA oracle on the same inputs and lists.  ``lens`` is the packing (ints, zero-length sequences
     allowed; ``max_seq_len`` defaults to the longest); ``cu`` hands the ``[B+1]`` prefix sums over instead of the ``[B]``
     lengths, ``rank2`` the ``[T, .]`` input spelling; ``lists`` overrides the generated ``(block_ids, block_lens)``; ``inp``
     reuses another cell's ``(inputs, meta)``; ``refs=False`` skips the oracle (the bitwise pins); ``fuse_gate`` (appended) folds
-    stage (5) into the sparse core's epilogue on the packed GATE slice (the gated O is then the SDPA's own output in the same slot)."""
+    stage (5) into the sparse core's epilogue on the packed GATE slice (the gated O is then the SDPA's own output in the same slot);
+    ``paged_kv_page_size`` / ``pools`` (appended) declare the write-through and hand ``execute`` the pools (``k_cache`` / ``v_cache`` /
+    ``slot_mapping``)."""
     ref_geom = RefQsaGeometry(**geom_kw, qsa=RefQsaSpec(top_k=top_k, index_band=index_band))
     geom = GatedAttentionBlockGeometry(**geom_kw, qsa=QsaSpec(top_k=top_k, index_band=index_band))
     if inp is None:
@@ -1157,6 +1161,7 @@ def _run_thd(
         max_seq_len=meta["max_seq_len"],
         cu_seqlens=cu,
         fuse_gate=fuse_gate,
+        paged_kv_page_size=paged_kv_page_size,
     )
     assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.thd and (blk.batch, blk.seq_len) == (1, t)
     assert (
@@ -1174,7 +1179,20 @@ def _run_thd(
         if lse is not None:
             lse.fill_(sent)
         blk.execute(
-            h, inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], cos, sin, inp["w_o"], out, ws, seq_lens=seq_lens, lse=lse, block_ids=ids, block_lens=lens_arg
+            h,
+            inp["w_qkvg"],
+            inp["w_q_norm"],
+            inp["w_k_norm"],
+            cos,
+            sin,
+            inp["w_o"],
+            out,
+            ws,
+            seq_lens=seq_lens,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens_arg,
+            **(pools or {}),
         )
         torch.cuda.synchronize()
         o_gated = _view(ws, lay.o, (t, geom.h_q, geom.d_head), dtype).clone()
@@ -1605,3 +1623,49 @@ def test_fuse_gate_under_thd_qsa_matches_the_per_sequence_oracle_and_the_unfused
         f"out cos {cos_out:.6f} max|d out| {d_out:.4e}; vs oracle cos {mags['cos']:.6f} |dO| {mags['d_o']:.4e} |dLSE| {mags['d_lse']:.2e}; "
         f"{mags['seqs']} live sequences of {len(lens)}"
     )
+
+
+@requires_rubin
+def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
+    """The write-through acceptance on the PACKED sparse block (the typed decline ``paged_kv_page_size with thd=True``, inverted
+    2026-10-14; the dense half is ``test_a_qsa_block_with_write_through_is_bitwise_the_one_without``): a ``QsaSpec`` block declared
+    ``thd=True`` with ``paged_kv_page_size=16`` writes every packed token's post-RoPE K / V row through into the pools at
+    ``slot_mapping[token]`` and its ``out`` / LSE / gated O are BITWISE the same packed block without write-through (the same
+    inputs, lists and lengths -- an empty sequence among them); the pools are bitwise the slab bands the sparse core consumed, a
+    padded slot writes nothing, ``get_workspace_size`` is unchanged and the stage sits right before the packed sparse SDPA."""
+    geom_kw, lens, ps = GEOM_SMALL, [300, 0, 128, 84], 16
+    plain = _run_thd(geom_kw, lens, source="synthetic", seed=11)
+    _check_thd(plain, "small8-2 packed 300/0/128/84 plain")
+    t, geom = plain.meta["t"], plain.geom
+    n_pages = t // ps + 2
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    slot = torch.randperm(n_pages * ps, generator=gen, device="cuda")[:t].to(torch.int32)
+    slot[::13] = -1
+    k_cache, v_cache = _nan_pool(n_pages, geom.h_kv, ps, geom.d_head), _nan_pool(n_pages, geom.h_kv, ps, geom.d_head)
+    wt = _run_thd(
+        geom_kw,
+        lens,
+        source="synthetic",
+        seed=11,
+        lists=(plain.ids, plain.lens),
+        inp=(plain.inp, plain.meta),
+        refs=False,
+        paged_kv_page_size=ps,
+        pools=dict(k_cache=k_cache, v_cache=v_cache, slot_mapping=slot),
+    )
+    assert torch.equal(_bits(wt.runs[0][0]), _bits(plain.runs[0][0])) and torch.equal(
+        wt.runs[0][1], plain.runs[0][1]
+    ), "write-through changed the packed sparse block's output"
+    assert torch.equal(_bits(wt.runs[0][2]), _bits(plain.runs[0][2]))
+    assert wt.blk.get_workspace_size() == plain.blk.get_workspace_size()
+    lay = wt.blk._layout()
+    proj = _view(wt.ws, lay.proj, (t, geom.n_qkvg), BF16)
+    k_rows, v_rows = _cols(proj, geom.qkvg_offsets[2], geom.h_kv, geom.d_head), _cols(proj, geom.qkvg_offsets[3], geom.h_kv, geom.d_head)
+    live = slot >= 0
+    s_ = slot[live].long()
+    assert torch.equal(_bits(k_cache[s_ // ps, :, s_ % ps, :]), _bits(k_rows[live])) and torch.equal(
+        _bits(v_cache[s_ // ps, :, s_ % ps, :]), _bits(v_rows[live])
+    )
+    for pool in (k_cache, v_cache):
+        assert (~torch.isnan(pool.float())).all(-1).sum().item() == int(live.sum()) * geom.h_kv
+    assert wt.blk._stages.index(wt.blk._cache_write) == wt.blk._stages.index(wt.blk._sdpa) - 1

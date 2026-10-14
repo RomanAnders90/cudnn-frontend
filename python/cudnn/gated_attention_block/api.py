@@ -290,8 +290,9 @@ OWN sequence, the sparse core's packed arm over the same views).  Typed declines
 fully fused quantized pipelines (the quantized THD SDPA bodies have no THD gate
 descriptor, and the fused MXFP8 projection fork decodes ``(b, s_tile)`` once per
 128-row GEMM tile, which a packed tile may straddle), ``seq_lens_present`` (the
-two length contracts are mutually exclusive), the in-block indexer and the paged
-write-through under ``QsaSpec``.  The lengths are device data, never read on the host:
+two length contracts are mutually exclusive) and the in-block indexer under ``QsaSpec``
+(the paged write-through composes with the packed sparse block: the stage addresses tokens).
+The lengths are device data, never read on the host:
 the caller's contract is every length in ``[0, max_seq_len]`` and
 ``sum(lengths) == T`` -- the SDPA leaves rows past the live total UNWRITTEN, and
 the gate and the backward's weight-gradient GEMMs read every one of the ``T``
@@ -4620,7 +4621,8 @@ class _SparseSdpa(_Stage):
 
     Not here (typed declines at the block's declaration, each naming its feature): ``causal_bottom_right`` -- the decode /
     verify form; the quantized pipelines and training; THD together with the in-block indexer (the scorer reads dense
-    ``[B, S]`` prompts) and THD together with the paged write-through.  Each lands by flipping the record, the adapter AND
+    ``[B, S]`` prompts).  THD together with the paged write-through is served (2026-10-14: the write-through stage addresses
+    tokens, so the packed sparse block builds the same ``(4w)`` stage).  Each lands by flipping the record, the adapter AND
     this stage in the same change; the declaration decline names the record's state so the flip is visible (``thd`` and
     ``fuse_gate`` flipped 2026-10-08).
     """
@@ -5846,7 +5848,8 @@ class GatedAttentionBlockFwd(APIBase):
     ``out`` is bitwise the block's without it.  A declaration ATTRIBUTE: ``execute`` then REQUIRES the pools and the
     slot mapping and refuses them otherwise.  The stage addresses TOKENS, so under ``thd=True`` (the block is
     ``B = 1, S = T`` inside) it is the same launch over the same ``[T, H_kv, D]`` views; a pad token's slot is ``-1``.
-    The knob ``fuse_prepare=True`` (in-place bf16 / f16 only) runs (2+3) and (4w) as ONE launch,
+    The knob ``fuse_prepare=True`` (in-place bf16 / f16 only, the dense declaration with the write-through alone) runs (2+3)
+    and (4w) as ONE launch,
     ``(2+3+4w) prepare: PROJ[Q], PROJ[K] -> in place; PROJ[K], PROJ[V] (and the raw key) -> the pools`` --
     bitwise the two-stage form, one launch fewer (two with the band).
 
@@ -5856,8 +5859,8 @@ class GatedAttentionBlockFwd(APIBase):
     the same operands, the same strides and the same launch count; ``execute`` then REQUIRES ``block_ids`` (``[T, top_k]``
     int32: each query's selected 4-token blocks, the open tail block always visible; under ``thd=True`` the ids are relative
     to the token's OWN sequence) and refuses it otherwise.  Every claim of that core is read off the adapter's capabilities
-    record, never transcribed; what the core does not serve is a typed decline at declaration (the in-block indexer and the
-    paged write-through under ``thd`` among them).
+    record, never transcribed; what the core does not serve is a typed decline at declaration (the in-block indexer under
+    ``thd`` among them; the paged write-through composes with the packed sparse block -- the stage addresses tokens).
     ``fuse_gate=True`` folds stage (5) into the sparse core's epilogue exactly as on the dense block (the GATE slice read in
     place, O gated after the dead-row select, the LSE untouched; stage (5) is not built).
 
@@ -5981,8 +5984,9 @@ class GatedAttentionBlockFwd(APIBase):
     ``_sf_slot_bytes_packed``), ``fuse_norm_rope`` and ``fuse_gate`` (bf16 / fp16
     inference; the gate rides the packed d256 prefill's epilogue through the
     SDPA's THD gate descriptor) and block-sparse attention with caller lists are
-    served; the fully fused quantized pipelines, ``seq_lens_present``, the in-block
-    indexer and the paged write-through are typed declines.  Module docstring, "THD".
+    served, the paged write-through composing with them; the fully fused quantized
+    pipelines, ``seq_lens_present`` and the in-block indexer are typed declines.  Module
+    docstring, "THD".
 
     **TRAINING (``save_for_backward=True``; bf16 / fp16, out of place, no fusion
     knob)** writes THROUGH the caller's :class:`SavedForBackward` instead of the
@@ -6768,8 +6772,10 @@ class GatedAttentionBlockFwd(APIBase):
         (there is nothing to fold without it -- ``ValueError`` naming both), the in-place pipeline (the fused kernel rewrites
         Q / K in the slab; the out-of-place layout keeps its two stages -- ``ValueError``) and not ``fuse_norm_rope`` (the norm
         + RoPE already live in the projection epilogue there; the prepare kernel has no cache-write-only arm --
-        ``NotImplementedError``).  ``quant`` / ``save_for_backward`` / ``thd`` are excluded by the attribute's own rows, which
-        ran first.  Device-free.  A performance knob: whatever it returns, the block computes the same function."""
+        ``NotImplementedError``); then the knob's own arms: not ``thd=True`` (the prepare kernel addresses the dense ``[B, S]``
+        slab) and not ``kv_source="paged"`` (the fusion is validated with the write-through alone) -- ``NotImplementedError``.
+        ``quant`` / ``save_for_backward`` are excluded by the attribute's own rows, which ran first.  Device-free.  A performance
+        knob: whatever it returns, the block computes the same function."""
         if not isinstance(fuse_prepare, bool):
             raise TypeError(f"fuse_prepare must be a bool (the prepare-fusion knob), got {type(fuse_prepare).__name__}")
         if not fuse_prepare:
@@ -6788,6 +6794,18 @@ class GatedAttentionBlockFwd(APIBase):
             raise ValueError(
                 "fuse_prepare=True rewrites Q / K in place in the projection slab and writes the pools from the same registers; the out-of-place "
                 "layout (inplace_qkv=False) keeps its two stages -- pass inplace_qkv=True (the inference default) or fuse_prepare=False"
+            )
+        if self.thd:
+            raise NotImplementedError(
+                "fuse_prepare=True with thd=True: the prepare kernel addresses the dense [B, S] slab (one RoPE table row per (b, s)); its "
+                "packed-sequence arm is a follow-up -- run the two-stage form (fuse_prepare=False: the norm + RoPE stage and the write-through "
+                "both serve thd=True)"
+            )
+        if self.kv_source == KV_SOURCE_PAGED:
+            raise NotImplementedError(
+                "fuse_prepare=True with kv_source='paged': the prepare fusion is validated with the write-through alone (stage (4) over the "
+                "block's own K / V); under the EXTEND / DECODE forms stage (4) reads the pools the fused launch writes -- a composition without "
+                "its accept cell yet; run the two-stage form (fuse_prepare=False)"
             )
         return True
 

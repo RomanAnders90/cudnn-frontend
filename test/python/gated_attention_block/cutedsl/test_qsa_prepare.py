@@ -649,6 +649,22 @@ def test_fuse_prepare_declaration_rows():
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, inplace_qkv=False)
     with pytest.raises(NotImplementedError, match="paged_kv_page_size with save_for_backward"):
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, save_for_backward=True)
+    # the knob's own arms (the write-through serves thd=True and the paged forms since 2026-10-14; the prepare kernel does not yet)
+    with pytest.raises(NotImplementedError, match="fuse_prepare=True with thd=True"):
+        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, thd=True, num_sequences=1, max_seq_len=64)
+    mk = lambda *shape, dt=BF16: torch.empty(*shape, dtype=dt, device=_DEV)  # noqa: E731
+    with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_source='paged'"):
+        _make_block(
+            dict(_SMALL_D256, causal_bottom_right=True),
+            1,
+            1,
+            paged_kv_page_size=16,
+            fuse_prepare=True,
+            kv_source="paged",
+            sample_k_cache=mk(4, 2, 16, 256),
+            sample_v_cache=mk(4, 2, 16, 256),
+            sample_block_table=mk(1, 4, dt=torch.int32),
+        )
     blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True)
     assert blk.fuse_prepare and blk.paged_kv_page_size == 16 and isinstance(blk._prepare, _QsaPrepare)
     plain, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)

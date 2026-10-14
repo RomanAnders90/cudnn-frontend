@@ -191,22 +191,24 @@ def test_typed_declines_at_declaration_name_the_feature():
             paged_kv_page_size=16,
         )
     h2 = inp["h"].view(64, geom.d_model)
-    with pytest.raises(NotImplementedError, match="thd=True"):
-        GatedAttentionBlockFwd(
-            h2,
-            inp["w_qkvg"],
-            inp["w_q_norm"],
-            inp["w_k_norm"],
-            inp["cos"].view(64, -1),
-            inp["sin"].view(64, -1),
-            inp["w_o"],
-            out.view(64, geom.d_model),
-            geom,
-            thd=True,
-            num_sequences=2,
-            max_seq_len=64,
-            paged_kv_page_size=16,
-        )
+    # The packed form is SERVED (the former typed decline, inverted 2026-10-14 on this branch as on the dense block's module): the
+    # stage addresses tokens, so the packed block builds the same stage at the packed token count.
+    packed = GatedAttentionBlockFwd(
+        h2,
+        inp["w_qkvg"],
+        inp["w_q_norm"],
+        inp["w_k_norm"],
+        inp["cos"].view(64, -1),
+        inp["sin"].view(64, -1),
+        inp["w_o"],
+        out.view(64, geom.d_model),
+        geom,
+        thd=True,
+        num_sequences=2,
+        max_seq_len=64,
+        paged_kv_page_size=16,
+    )
+    assert packed.thd and isinstance(packed._cache_write, _CacheWrite) and packed._cache_write.batch * packed._cache_write.seq_len == 64
     # Served pipelines declare without complaint: fused norm + RoPE, out-of-place Q / K / V, the fused gate, fp16.
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, **kw)
@@ -269,8 +271,9 @@ def test_a_declared_block_requires_the_pools_and_the_slot_mapping_and_declines_t
                 _exec(blk, inp, out, ws, **{k: v for k, v in args.items() if k != missing})
         with pytest.raises(ValueError, match="paged_kv_page_size=16 needs"):
             _exec(blk, inp, out, ws)
+        # block_table / kv_lens are the EXTEND / DECODE forms' inputs (kv_source="paged"): refused on a block declared kv_source="self"
         for read in (dict(block_table=torch.zeros(1, 4, device=_DEV, dtype=torch.int32)), dict(kv_lens=torch.zeros(1, device=_DEV, dtype=torch.int32))):
-            with pytest.raises(NotImplementedError, match="paged-READ mode"):
+            with pytest.raises(ValueError, match="kv_source='paged'"):
                 _exec(blk, inp, out, ws, **args, **read)
         # No indexer band on this geometry: a raw-key pool is refused, not ignored.
         with pytest.raises(ValueError, match="index_k_raw.*indexer band"):

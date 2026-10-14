@@ -65,7 +65,9 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
 - `fuse_prepare=True` (serving, with `paged_kv_page_size > 0`) folds stages (2)+(3) and the paged-cache write-through (4w)
   into ONE launch: Q / K are normed and rotated in place and the post-RoPE K, the V and the raw indexer key land in the
   pools from the same registers -- every output bitwise the two-stage form, one launch fewer (two with the indexer band).
-  In-place bf16 / f16 only; `fuse_norm_rope` together with it is a typed decline (pick one). See "Serving: write-through".
+  In-place bf16 / f16 only, on the dense declaration with the write-through alone; `fuse_norm_rope` together with it is a typed
+  decline (pick one), as are `thd=True` and `kv_source="paged"` (the prepare kernel's packed and paged arms are follow-ups). See
+  "Serving: write-through".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -302,8 +304,9 @@ not carry -- is read off the adapter's capabilities record (`cudnn.sdpa.fwd.spar
 adapter's own `check_support` enforces; the block transcribes none of it. Typed declines at declaration, naming the feature:
 `save_for_backward` (sparse training is out of scope; `GatedAttentionBlockBwd` refuses a `qsa` geometry), `quant`,
 `fuse_norm_rope` together with `index_band` (the fused projection renders 256-column tiles; 640 is not a whole number of them --
-the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256`, `thd`
-together with `paged_kv_page_size` (the write-through under packed sequences waits for its own accept cell); under
+the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256` (`thd`
+together with `paged_kv_page_size` is served: the write-through addresses tokens, so the packed sparse block builds the same
+stage); under
 `index_source="indexer"` also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the
 scorer's packed head groups (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target
 needs (the public 4.8.0 wheel), named with the installed version, before the kernel module is imported. Under
@@ -777,8 +780,8 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
   typed: the fully fused quantized pipelines (the quantized THD SDPA bodies have no THD gate descriptor, and the fused
   MXFP8 projection fork decodes `(b, s_tile)` once per 128-row GEMM tile, which a packed tile may straddle), the MXFP8
   block BACKWARD over a packed record (its SDPA-layout MX quantize stages run the quantizer's dense arm only; the packed
-  record and the packed delta exist, the packed MXFP8 backward is a follow-up), the in-block indexer and the paged write-through
-  under `QsaSpec`.
+  record and the packed delta exist, the packed MXFP8 backward is a follow-up) and the in-block indexer under `QsaSpec` (the
+  paged write-through composes with the packed sparse block: the stage addresses tokens, so `slot_mapping` is `[T]` there too).
 - **Declare `max_seq_len` tight.** The SDPA's unit grid is the plan-time envelope `B * ceil(max_seq_len / tile) * H_q`
   with dead units past the live total, and the backward's dS workspace scales with `ceil128(max_seq_len)`.
 
@@ -1327,7 +1330,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   `h_q // h_kv <= 16`, caller lists (`block_ids`, `top_k` a multiple of 4 in `[4, 512]`) or the in-block indexer
   (`index_source="indexer"`: bf16, the band, `index_head_dim` 128, `index_heads` in the scorer's packed groups; dense only); the indexer
   band on the UNFUSED projection; `save_for_backward`, `quant`, `fuse_gate`, `fuse_norm_rope` together with the band,
-  `causal_bottom_right`, and `thd` together with the in-block indexer or the paged write-through are typed declines ("Sparse attention (QSA)" above); what a serving stack hands in -- the list
+  `causal_bottom_right`, and `thd` together with the in-block indexer are typed declines ("Sparse attention (QSA)" above; `thd` together with the paged write-through is served -- the stage addresses tokens); what a serving stack hands in -- the list
   form, the count rule, the decode-mode list, the pools, the indexer's inputs and outputs -- is the contract page "Serving:
   index lists and paged KV" above.
 - Paged KV-cache write-through (`paged_kv_page_size`, a positive multiple of 16): bf16 / f16 inference, dense `[B, S, d_model]`
