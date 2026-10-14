@@ -102,6 +102,7 @@ def test_qsa_spec_defaults_and_derived_numbers():
     q = QsaSpec()
     assert (q.block_size, q.top_k, q.index_source, q.index_band) == (4, 512, "caller", False)
     assert (q.index_heads, q.index_kv_heads, q.index_head_dim, q.index_norm_eps) == (4, 1, 128, 1e-6)
+    assert q.index_cache_dtype is None and not q.index_cache_e4m3  # appended: the indexer cache's dtype, None = the activation dtype
     assert (QSA_BLOCK_SIZE, QSA_TOP_K_MAX, QSA_TOP_K_ALIGN) == (4, 512, 4)
     assert q.index_band_cols == 640
     assert q.identity_bound == 2051  # floor(n / 4) <= 512 <=> n <= 2051
@@ -109,7 +110,15 @@ def test_qsa_spec_defaults_and_derived_numbers():
     q.validate()
     QsaSpec(top_k=4).validate()
     QsaSpec(index_source="indexer", index_band=True).validate()
+    QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.bfloat16).validate()
+    e4 = QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e4m3fn)
+    e4.validate()
+    assert e4.index_cache_e4m3
     assert hash(GEOM_BAND) != hash(GEOM_DENSE)  # frozen dataclasses: a compile key tells the two apart
+    # the fp8 indexer cache is a different plan from the bf16 indexer (numerics-changing: an attribute, never a knob)
+    assert hash(GatedAttentionBlockGeometry(**_SMALL_D256, qsa=e4)) != hash(
+        GatedAttentionBlockGeometry(**_SMALL_D256, qsa=QsaSpec(index_source="indexer", index_band=True))
+    )
 
 
 @pytest.mark.parametrize(
@@ -126,6 +135,12 @@ def test_qsa_spec_defaults_and_derived_numbers():
         (dict(index_kv_heads=2), "index_kv_heads"),
         (dict(index_head_dim=100), "index_head_dim"),
         (dict(index_norm_eps=0.0), "index_norm_eps"),
+        # the fp8 indexer cache: e5m2 named, another dtype refused, the attribute under caller lists refused by name
+        (dict(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e5m2), "e5m2"),
+        (dict(index_source="indexer", index_band=True, index_cache_dtype=torch.float16), "index_cache_dtype must be"),
+        (dict(index_source="indexer", index_band=True, index_cache_dtype=torch.float32), "index_cache_dtype must be"),
+        (dict(index_cache_dtype=torch.float8_e4m3fn), "requires index_source='indexer'"),
+        (dict(index_band=True, index_cache_dtype=torch.float8_e4m3fn), "requires index_source='indexer'"),
     ],
 )
 def test_qsa_spec_validate_rejects(kwargs, match):
@@ -343,6 +358,16 @@ _DECLINES = [
         {}, QsaSpec(index_source="indexer", index_band=True, index_heads=3), {}, torch.bfloat16, NotImplementedError, "head groups", id="indexer_heads"
     ),
     pytest.param(dict(d_head=128), QsaSpec(), {}, torch.bfloat16, NotImplementedError, "d_head == 256", id="d_head"),
+    # the fp8 indexer cache on f16 activations: the indexer's own dtype row speaks (the scorer packs bf16 queries and keys)
+    pytest.param(
+        {},
+        QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=_E4M3),
+        {},
+        torch.float16,
+        NotImplementedError,
+        "bf16 activations",
+        id="indexer_e4m3_cache_f16",
+    ),
     # THD composed with what the core does not carry under packed sequences: the in-block indexer (the paged write-through composes
     # with the packed sparse block since 2026-10-14: test_write_through_under_thd_builds_the_same_stage_beside_the_packed_sparse_stage)
     pytest.param(
@@ -1107,3 +1132,69 @@ def test_unfused_projection_serves_the_indexer_band_at_flash_next():
     # The engine scratch and the workspace beyond the slab were never the GEMM's output: the sentinel survives there.
     lay = blk._layout()
     assert (ws[lay.o : lay.o + 16] == 0x7F).all()
+
+
+def test_an_e4m3_indexer_cache_declaration_appends_its_slots_and_the_cache_dtype_flips_the_execute_contract():
+    """``QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e4m3fn)`` -- the fp8 indexer cache --
+    CONSTRUCTS (no host sync): past the identity bound the carve is the bf16 indexer block's seven slots followed by the two e4m3
+    slots ``ix_q8`` / ``ix_kbar8`` (``T x H_i x D_i`` and ``B x floor(S / 4) x D_i`` bytes, each 256-B aligned), below it ONE bf16
+    staging slot ``ix_kbar`` for the cache cast (``ix_q`` / ``ix_q8`` / ``ix_kbar8`` unreserved) -- so every layout WITHOUT the
+    attribute is byte-identical to before; the launch census is the bf16 indexer's plus two casts (plus one cache cast), below the
+    bound the staging compress plus the cache cast; ``execute`` REQUIRES an e4m3 ``index_k_compressed`` on the e4m3 block and a bf16
+    one on the bf16 block (the mirror images refused by name, each message naming the declared cache dtype).  Form only, no plan."""
+    from cudnn.gated_attention_block.api import _QSA_SORT_ROWS, _qsa_indexer_slots
+
+    e4 = QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=_E4M3)
+    g16 = QsaSpec(index_source="indexer", index_band=True)
+    geom, geom16 = GatedAttentionBlockGeometry(**_SMALL_D256, qsa=e4), GatedAttentionBlockGeometry(**_SMALL_D256, qsa=g16)
+    with _no_host_sync():
+        for b, s, lens in ((1, e4.identity_bound + 1, False), (2, 2300, True), (2, 8, False), (1, e4.identity_bound, False), (1, 3, False)):
+            blk = GatedAttentionBlockFwd(**_samples(geom, batch=b, seq_len=s), geometry=geom, return_lse=True, seq_lens_present=lens)
+            blk16 = GatedAttentionBlockFwd(**_samples(geom16, batch=b, seq_len=s), geometry=geom16, return_lse=True, seq_lens_present=lens)
+            ix, ix16 = blk._indexer, blk16._indexer
+            assert ix.fp8 and ix.cache_dtype == _E4M3 and not ix16.fp8 and ix16.cache_dtype == torch.bfloat16
+            assert ix.selects == ix16.selects == (s > e4.identity_bound) and ix.n_blocks == s // 4
+            lay, lay16 = blk._layout(), blk16._layout()
+            t, nb, d_i, h_i = b * s, s // 4, e4.index_head_dim, e4.index_heads
+            windows = -(-t // _QSA_SORT_ROWS)
+            if ix.selects:
+                # the seven bf16-indexer slots at the SAME offsets, then the two e4m3 slots, then the total
+                for nm in ("ix_q", "ix_kbar", "ix_ids", "ix_scores", "ix_cand", "ix_ids_sorted", "ix_sort_idx"):
+                    assert getattr(lay, nm) == getattr(lay16, nm) >= 0, nm
+                slots = _qsa_indexer_slots(geom, b, s, 2, ix.cand_floats, e4m3=True)
+                assert [nm for nm, _ in slots][-2:] == ["ix_q8", "ix_kbar8"] and len(slots) == 9
+                assert dict(slots)["ix_q8"] == t * h_i * d_i and dict(slots)["ix_kbar8"] == b * nb * d_i
+                assert lay.ix_q8 == lay16.total_bytes and lay.ix_kbar8 == lay.ix_q8 + _align_up(t * h_i * d_i)
+                assert lay.total_bytes == lay.ix_kbar8 + _align_up(b * nb * d_i)
+                assert ix.launches_per_execute(False) == 6 + windows == ix16.launches_per_execute(False) + 2
+                assert ix.launches_per_execute(True) == 7 + windows == ix16.launches_per_execute(True) + 2
+            else:
+                # below the bound: the bf16 indexer block reserves nothing; the e4m3 one reserves the staging slot alone
+                assert lay16.ix_kbar == -1 and lay.ix_kbar == lay16.total_bytes and lay.ix_q == lay.ix_q8 == lay.ix_kbar8 == -1
+                assert lay.total_bytes == lay16.total_bytes + _align_up(b * nb * d_i * 2)
+                assert ix.launches_per_execute(False) == 0 == ix16.launches_per_execute(False)
+                assert ix.launches_per_execute(True) == (2 if nb > 0 else 1) and ix16.launches_per_execute(True) == 1
+            # a zero-row staging slot (S < 4: no complete block) adds no bytes; get_workspace_size is not called (check_support = the scorer's device gate)
+            assert (lay.total_bytes > lay16.total_bytes) == (nb > 0)
+        # the execute contract: the cache's dtype is the DECLARED one, both ways, named in the refusal
+        b, s = 2, 8
+        kw, kw16 = _samples(geom, batch=b, seq_len=s), _samples(geom16, batch=b, seq_len=s)
+        names = ("sample_h", "sample_w_qkvg", "sample_w_q_norm", "sample_w_k_norm", "sample_cos", "sample_sin", "sample_w_o", "sample_out")
+        args, args16 = tuple(kw[k] for k in names), tuple(kw16[k] for k in names)
+        ws = torch.zeros(16, dtype=torch.uint8, device=_DEV)
+        w = torch.ones(e4.index_head_dim, dtype=torch.bfloat16, device=_DEV)
+        kb = lambda nb, dt: torch.zeros(b, nb, e4.index_head_dim, dtype=dt, device=_DEV)  # noqa: E731
+        blk, blk16 = GatedAttentionBlockFwd(**kw, geometry=geom), GatedAttentionBlockFwd(**kw16, geometry=geom16)
+        with pytest.raises(
+            ValueError, match=r"index_k_compressed must be a contiguous torch.float8_e4m3fn tensor \(QsaSpec.index_cache_dtype=torch.float8_e4m3fn"
+        ):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(2, torch.bfloat16))
+        with pytest.raises(ValueError, match=r"index_k_compressed must be a contiguous torch.bfloat16 tensor \(QsaSpec.index_cache_dtype=None"):
+            blk16.execute(*args16, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(2, _E4M3))
+        with pytest.raises(ValueError, match=r"index_k_compressed must be \[B=2, >= 2"):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(1, _E4M3))
+        # well-formed: the next refusal is the plan's
+        with pytest.raises(RuntimeError, match="call compile"):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w, index_k_compressed=kb(5, _E4M3))
+        with pytest.raises(RuntimeError, match="call compile"):
+            blk.execute(*args, ws, w_iq_norm=w, w_ik_norm=w)

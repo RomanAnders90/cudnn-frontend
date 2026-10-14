@@ -248,6 +248,7 @@ top_k=512`). It is a DECLARATION ATTRIBUTE -- it changes the function -- never a
 | `top_k` (`512`) | blocks per query in the caller's list: a multiple of 4 in `[4, 512]` (it sizes the kernel's index staging) |
 | `index_source` (`"caller"`) | `"caller"`: `execute(block_ids=)` carries the selection; `"indexer"`: the block runs the indexer over its own band and derives the selection (bf16, `index_band=True`; "The in-block indexer" below) |
 | `index_band` (`False`) | `W_qkvg` carries a fifth band `ProjBlock.INDEX` of `(index_heads + index_kv_heads) * index_head_dim` columns below V |
+| `index_cache_dtype` (`None`) | appended: the indexer cache's dtype under `index_source="indexer"` -- `None` / `torch.bfloat16` (the compressed keys and the queries as the compress kernel writes them) or `torch.float8_e4m3fn` (the fp8 indexer cache: both as plain e4m3 of the same values, no scales, scored through the scorer's MXFP8 arm with unit scale factors; `index_k_compressed` is then an e4m3 buffer). Numerics-changing (3 mantissa bits move the weakest selected blocks at the k-th boundary: 99.0 / 97.4 / 96.5 % set agreement with the bf16 selection at S = 4096 / 32768 / 131072 on synthetic activations, every flip a rank-boundary flip), so an attribute, never a knob; bf16 stays the default and the reference. Refused under `index_source="caller"` (nothing of the block reads or writes an indexer cache there); e5m2 named |
 | `index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` (`4`, `1`, `128`, `1e-6`) | the indexer's geometry; they size the band (and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool); under `index_source="indexer"` the scorer reads them (`index_heads` one of its packed head groups, `index_head_dim` its head dim) |
 
 `QsaSpec.identity_bound` (`top_k * block_size + block_size - 1` = 2051 at the defaults) is the visible-token count up to which
@@ -310,8 +311,9 @@ adapter's own `check_support` enforces; the block transcribes none of it. Typed 
 the unfused projection serves the band), `causal_bottom_right`, an fp32 activation, `h_q // h_kv > 16`, `d_head != 256` (`thd`
 together with `paged_kv_page_size` is served: the write-through addresses tokens, so the packed sparse block builds the same
 stage); under
-`index_source="indexer"` also an f16 activation, an `index_head_dim` other than the scorer's 128, an `index_heads` outside the
-scorer's packed head groups (4, 8, 16, 32, 64) and `thd`; and at `check_support`, a CuTe DSL below the floor the Rubin target
+`index_source="indexer"` also an f16 activation (with or without the fp8 indexer cache), an `index_head_dim` other than the scorer's 128, an `index_heads` outside the
+scorer's packed head groups (4, 8, 16, 32, 64) and `thd`; `index_cache_dtype` other than `None` / bf16 / e4m3 (e5m2 named), or e4m3 under
+`index_source="caller"`, from `QsaSpec.validate()`; at execute an `index_k_compressed` of the other dtype (the message names the declared one); and at `check_support`, a CuTe DSL below the floor the Rubin target
 needs (the public 4.8.0 wheel), named with the installed version, before the kernel module is imported. Under
 `index_source="indexer"` the floor is checked at declaration as well -- the scorer's head groups are read off the DSA tree, whose
 package imports its kernels, so a too-old DSL declines from `GatedAttentionBlockFwd(...)` before that import (and again from the
@@ -399,7 +401,7 @@ section); under `index_source="caller"` no kernel scores with them, under `index
 
 **The in-block indexer (`QsaSpec(index_source="indexer", index_band=True)`, bf16).** The block derives the selection
 from its own fifth band -- five launches at `T <= 4096` (two compress launches, the scorer GEMM, the radix top-k, the row
-sort; one more sort window per further 4096 rows), no kernel of its own: (1) the band's indexer QUERIES, RMSNormed with
+sort; one more sort window per further 4096 rows; two casts more under the fp8 indexer cache, below), no kernel of its own: (1) the band's indexer QUERIES, RMSNormed with
 `w_iq_norm` (`index_norm_eps`) and partially rotated at the token's position -- the block-compress kernel at pool 1 over
 the slab's query columns, bitwise the block's own norm + RoPE chain on those rows (one fp32 pass, one rounding); (2) the
 COMPRESSED KEYS -- the band's raw key head mean-pooled in fp32 per complete 4-token block, RMSNormed with `w_ik_norm` and
@@ -418,7 +420,7 @@ valid ids then `-1`, so the sparse core takes it without `block_lens`.
 | `block_ids` / `block_lens` | -- | REFUSED: the block derives the selection |
 | `block_ids_out` | int32 `[T, top_k]` or `[B, S_q, top_k]`, contiguous; optional | the block's OWN selection in canonical order (ids descending, then `-1`), written in place (the step-0 list a speculative-decoding caller reuses for the drafted rows) |
 | `block_lens_out` | int32 `[T]` or `[B, S_q]`, contiguous; optional | the valid-prefix length of every row of that list, `min(top_k, floor((pos + 1) / 4))` -- the position rule, padding rows included |
-| `index_k_compressed` | activation dtype `[B, >= floor(S / 4), index_head_dim]`, contiguous; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
+| `index_k_compressed` | the indexer cache dtype (`QsaSpec.index_cache_dtype`: the activation dtype by default, `torch.float8_e4m3fn` under the fp8 indexer cache) `[B, >= floor(S / 4), index_head_dim]`, contiguous; optional | the compressed-key cache: the compress writes rows `[0, floor(S_b / 4))` of every sequence (its complete blocks) and never touches the rest, so a cache sized for a longer context keeps its later rows |
 
 **The RoPE tables are the attention's own.** The compress reads `cos` / `sin` at row `4j` for block `j` (every block start
 is a position of the prefill) and the query norm at row `pos`: no appended block-start table and no position ids. A
@@ -437,6 +439,26 @@ such a row's extra candidates score 0 -- a positive visible block always wins, a
 (visible) id -- and the sparse core masks every key past the length anyway. The caller's `index_k_compressed` is not
 zero-filled (its rows past a sequence's blocks are the caller's); a padding row's list may name blocks past its range,
 which attention never reads.
+
+**The fp8 indexer cache (`QsaSpec(index_source="indexer", index_band=True, index_cache_dtype=torch.float8_e4m3fn)`).** The
+compressed keys and the indexer queries as plain e4m3 of the RMSNormed + rotated values (no scales -- the serving stacks' fp8 indexer
+cache recipe), scored through `cudnn.gated_attention_block.qsa_select`'s e4m3 arm: the DSA MXFP8 unified scorer with all-ones E8M0
+scale blobs, i.e. `sum_h relu(e4m3(q_h) . e4m3(kbar_j)) / sqrt(128)`. No new kernel: the two compress launches keep writing bf16
+(the one-rounding chain) and the FP8 pipeline's per-tensor cast (`sat_e4m3(row x 1.0)` -- round-to-nearest-even, saturating at
+448, never a NaN) writes the e4m3 operands into two workspace slots appended after the indexer's seven (every layout without the
+attribute is byte-identical); the caller's `index_k_compressed` is then an **e4m3** buffer written by one more cast over the
+`floor(S / 4)` rows of every sequence -- under `seq_lens` the rows `[floor(S_b / 4), floor(S / 4))` of a padded sequence receive
+ZEROS (the bf16 form leaves them untouched); rows at or past `floor(S / 4)` stay the caller's in both forms. Below the identity
+bound only the cache launches run (the bf16 compress into a staging slot, the cast into the cache: two launches where the bf16
+form runs one); past it the census is the bf16 indexer's plus two casts (plus the cache cast). The selection is a different
+FUNCTION of the inputs (3 mantissa bits: on synthetic activations the e4m3 selection agrees with the bf16 one on 99.0 % of the
+blocks at S = 4096, 97.4 % at 32768 and 96.5 % at 131072, every flipped block a rank-boundary flip within ~5 % of the row's top
+score; bf16 vs fp32 agrees at 99.8 %), so the dtype is a declaration attribute, never a knob, bf16 the default and the reference;
+the model-quality question of serving it is the caller's. The e4m3 block's selection is pinned against the top-k of the fp64
+scores of its own e4m3 operands (exact up to ties), against the fp32-operand oracle under the margin rule, and against the bf16
+block on the same inputs (the agreement reported, every flip within 8 % of the row's top score); its first execute captures and
+replays bitwise (`test_block_qsa_end_to_end.py`). The compress kernel's e4m3 store arm would fold the casts away (a lever, not
+built); the decode step over an e4m3 indexer cache is `qsa_select_decode`'s e4m3 arm, outside the block like the bf16 one.
 
 **What it costs.** Past the bound the workspace grows by the indexer's queries (`T x index_heads x index_head_dim x 2` B),
 the compressed keys (`B x S / 4 x index_head_dim x 2` B), the list, its sorted copy and its scores (`T x top_k x 12` B), the
