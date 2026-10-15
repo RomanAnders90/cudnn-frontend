@@ -154,7 +154,7 @@ declaration, ``h_sf`` / ``w_qkvg_sf`` at execute) and an :class:`MxQuantSpec`:
   blobs (``sf_q`` / ``sf_k`` / ``sf_v``, one 1 KiB tile per ``(b, h, 128-row
   tile)``; V's is D-PLANE-MAJOR, ``mma-tma-matrix.md`` § 7); the production
   ``sm107/prefill_d256_mxfp8.py`` (``SdpaFwdDslSm100(pertensor_fp8=False)``,
-  NATURAL at (256, 256), cga1) writes bf16 O; the bf16 gate; a PER-TENSOR
+  NATURAL at (256, 256), the 2-CTA pair on dense legs) writes bf16 O; the bf16 gate; a PER-TENSOR
   ``quantize_o`` (``MxQuantSpec.scale_o``; D1 -- never the rowwise recipe) and
   the per-tensor FP8 ``out_proj`` with ``alpha_o = descale_w_o / scale_o``.
 * **FULLY FUSED** (``fuse_norm_rope=True, fuse_gate=True``, 3 launches): the
@@ -3262,6 +3262,10 @@ class _FusedQkvProjection(_Stage):
         norm_source: str = "ldg_early",
         quant: Optional[Union[QuantSpec, MxQuantSpec]] = None,
         device=None,
+        # APPENDED (serving): the paged KV-cache write-through FOLDED into this fork's epilogue -- the pools' tokens per page (0 = off,
+        # the separate `_CacheWrite` launch).  bf16 fork only; the stage compiles both slot dtypes (int32 / int64 are the two the serving
+        # stacks hand over; the dtype is a compile key, as in the separate kernel) so execute dispatches on a guaranteed cache hit.
+        kv_pool_page_size: int = 0,
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
@@ -3272,6 +3276,8 @@ class _FusedQkvProjection(_Stage):
         self.dtype = dtype
         self.want_rstd = bool(want_rstd)
         self.norm_source = str(norm_source)
+        self.kv_pool_page_size = int(kv_pool_page_size)
+        self._plan_i64 = None  # the int64-slot twin of _plan under the write-through arm
         # FP8: the QuantSpec whose alpha_qkvg / scale_q / scale_k / scale_v the
         # fork's epilogue applies; `device` is where `qscal` is materialised.
         # MXFP8: an MxQuantSpec selects the block-scale twin (no scalars ride in).
@@ -3324,6 +3330,10 @@ class _FusedQkvProjection(_Stage):
             if not self._fork_supports_qk_norm():
                 raise NotImplementedError(self._qk_norm_off_unsupported_msg())
             kw["qk_norm"] = False
+        if self.kv_pool_page_size:
+            # Same only-when-set idiom: the write-through arm names its two fields (the page size; the slot dtype = this plan's, the int64
+            # twin is built with kv_slot_i64=True in compile()); every key without the arm is spelled identically to today.
+            kw["kv_pool_page_size"] = self.kv_pool_page_size
         return NormRopeFusionParams(
             d_head=g.d_head, rope_dim=g.rope_dim, h_q=g.h_q, h_kv=g.h_kv, eps=g.qk_norm_eps, want_rstd=self.want_rstd, norm_source=self.norm_source, **kw
         )
@@ -3495,6 +3505,12 @@ class _FusedQkvProjection(_Stage):
         # a compile() reached without check_support() cannot build a norm-ON
         # artifact for a norm-OFF geometry.
         self._plan = build_fused_proj_gemm(self.params())
+        if self.kv_pool_page_size:
+            # The int64-slot twin (the slot dtype is a compile key): both artifacts exist before the first execute, so whichever dtype
+            # the serving stack hands over dispatches on a cache hit (Rule 4) -- the separate `_CacheWrite` stage's own contract.
+            import dataclasses as _dc
+
+            self._plan_i64 = build_fused_proj_gemm(_dc.replace(self.params(), kv_slot_i64=True))
         if self.fp8:
             # The fork reads these four once per epilogue warp from a device vector the execute path never allocates or converts.
             # ALLOCATED here and written on a launch stream only (write_qscal: the block's first execute or update_quant_scales, or
@@ -3517,11 +3533,14 @@ class _FusedQkvProjection(_Stage):
     def flops(self) -> int:
         return 2 * self.m * self.n * self.k
 
-    def execute(self, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q=None, rstd_k=None, *, stream) -> None:
+    def execute(self, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q=None, rstd_k=None, *, stream, k_cache=None, v_cache=None, slot_mapping=None) -> None:
         """bf16 arm: ONE ``[M, N]`` slab out (Q/K columns normed + rotated).
 
         ``w_q_norm`` / ``w_k_norm`` are ``None`` (both) under ``geometry.qk_norm=False``
-        and tensors otherwise -- checked here, both directions, before the runner."""
+        and tensors otherwise -- checked here, both directions, before the runner.
+        ``k_cache`` / ``v_cache`` / ``slot_mapping`` (appended): the write-through arm's pools and slot map -- REQUIRED on a stage declared
+        with ``kv_pool_page_size`` (the epilogue writes the post-RoPE K / V rows there too), REFUSED otherwise; the slot dtype picks the
+        artifact (int32 / int64, both compiled)."""
         from .kernels.proj_gemm import run_fused_proj_gemm
 
         if self._plan is None:
@@ -3531,7 +3550,19 @@ class _FusedQkvProjection(_Stage):
         if self.mxfp8:
             raise ValueError(f"{self.name}: this stage was declared MXFP8; use execute_mxfp8(...)")
         _check_norm_weights_agree(self.geom.qk_norm, w_q_norm, w_k_norm)
-        run_fused_proj_gemm(self._plan, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q, rstd_k, stream=stream)
+        plan = self._plan
+        if self.kv_pool_page_size:
+            if slot_mapping is None:
+                raise ValueError(
+                    f"{self.name}: this stage folds the paged KV-cache write-through into its epilogue; k_cache, v_cache and slot_mapping are required"
+                )
+            if slot_mapping.dtype == torch.int64:
+                plan = self._plan_i64
+            elif slot_mapping.dtype != torch.int32:
+                raise ValueError(f"{self.name}: slot_mapping must be int32 or int64, got {slot_mapping.dtype}")
+        run_fused_proj_gemm(
+            plan, a, w, out, w_q_norm, w_k_norm, cos, sin, rstd_q, rstd_k, stream=stream, k_cache=k_cache, v_cache=v_cache, slot_mapping=slot_mapping
+        )
 
     def execute_fp8(self, a, w, out_q8, out_k8, out_v8, out_gate16, w_q_norm, w_k_norm, cos, sin, *, stream) -> None:
         """FP8 arm: COMPACT e4m3 ``q8 [M, h_q*d]`` / ``k8 [M, h_kv*d]`` / ``v8 [M, h_kv*d]``
@@ -4013,7 +4044,8 @@ class _Sdpa(_Stage):
     D8).  ``sched_policy`` is read off the MXFP8 row
     (``engine_name(arch, mxfp8=True)``: NATURAL at (256, 256) -- the per-tensor
     row's LPT claim does NOT transfer, D5) and ``cta_mma`` is left to the
-    adapter (1 for the quantized d256 flavor).  ``has_amax_o=False`` as under FP8.
+    adapter (2 on a dense unsplit leg, 1 under THD / paged / split-KV;
+    ``config_sm100.d256_mxfp8_pair_leg``).  ``has_amax_o=False`` as under FP8.
     Under ``thd=True`` the three blobs are the row's PACKED per-sequence-tile-padded
     layout at the block's slot CAPACITY (``_sf_slot_bytes_packed``: ``n_cap`` tiles
     per head, K and V equal) -- the adapter's binder derives the tile extent from
@@ -4151,10 +4183,11 @@ class _Sdpa(_Stage):
         elif self.num_sequences is not None or self.max_seq_len is not None or self.cu_seqlens:
             raise ValueError(f"{self.name}: num_sequences / max_seq_len / cu_seqlens are THD-only (thd=True)")
         # The EXTEND form (kv_source="paged"): the stage's own honesty about the ONE leg it binds -- the adapter's paged THD
-        # leg of the f16 / bf16 d256 flavor: packed queries, pools with the page size compiled in, no gate (that body has no
-        # gate seam), no LSE (the form writes none), no quantized Q / K / V (the FP8 THD path clamps runtime descriptors to a
-        # packed total and serves no pools).  The block's declaration-time checks say the same in the caller's vocabulary
-        # first; these keep a standalone stage from binding a leg nobody validated.
+        # leg of the f16 / bf16 d256 flavor: packed queries, pools with the page size compiled in, the fused gate (the shared
+        # SM100 d256 body compiled for cc 10.7 carries the gate seams on its paged / THD arms; the adapter's paged x gate twin
+        # admits it and the prepared THD binder binds G per call), no LSE (the form writes none), no quantized Q / K / V (the
+        # FP8 THD path clamps runtime descriptors to a packed total and serves no pools).  The block's declaration-time checks
+        # say the same in the caller's vocabulary first; these keep a standalone stage from binding a leg nobody validated.
         if kv_source not in _KV_SOURCES:
             raise ValueError(f"{self.name}: kv_source must be one of {_KV_SOURCES}, got {kv_source!r}")
         self.kv_source = kv_source
@@ -4182,10 +4215,9 @@ class _Sdpa(_Stage):
             if self.fp8:
                 raise NotImplementedError(f"{self.name}: kv_source='paged' serves bf16 / f16 operands and pools only (no quantized paged leg)")
             if self.thd:
-                if self.fuse_gate:
-                    raise NotImplementedError(
-                        f"{self.name}: kv_source='paged' has no gate arm on the packed form (the paged THD body carries no epilogue-gate seam)"
-                    )
+                # fuse_gate rides the paged THD leg: the gate is declared at the SAME (B_env, H, S_max, D) envelope as O at the
+                # slab's GATE column stride and bound as the packed (T, H, D) view at execute -- the dense THD arm's contract.
+                pass
             else:
                 if self.decode_split_kv < 1:
                     raise ValueError(f"{self.name}: decode_split_kv must be >= 1, got {decode_split_kv}")
@@ -4252,6 +4284,13 @@ class _Sdpa(_Stage):
                     paged_table_stride=table_stride,
                     paged_table_v_stride=table_stride,
                 )
+                if self.fuse_gate:
+                    # The gate descriptor selects the epilogue_gate specialization of the paged body (template_params().epilogue_gate):
+                    # G at the slab's GATE column stride, the (B_env, H, S_max, D) envelope O takes, mapped by the adapter through the
+                    # packed [1, T, H, D] form Q / O take under THD.
+                    kw["sample_gate"] = _bhsd_desc(
+                        b_env, g.h_q, s_env, d, self.gate_dtype or self.dtype, self.device, "gate", token_stride=self.gate_token_stride
+                    )
                 return SdpaFwdDslSm100(
                     _bhsd_desc(b_env, g.h_q, s_env, d, self.dtype, self.device, "q", token_stride=ts),
                     dataclasses.replace(self.k_cache_desc, name="k"),
@@ -4604,6 +4643,9 @@ class _Sdpa(_Stage):
                 workspace=workspace,
                 current_stream=current_stream,
                 block_table=block_table,
+                # The fused gate: the rank-3 packed (T, H, D) view of the slab's GATE columns, as on the dense THD arm (an exact
+                # `.view` at the slab's token stride, no copy).
+                **({"gate": gate.view(t, g.h_q, g.d_head)} if self.fuse_gate else {}),
             )
             return
         if any(x is not None for x in paged_args):
@@ -6416,13 +6458,9 @@ _EXTEND_DECLINES: Tuple[Tuple[str, type, Callable[[_ServingDecl], bool], str], .
         lambda d: _is_paged(d) and d.geometry.d_head != 256,
         "kv_source='paged' is validated at d_head == 256 only (the Rubin d256 paged THD leg); other head dims are a follow-up",
     ),
-    (
-        "fuse_gate",
-        NotImplementedError,
-        lambda d: _is_paged(d) and d.thd and d.fuse_gate,
-        "kv_source='paged' with fuse_gate=True: the paged THD body stage (4) binds carries no epilogue-gate seam (the packed block's gate rides "
-        "the dense THD prefill's epilogue only); the EXTEND form runs stage (5) as its own launch -- declare fuse_gate=False",
-    ),
+    # (retired) "fuse_gate": the paged THD body stage (4) binds -- the shared SM100 d256 half body compiled for cc 10.7 -- carries the
+    # epilogue-gate seams (the paged gate), so fuse_gate=True rides the EXTEND form's SDPA epilogue (5 -> 4 stages) and
+    # the row is gone from the table; a hypothetical declaration that asked for it hears nothing (the envelope lists no such row).
     (
         "return_lse",
         NotImplementedError,
@@ -6520,7 +6558,7 @@ _EXTEND_REQUIRES = (
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=None, d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B_max, max_pages] int32)",
-    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False, fuse_gate=False",
+    "bf16 / f16 activations (quant=None), save_for_backward=False, return_lse=False; fuse_gate as declared (True folds stage (5) into the paged SDPA's epilogue)",
 )
 
 
@@ -6587,19 +6625,19 @@ class GatedAttentionBlockFwd(APIBase):
         (1)+(2)+(3) proj + norm + rope   h [T_max, d_model]        -> slab          (or (1) then (2+3) unfused)
         (4w) cache write                  slab[K], slab[V]          -> k_cache / v_cache at slot_mapping
         (4)  sdpa (paged THD leg)         slab[Q], k_cache, v_cache -> O             block_table, kv_lens, seq_lens
-        (5)  gate                         O, slab[G]                -> O in place
+        (5)  gate                         O, slab[G]                -> O in place    | fuse_gate: (4)+(5) in ONE launch
         (6)  out_proj                     O                         -> out [T_max, d_model]
 
-    Five launches, one stream (the write is ordered before the read by STREAM order alone -- no programmatic dependent
-    launch on the chain).  Declared as ``thd=True, num_sequences=B_max, max_seq_len=token_capacity, token_capacity=T_max,
+    Five launches -- four with ``fuse_gate=True`` (the paged SDPA body carries the epilogue gate) -- one stream (the write is
+    ordered before the read by STREAM order alone -- no programmatic dependent launch on the chain).  Declared as ``thd=True, num_sequences=B_max, max_seq_len=token_capacity, token_capacity=T_max,
     paged_kv_page_size=P, kv_source="paged", geometry.causal_bottom_right=True`` with the pools' and the block table's
     SAMPLES (their layout and row stride are compiled in; ``serving_envelope`` lists the rest).  ``token_capacity`` makes
     the packed row count a CAPACITY: a step's lengths sum to ``T_live <= T_max`` and rows ``[T_live, T_max)`` are pad rows
     (slot ``-1``, finite ``cos`` / ``sin``, never attended; their ``out`` rows unspecified but finite); ``execute(num_tokens_live=T_live)``
     (appended) launches the token-indexed stages over the live rows alone -- no recompile, ``h`` / ``cos`` / ``sin`` / ``slot_mapping`` /
     ``out`` at ``T_max`` or exactly ``T_live`` rows, rows ``[T_live, T_max)`` of ``out`` untouched.  Typed declines, in
-    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, a fused gate
-    (the paged THD body carries no gate seam; the packed block's gate rides the dense THD prefill only), an LSE;
+    :data:`_EXTEND_DECLINES`'s order: a missing bottom-right diagonal, a window, another head dim, an LSE (a fused gate
+    is SERVED: the shared SM100 d256 body compiled for cc 10.7 carries the gate seams on its paged / THD arms);
     ``quant`` / ``save_for_backward`` are the write-through's, a sparse geometry the table's ``sparse`` row (the
     block-sparse forms' attention over the pools is its own binding; the sparse stage reads the block's own K / V,
     dense or packed).  Dense declarations use the DECODE form described below.
@@ -6648,8 +6686,8 @@ class GatedAttentionBlockFwd(APIBase):
     (value = code x scale), a bf16 Q attends over the dequantized rows.  A declaration ATTRIBUTE beside ``paged_kv_page_size``
     (it changes the write-through's numerics), never a knob.  The WRITE-THROUGH then quantizes the post-RoPE K / V
     (:class:`_QuantizedCacheWrite`: two per-tensor casts ``sat_e4m3(row x (1 / scale))`` + the bit copy through the pools' bf16
-    views; the raw indexer key keeps its bf16 pool) on every form that writes through over the block's own K / V (dense or
-    packed, QsaSpec or dense).  OVER THE POOLS it is served on the block-sparse DECODE mode at ``S_q <= 4`` (the shared list):
+    views; the raw indexer key keeps its bf16 pool) on every DENSE form that writes through over the block's own K / V (QsaSpec or
+    dense; the packed prefill's quantizing write-through is a typed decline until its accept cell lands).  OVER THE POOLS it is served on the block-sparse DECODE mode at ``S_q <= 4`` (the shared list):
     stage (4) is :class:`_UpcastSparseSdpa` -- ``kernels/qsa_kv_upcast.py`` gathers the listed rows and the open tail, casts them
     to bf16 into the workspace scratch (``[B x S_q x H_kv, 2, 2176, 256]`` + ``kv_len_t``), and the Rubin d256 DECODE tile runs
     over it as a plain padded dense SDPA (no causal mask, ``seq_kv_lens = kv_len_t``, the group packed, unsplit); the mode
@@ -6677,7 +6715,7 @@ class GatedAttentionBlockFwd(APIBase):
         (1)  proj          h8+sf_h, W8+sf_w -> PROJ [T, N] bf16   block-scale FROST GEMM (E8M0 dequant in-MMA, no alpha)
         (2+3) norm+rope    in place (out of place into compact bf16 Q/K under save_for_backward)   this block's kernel
         (3q) quantize x3   PROJ[Q]/[K] rowwise, PROJ[V] columnwise -> q8/k8/v8 + sf_q/sf_k/sf_v   kernels/quantize_mxfp8.py
-        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, cga1)
+        (4)  sdpa          q8,k8,v8 + SF -> O bf16                 production prefill_d256_mxfp8.py (NATURAL, pair on dense legs)
         (5)  gate          O, PROJ[G] -> O in place                this block's kernel
         (5q) quantize_o    O -> o8 (PER-TENSOR scale_o, D1)        kernels/quantize.py
         (6)  out_proj      o8 -> out (alpha_o = descale_w_o / scale_o)   per-tensor FP8 FROST GEMM
@@ -6824,6 +6862,12 @@ class GatedAttentionBlockFwd(APIBase):
         # fp32 partials in the workspace + one combine launch, the same function under every value).
         max_kv_len: Optional[int] = None,
         decode_split_kv: Optional[int] = None,
+        # APPENDED (serving): WHERE the paged KV-cache write-through runs under paged_kv_page_size > 0.  None = AUTO: folded into the fused
+        # projection's epilogue wherever that arm serves (fuse_norm_rope=True, bf16 / f16 activations, no indexer band -- both serving forms as
+        # declared today: EXTEND 4 -> 3 stages with fuse_gate, DECODE 5 -> 4), the separate cache-write launch everywhere else; False = the
+        # separate launch always (the A/B control and the fallback); True = the fused arm, a typed decline on a form it cannot serve.  A
+        # performance-only knob: the pools hold the SAME bytes either way (the pool row is the slab row, bitwise).
+        fuse_cache_write: Optional[bool] = None,
         # APPENDED (serving): run stages (2)+(3) and the write-through (4w) as ONE launch (kernels/qsa_prepare.py).  A
         # PERFORMANCE knob -- the same function, every output bitwise the two-stage form; needs paged_kv_page_size > 0 and
         # the in-place bf16 / f16 pipeline (typed otherwise).  Off by default.
@@ -7054,7 +7098,7 @@ class GatedAttentionBlockFwd(APIBase):
         self.paged_kv_page_size = self._check_cache_write_declaration(paged_kv_page_size, quant)
         # THE e4m3 KV CACHE (kv_cache_dtype): the attribute's own rows (type, e5m2 by name, the write-through it belongs to, bf16
         # activations), typed and naming the feature -- device-free; the pools' samples below are checked in THIS dtype.
-        self.kv_cache_dtype = self._check_kv_cache_dtype_declaration(kv_cache_dtype, quant)
+        self.kv_cache_dtype = self._check_kv_cache_dtype_declaration(kv_cache_dtype, quant, kv_source)
         self.kv_cache_e4m3 = self.kv_cache_dtype == KV_CACHE_E4M3
         # THE EXTEND FORM (kv_source) and the BOUNDED token form (token_capacity): the typed declines of the table every caller's
         # dispatch predicate can read back (serving_envelope), then the three samples' contract -- device-free, before any descriptor.
@@ -7083,6 +7127,15 @@ class GatedAttentionBlockFwd(APIBase):
         # else (an unsplit decode tile).  `fuse_gate` stays what was declared; `gate_fused` is what runs.
         self.gate_fused = (
             self.fuse_gate and not self.upcast_decode and (self.decode_route is None or (self.decode_route.decode_tile and self.decode_split_kv >= 2))
+        )
+        # Where the paged KV-cache write-through runs: the fused projection's epilogue (the arm serves the bf16 / f16 fused norm + RoPE
+        # pipeline without an indexer band) or the separate cache-write launch.  `fuse_cache_write` stays what was declared;
+        # `cache_write_fused` is what runs.  Never under kv_cache_dtype=e4m3: the epilogue writes 16-bit rows and the e4m3 write-through
+        # QUANTIZES (the separate _QuantizedCacheWrite launches); AUTO stays off there, an explicit True is the typed decline below.
+        self.fuse_cache_write = self._check_fuse_cache_write_declaration(fuse_cache_write, quant)
+        self.cache_write_fused = bool(self.paged_kv_page_size) and (
+            self.fuse_cache_write is True
+            or (self.fuse_cache_write is None and self.fuse_norm_rope and quant is None and not geometry.index_band and not self.kv_cache_e4m3)
         )
         # The PREPARE fusion (stages (2)+(3) + (4w) in one launch): a performance knob over the write-through declaration;
         # its own rows (type, the attribute it needs, the pipelines its kernel has an arm for), typed and naming the knob.
@@ -7140,7 +7193,15 @@ class GatedAttentionBlockFwd(APIBase):
             # compact e4m3 q8/k8/v8 + the bf16 gate16 buffer, quantizing in its
             # epilogue.  MXFP8: the block-scale twin (typed decline until S6 lands).
             self._proj = _FusedQkvProjection(
-                geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, want_rstd=want_rstd, quant=quant, device=self.device
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                want_rstd=want_rstd,
+                quant=quant,
+                device=self.device,
+                # the serving write-through folded into the epilogue (cache_write_fused): the pools' page size, else 0 = the fork as before
+                kv_pool_page_size=self.paged_kv_page_size if self.cache_write_fused else 0,
             )
             self._norm_rope = None  # lives in the fused epilogue
         else:
@@ -7291,8 +7352,9 @@ class GatedAttentionBlockFwd(APIBase):
         self._gate = None if self.gate_fused else _SigmoidGate(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
         # (4w) SERVING write-through of the post-RoPE K / V (+ the raw indexer key) into paged pools -- built only when
         # the declaration carries a page size; not built rather than built and skipped (it would still compile).
+        # Not built when the fused projection's epilogue writes the pools (cache_write_fused): a stage that never runs is not in `_stages`.
         # Under kv_cache_dtype=e4m3 the write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views).
-        if not self.paged_kv_page_size:
+        if not self.paged_kv_page_size or self.cache_write_fused:
             self._cache_write = None
         elif self.kv_cache_e4m3:
             self._cache_write = _QuantizedCacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
@@ -7571,20 +7633,19 @@ class GatedAttentionBlockFwd(APIBase):
                 hint=f" (the decode mode's SHARED list: one row per sequence selected at the step-0 position kv_lens[b] - {self.seq_len}; a per-token "
                 f"[{t}, {top_k}] / [{b}, {self.seq_len}, {top_k}] list is the form of a declaration with S_q > 4)",
             )
-            if block_lens is not None:
-                _check_index_tensor(block_lens, "block_lens", (b,), (b,), h.device, hint=" (one count per sequence under the shared list)")
-            return
-        _check_index_tensor(
-            block_ids,
-            "block_ids",
-            (t, top_k),
-            (self.batch, self.seq_len, top_k),
-            h.device,
-            hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form: a dense declaration with S_q <= 4 over the pools, kv_source='paged')",
-        )
+        else:
+            _check_index_tensor(
+                block_ids,
+                "block_ids",
+                (t, top_k),
+                (self.batch, self.seq_len, top_k),
+                h.device,
+                hint=" (a [B, top_k] list shared by a sequence's rows is the decode mode's form: a dense declaration with S_q <= 4 over the pools, kv_source='paged')",
+            )
         # The sparse core binds block_ids as a TMA / bulk-copy base (assumed_align=16): the adapter refuses a view that starts off a
         # 16-byte boundary (a storage offset of a few ids) -- but at stage (4), after the projection, norm + RoPE and a declared
-        # write-through have already run.  The same rule here, before any stage, so the refusal modifies nothing.
+        # write-through have already run.  The same rule here, before any stage and on BOTH list forms (a review found the shared form
+        # returning above it), so the refusal modifies nothing.
         ptr = int(block_ids.data_ptr())
         if ptr % 16:
             raise ValueError(
@@ -7592,7 +7653,10 @@ class GatedAttentionBlockFwd(APIBase):
                 f"is refused before any stage runs); got data_ptr=0x{ptr:x}"
             )
         if block_lens is not None:
-            _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
+            if self.qsa_shared_list:
+                _check_index_tensor(block_lens, "block_lens", (self.batch,), (self.batch,), h.device, hint=" (one count per sequence under the shared list)")
+            else:
+                _check_index_tensor(block_lens, "block_lens", (t,), (self.batch, self.seq_len), h.device)
 
     # -- paged-cache write-through (serving) ---------------------------------
 
@@ -7630,6 +7694,38 @@ class GatedAttentionBlockFwd(APIBase):
                 "forward keeps its K / V in the SavedForBackward record, not in a paged pool"
             )
         return page_size
+
+    def _check_fuse_cache_write_declaration(self, fuse_cache_write, quant) -> Optional[bool]:
+        """``fuse_cache_write`` at declaration: None / True / False (``TypeError`` otherwise); True on a pipeline the fused projection's
+        write-through arm does not serve is a typed ``NotImplementedError`` naming the feature (the arm: ``paged_kv_page_size > 0``,
+        ``fuse_norm_rope=True``, bf16 / f16 activations, no indexer band, 16-bit pools -- the bf16 fork's epilogue; the quantizing forks, the
+        unfused chain, the indexer band and the e4m3 KV cache keep the separate cache-write launch).  Device-free."""
+        if fuse_cache_write is not None and not isinstance(fuse_cache_write, bool):
+            raise TypeError(f"fuse_cache_write must be None (auto), True or False, got {type(fuse_cache_write).__name__}")
+        if fuse_cache_write is True:
+            if not self.paged_kv_page_size:
+                raise ValueError("fuse_cache_write=True needs paged_kv_page_size > 0 (there is no write-through to fold)")
+            if quant is not None:
+                raise NotImplementedError(
+                    f"fuse_cache_write=True with quant={type(quant).__name__}: the write-through arm lives in the bf16 fused projection's epilogue; the "
+                    "quantizing forks keep the separate cache-write launch (the paged pools are bf16 / f16 either way)"
+                )
+            if not self.fuse_norm_rope:
+                raise NotImplementedError(
+                    "fuse_cache_write=True needs fuse_norm_rope=True: the write-through is an epilogue arm of the fused norm + RoPE projection; the "
+                    "unfused chain norms the slab in place after the GEMM and keeps the separate cache-write launch"
+                )
+            if self.geom.index_band:
+                raise NotImplementedError(
+                    "fuse_cache_write=True with an indexer band: the fused projection declines the band's 640-column tile, and the raw indexer key's "
+                    "pool is the separate cache-write launch's; declare fuse_cache_write=False (or None)"
+                )
+            if self.kv_cache_e4m3:
+                raise NotImplementedError(
+                    "fuse_cache_write=True with kv_cache_dtype=torch.float8_e4m3fn: the fused projection's epilogue writes bf16 / f16 rows, and the e4m3 "
+                    "cache's write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views) -- declare fuse_cache_write=False (or None)"
+                )
+        return fuse_cache_write
 
     def _check_fuse_prepare_declaration(self, fuse_prepare) -> bool:
         """``fuse_prepare`` at declaration: a ``bool`` (``TypeError`` otherwise); ``True`` needs the write-through attribute
@@ -7675,12 +7771,14 @@ class GatedAttentionBlockFwd(APIBase):
 
     # -- the e4m3 KV cache (kv_cache_dtype) ---------------------------------
 
-    def _check_kv_cache_dtype_declaration(self, kv_cache_dtype, quant) -> torch.dtype:
+    def _check_kv_cache_dtype_declaration(self, kv_cache_dtype, quant, kv_source=KV_SOURCE_SELF) -> torch.dtype:
         """``kv_cache_dtype`` at declaration, device-free: ``None`` / the activation dtype = the pools as before; ``torch.float8_e4m3fn``
         = the e4m3 KV cache, which needs the write-through attribute (``paged_kv_page_size > 0``: the attribute changes what the
         write-through writes) and bf16 activations (the cast writes bf16 rows, the decode tile reads a bf16 Q); ``quant`` and
         ``save_for_backward`` with the write-through are the write-through's own declines (heard first).  e5m2 is declined BY NAME; any
-        other dtype is a ``ValueError``.  Returns the pools' dtype.  Runs AFTER ``_check_cache_write_declaration``."""
+        other dtype is a ``ValueError``; the packed (``thd=True``) PREFILL (``kv_source="self"``) with the attribute is a typed decline (its
+        quantizing write-through has no accept cell yet) -- a packed declaration OVER THE POOLS is the serving table's EXTEND row, which
+        speaks for itself later.  Returns the pools' dtype.  Runs AFTER ``_check_cache_write_declaration`` and before the serving table."""
         act = self.act_dtype
         if kv_cache_dtype is None:
             return act
@@ -7717,6 +7815,12 @@ class GatedAttentionBlockFwd(APIBase):
             raise NotImplementedError(
                 f"kv_cache_dtype=torch.float8_e4m3fn with {act} activations: the gathered cast writes bf16 rows and the d256 decode tile over them reads a "
                 "bf16 Q (one dtype per plan) -- declare bf16 activations (f16 activations over an e4m3 cache are a follow-up)"
+            )
+        if self.thd and kv_source != KV_SOURCE_PAGED:
+            raise NotImplementedError(
+                "kv_cache_dtype=torch.float8_e4m3fn with thd=True: the packed prefill's quantizing write-through (the same token-addressed launches over "
+                "the packed slab) has no accept cell yet, so it is declared as a typed decline rather than claimed -- run the dense prefill over e4m3 "
+                "pools, or the packed prefill over bf16 / f16 pools (kv_cache_dtype=None)"
             )
         return KV_CACHE_E4M3
 
@@ -8913,6 +9017,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``NotImplementedError`` (the graph binds the declared ``M``).  A CUDA-graph
         capture bakes the host int into the captured launches: a replay serves
         the live count it was captured with -- one capture per live-count bucket.
+
         ``k_scale`` / ``v_scale`` (appended): under ``kv_cache_dtype=torch.float8_e4m3fn``
         REQUIRED -- the pools' per-tensor DEscales (value = code x scale), 1-element
         fp32 CUDA tensors on ``h``'s device, read on device: the write-through
@@ -9128,6 +9233,13 @@ class GatedAttentionBlockFwd(APIBase):
                 rstd_q if rstd_q is None else rstd_q.view(t, g.h_q),
                 rstd_k if rstd_k is None else rstd_k.view(t, g.h_kv),
                 stream=stream,
+                # (4w) folded in (cache_write_fused): the post-RoPE K / V rows go to the pools from the epilogue's registers -- the same
+                # bytes the slab gets, so the pool row is bitwise the row stage (4) consumes; stream order still orders this launch
+                # before the paged read (nothing on the chain launches as a programmatic dependent launch).  The slot map is the
+                # LIVE-ROW view (`slot_live`, as the separate cache-write stage takes it): the fused projection runs over `rows` rows and
+                # its runner checks the slot map against that count, so under num_tokens_live a capacity-length slot map is sliced
+                # to the live rows here, not rejected there.
+                **({"k_cache": k_cache, "v_cache": v_cache, "slot_mapping": slot_live} if self.cache_write_fused else {}),
             )
         else:
             if mxfp8:

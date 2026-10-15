@@ -209,10 +209,15 @@ def test_typed_declines_at_declaration_name_the_feature():
         paged_kv_page_size=16,
     )
     assert packed.thd and isinstance(packed._cache_write, _CacheWrite) and packed._cache_write.batch * packed._cache_write.seq_len == 64
-    # Served pipelines declare without complaint: fused norm + RoPE, out-of-place Q / K / V, the fused gate, fp16.
+    # Served pipelines declare without complaint: fused norm + RoPE, out-of-place Q / K / V, the fused gate, fp16.  Under fuse_norm_rope=True
+    # the write-through is FOLDED into the fused projection's epilogue by default (fuse_cache_write=None = AUTO, develop 2026-10-14): no
+    # separate stage, `cache_write_fused` says so; the other pipelines keep the separate stage.
     for kw in (dict(fuse_norm_rope=True), dict(inplace_qkv=False), dict(fuse_gate=True), dict(fuse_norm_rope=True, fuse_gate=True)):
         blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, **kw)
-        assert isinstance(blk._cache_write, _CacheWrite)
+        if kw.get("fuse_norm_rope"):
+            assert blk.cache_write_fused is True and blk._cache_write is None
+        else:
+            assert blk.cache_write_fused is False and isinstance(blk._cache_write, _CacheWrite)
     blk16, *_ = _make_block(_SMALL_D256, 1, 64, dtype=torch.float16, paged_kv_page_size=16)
     assert blk16._cache_write.dtype == torch.float16
 
