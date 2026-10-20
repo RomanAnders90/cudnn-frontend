@@ -26,6 +26,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+import cutlass
 import cutlass.cute as cute
 
 # Host side: classify sample tensors and derive the kernel-facing views for the descriptors.
@@ -74,6 +75,35 @@ def normalize_prob(tensor):
     if tensor is not None and tensor.ndim == 1:
         return True, tensor.view(-1, 1, 1)
     return False, tensor
+
+
+def live_kernel_view(tensor, normalize, canonical: bool, name: str):
+    """Kernel-facing view of an execute operand, which must use the layout the kernel was compiled for."""
+    is_canonical, view = normalize(tensor)
+    if is_canonical != canonical:
+        raise ValueError(f"{name} layout mismatch: the kernel was compiled for the {'canonical' if canonical else 'legacy'} layout")
+    return view
+
+
+def operand_signature(tensor):
+    """Hashable (shape, stride, dtype, device) of an execute operand, or None; data pointers excluded."""
+    if tensor is None:
+        return None
+    from cudnn.tensor_adapter import get_device, get_shape, get_strides, is_torch_tensor
+
+    if is_torch_tensor(tensor):
+        return (tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+    return (get_shape(tensor), get_strides(tensor), tensor.dtype, get_device(tensor))
+
+
+def validate_once(cache: dict, check, operands) -> None:
+    """``check(*operands)`` once per distinct operand metadata; the outcome depends on nothing else."""
+    signature = tuple(operand_signature(tensor) for tensor in operands)
+    if signature not in cache:
+        check(*operands)
+        if len(cache) >= 1024:
+            cache.clear()
+        cache[signature] = True
 
 
 def is_flat_sf(tensor) -> bool:
@@ -198,6 +228,16 @@ def kernel_facing_wgrad_sf(tensor, rows, tokens, sf_vec_size):
         return tensor
     cols = (tokens + sf_vec_size * 4 - 1) // (sf_vec_size * 4) * 4
     return cute.make_tensor(tensor.iterator, cute.make_layout(((rows + 127) // 128 * 128, cols), stride=(cols, 1)))
+
+
+def kernel_facing_fp4(tensor):
+    """Packed FP4 carried as uint8 -> 4-bit elements with twice the innermost extent; other element types pass through.
+
+    The JAX bridge presents uint8 arrays as Int8.
+    """
+    if tensor is None or tensor.element_type not in (cutlass.Uint8, cutlass.Int8):
+        return tensor
+    return cute.make_tensor(cute.recast_ptr(tensor.iterator, dtype=cutlass.Float4E2M1FN), cute.recast_layout(4, 8, tensor.layout))
 
 
 def kernel_facing_prob(tensor):

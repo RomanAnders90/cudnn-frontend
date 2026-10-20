@@ -28,7 +28,8 @@ included.  Rubin cells: the whole block, dense AND packed, bf16 AND f16, on ever
 rows bitwise the slab's post-RoPE K / V bands attention consumed and within the suite's bars of the per-sequence oracle,
 padded tokens unwritten on a NaN-poisoned pool, ``out`` bitwise the block's without write-through, the workspace size
 unchanged -- plus the other bf16 pipelines (fused norm + RoPE, dense and packed; out-of-place Q / K / V; the fused gate) and
-the indexer band's raw-key pool.
+the indexer band's raw-key pool on the sparse block (the stage walk, then the whole block with the full caller list against the
+fp32 QSA oracle).
 """
 
 import contextlib
@@ -57,7 +58,6 @@ from cudnn.gated_attention_block import (
 from cudnn.gated_attention_block.api import (
     _EXTEND_DECLINES,
     PAGED_KV_PAGE_ALIGN,
-    _align_up,
     _CacheWrite,
     _cols,
     _FusedQkvProjection,
@@ -86,6 +86,12 @@ requires_capture_safe_gemm_route = pytest.mark.skipif(
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from gated_block_qsa_reference import (  # noqa: E402
+    RefQsaGeometry,
+    RefQsaSpec,
+    full_block_ids,
+    gated_attention_block_qsa_reference,
+)
 from gated_block_reference import (  # noqa: E402
     RefGeometry,
     build_rope_tables,
@@ -701,6 +707,16 @@ def test_kernel_runner_refuses_a_mismatched_binding():
     odd = torch.full((2, 2, 16, 2 * 256 + 4), float("nan"), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match=r"pool_b stride\[2\].*multiple of 16 bytes"):
         run_cache_write(r, src, src, pool, odd[..., 256:512], slot, stream=s)
+    # Every operand on src_a's CUDA device, named: a CPU slot_mapping (a serving stack's `torch.tensor(slots)` with no device=) passed
+    # the dtype / rank / length checks and the kernel dereferenced a host address; a CPU pool, source or anchor is the same wild access.
+    with pytest.raises(ValueError, match="slot_mapping must live on"):
+        run_cache_write(r, src, src, pool, pool, slot.cpu(), stream=s)
+    with pytest.raises(ValueError, match="pool_b must live on"):
+        run_cache_write(r, src, src, pool, pool.cpu(), slot, stream=s)
+    with pytest.raises(ValueError, match="src_b must be on"):
+        run_cache_write(r, src, src.cpu(), pool, pool, slot, stream=s)
+    with pytest.raises(ValueError, match="src_a must be a CUDA tensor"):
+        run_cache_write(r, src.cpu(), src, pool, pool, slot, stream=s)
     with pytest.raises(ValueError, match="page_size must be >= 1"):
         compile_cache_write(dtype=torch.bfloat16, h=2, d=256, page_size=0)
     with pytest.raises(ValueError, match="bf16 / f16"):
@@ -753,13 +769,13 @@ _COMPILED = {}  # (form, dtype, page) -> the compiled block with write-through a
 
 
 def _oracle_rows(form, inp, meta, ref_geom):
-    """The per-sequence oracle's post-RoPE K / V as ``[T, H_kv, D]`` rows in token order (the dense oracle at B x S rows; the
-    packed one per sequence, concatenated -- an empty sequence contributes no rows)."""
+    """Post-RoPE K / V in token order. FP64 accumulation avoids reference GEMM errors at BF16 rounding boundaries;
+    intermediate casts still use the input dtype. Empty packed sequences contribute no rows."""
     if form == "dense":
-        ref = gated_attention_block_reference(**inp, geom=ref_geom)
+        ref = gated_attention_block_reference(**inp, geom=ref_geom, acc_dtype=torch.float64)
         return ref.k.reshape(-1, *ref.k.shape[2:]), ref.v.reshape(-1, *ref.v.shape[2:])
     refs = gated_attention_block_reference_packed(
-        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"]
+        inp["h"], inp["w_qkvg"], inp["w_q_norm"], inp["w_k_norm"], inp["cos"], inp["sin"], inp["w_o"], ref_geom, meta["lens"], acc_dtype=torch.float64
     )
     ks = [r.k[0] for r in refs if r is not None]
     vs = [r.v[0] for r in refs if r is not None]
@@ -1113,11 +1129,15 @@ def test_two_launches_are_bitwise_on_the_pools_and_the_output():
 @pytest.mark.L1
 @requires_rubin
 def test_raw_indexer_key_pool_at_flash_next():
-    """The band geometry's write-through stages -- the unfused projection over the five-band slab, norm + RoPE, the cache
-    write -- are the stages AHEAD of the sparse attention core in the block's walk (``check_support`` accepts them and
-    then declines at the sparse stage, which has not landed), so they run through the block's own stage objects: the raw
+    """The band geometry's write-through on the sparse block: ``check_support`` accepts the whole walk -- the unfused projection
+    over the five-band slab, norm + RoPE, the cache write AND the sparse attention core (stage (4) of a ``QsaSpec`` block is the
+    index-list sparse d256 forward; the core declined here before it landed) -- so the cell walks the stages AHEAD of the core
+    through the block's own stage objects (the only way to read the slab between the projection and norm + RoPE): the raw
     indexer key's pool is bitwise ``index_k_raw_view`` at every slot, the K / V pools bitwise the post-RoPE bands, and the
-    pre-norm raw key is untouched by norm + RoPE."""
+    pre-norm raw key is untouched by norm + RoPE.  Then the WHOLE block runs on the same inputs with the full caller list
+    (every complete block of the row's own sequence, below the identity bound: dense causal attention through the sparse core)
+    on fresh NaN pools: its three pools bitwise the walk's, its slab's raw key (``index_k_raw(workspace)``) bitwise the walk's,
+    ``out`` and the gated O within the suite's bars of the fp32 QSA oracle."""
     geom = GatedAttentionBlockGeometry(**_FLASH_NEXT, qsa=QsaSpec(index_band=True))
     b, s = 1, 512
     t, dm, ps = b * s, geom.d_model, 16
@@ -1134,12 +1154,11 @@ def test_raw_indexer_key_pool_at_flash_next():
     assert isinstance(blk._sdpa, _SparseSdpa) and blk._cache_write.index_band
     stages = list(blk._stages)
     assert stages.index(blk._cache_write) < stages.index(blk._sdpa)
-    with pytest.raises(NotImplementedError, match="sparse attention core"):
-        blk.check_support()  # the stages ahead of the sparse core -- the write-through included -- accepted the band geometry
-    for st in (blk._proj, blk._norm_rope, blk._cache_write):
-        st.compile()
+    assert blk.check_support()  # every stage accepts the band geometry -- the write-through and the sparse core included
+    blk.compile()
     lay = blk._layout()
-    ws = torch.full((lay.total_bytes + _align_up(max(blk._proj.workspace_bytes(), 1)),), 0x7F, dtype=torch.uint8, device="cuda")
+    ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
+    # The stages AHEAD of the sparse core, one by one through the block's own (compiled) stage objects.
     proj = _view(ws, lay.proj, (t, geom.n_qkvg), torch.bfloat16)
     blk._proj.execute(h.view(t, dm), w_qkvg, proj, ws[lay.engine_scratch :], stream=stream)
     o_q, _o_g, o_k, o_v = geom.qkvg_offsets[:4]
@@ -1163,6 +1182,28 @@ def test_raw_indexer_key_pool_at_flash_next():
     assert torch.equal(_bits(pooled), _bits(raw[0, live, 0])), "the raw-key pool is not the slab's raw indexer key"
     assert _written_rows(index_cache) == int(live.sum())
     assert blk._cache_write.moved_bytes() == 2 * 2 * t * geom.h_kv * geom.d_head * 2 + t * 4 + 2 * t * 128 * 2 + t * 4
+    # The WHOLE block on the same inputs -- the landed walk runs on through the sparse core, the gate and the out projection: the
+    # full caller list (``block_ids`` [T, top_k] int32, every complete block of the row's own sequence then -1; ``block_lens`` the
+    # count), fresh NaN pools with the raw-key pool handed in as ``index_k_raw``, ``out`` NaN-poisoned (a row never written stays NaN).
+    ids, lens = full_block_ids(torch.arange(s, device="cuda"), geom.qsa.top_k, geom.qsa.block_size)
+    k_blk, v_blk = _pools(n_pages, geom.h_kv, ps, geom.d_head, "unified", device="cuda")
+    index_blk = torch.full_like(index_cache, float("nan"))
+    out.fill_(float("nan"))
+    blk.execute(
+        h, w_qkvg, wn, wn, cos, sin, w_o, out, ws, block_ids=ids, block_lens=lens, k_cache=k_blk, v_cache=v_blk, slot_mapping=slot, index_k_raw=index_blk
+    )
+    torch.cuda.synchronize()
+    for walk, whole, nm in ((k_cache, k_blk, "k_cache"), (v_cache, v_blk, "v_cache"), (index_cache, index_blk, "index_k_raw")):
+        assert torch.equal(_bits(walk), _bits(whole)), f"the whole block's {nm} is not bitwise the stage walk's"
+    assert torch.equal(_bits(blk.index_k_raw(ws)), _bits(raw_before)), "the whole block's slab holds another raw indexer key than the stage walk's"
+    assert torch.isfinite(out.float()).all(), "a row of out was never written (NaN survived)"
+    ref = gated_attention_block_qsa_reference(
+        h, w_qkvg, wn, wn, cos, sin, w_o, RefQsaGeometry(**_FLASH_NEXT, qsa=RefQsaSpec(index_band=True)), block_ids=ids, block_lens=lens
+    )
+    o_gated = _view(ws, lay.o, (t, geom.h_q, geom.d_head), torch.bfloat16).view(b, s, geom.h_q, geom.d_head)  # gated in place under inference
+    cos_out, d_o = _cos(out, ref.out), float((o_gated.float() - ref.o_gated.float()).abs().max())
+    print(f"\nband geometry S={s}, the whole block vs the fp32 QSA oracle (full list): cos(out) {cos_out:.6f} max|d O_gated| {d_o:.4e}")
+    assert cos_out > 0.999 and d_o <= 2e-2, f"off the oracle: cos(out) {cos_out}, max|d O_gated| {d_o}"  # the dense block suites' budget, as every QSA cell
 
 
 # ===========================================================================
@@ -1386,8 +1427,9 @@ def test_extend_typed_declines_match_the_envelope_row_by_row(monkeypatch):
     d128 = dict(_EXTEND_GEOM, d_head=128, d_model=256)
     trips = {
         "write_through": lambda: _declare_extend_with(2, 128, good, page=0),
-        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py); past the decode tile's 32 rows it is this row
-        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 64, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
+        # a dense paged declaration IS the DECODE form now (test_block_serving_decode.py): past 32 tokens per sequence (the decode tile
+        # unpacked, its widest step) it is the decode_rows row; 160 packed rows (64 / 2 = group 32 at S_q 5) ride the unpacked arm
+        "decode_rows": lambda: _make_block(_EXTEND_GEOM, 1, 33, paged_kv_page_size=16, kv_source=KV_SOURCE_PAGED),
         "diagonal": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=_SMALL_D256),
         # the PACKED form over the pools on a QsaSpec geometry (a dense one is the block-sparse decode mode since 2026-10-14: _declare_dense_sparse_paged)
         "sparse": lambda: _declare_extend(2, 128, max_kv_len=128, geom_kw=dict(_SMALL_D256, qsa=QsaSpec())),
@@ -1567,12 +1609,18 @@ def test_extend_execute_form_checks_are_host_side_and_typed():
 
 @pytest.mark.L0
 def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_dependent_grid(monkeypatch):
-    """The ONLY ordering between the cache write and the paged read is STREAM order.  Pinned: (1) the write-through stage compiles
-    its kernels with ``use_pdl`` False (the runner's default; the stage passes nothing else -- a spy on the compile entry records
-    every call's kwargs), so the cache write never launches as a programmatic dependent launch; (2) no SDPA body the form can
-    run -- the shared d256 paged body compiled for Rubin and the Rubin sibling -- waits on a dependent grid or launches with
-    PDL (a static detector over their SOURCE TEXT: a kernel adopting PDL after a pool write must wait before its first K / V load);
-    (3) the runner's compile entry defaults ``use_pdl`` to False."""
+    """The ONLY ordering between the cache write and the paged read is STREAM order unless the block is DECLARED with
+    ``use_pdl=True`` -- and then only over a chain whose every body carries the sites.  Pinned: (1) by default the write-through
+    stage compiles its kernels with ``use_pdl`` False (the declaration's default, threaded by the stage -- a spy on the compile
+    entry records every call's kwargs), so the cache write never launches as a programmatic dependent launch on its own; (2) no
+    SDPA body the EXTEND form can run -- the shared d256 paged body compiled for Rubin and the Rubin sibling -- waits on a
+    dependent grid or launches with PDL (a static detector over their SOURCE TEXT: a kernel adopting PDL after a pool write must
+    wait before its first K / V load); (3) therefore an EXTEND declaration with ``use_pdl=True`` threads the switch to the
+    write-through and NEVER to stage (4): the paged body launches plain and the link serializes (its stream-ordered launch
+    follows the write-through's completion, so the read still follows the write -- correct by PDL's semantics), read back by
+    ``pdl_stages`` (the write-through, not ``"sdpa"``) and ``use_pdl_effective`` False; on Rubin the stage compiles, and a stage
+    FORCED to carry the switch onto the paged body is the adapter's typed decline; (4) the runner's compile entry defaults
+    ``use_pdl`` to False."""
     import inspect
 
     import cudnn.gated_attention_block.kernels.cache_write as cw
@@ -1595,13 +1643,34 @@ def test_extend_pipelines_launch_without_pdl_and_the_sdpa_bodies_wait_on_no_depe
 
     monkeypatch.setattr(cw, "compile_cache_write", spy)
     blk, *_ = _declare_extend(2, 128, max_kv_len=128)
+    assert blk.use_pdl is False and blk._cache_write.use_pdl is False
     blk._cache_write.compile()
     assert len(calls) == 2 and all(c.get("use_pdl", False) is False for c in calls), calls
-    assert "use_pdl" not in inspect.getsource(_CacheWrite.compile)
+    # the declared switch is the ONLY way the write-through ever launches with the attribute: the stage threads it as declared
+    calls.clear()
+    blk_on, *_ = _declare_extend(2, 128, max_kv_len=128, use_pdl=True)
+    assert blk_on.use_pdl is True and blk_on._cache_write.use_pdl is True
+    blk_on._cache_write.compile()
+    assert len(calls) == 2 and all(c.get("use_pdl") is True for c in calls), calls
     for mod in ("cudnn.sdpa.fwd.kernels.sm100.prefill_d256_f16", "cudnn.sdpa.fwd.kernels.sm107.prefill_d256_f16"):
         src = _kernel_source(mod)
         for token in ("griddepcontrol", "wait_on_dependent_grids", "launch_dependent_grids", "use_pdl=True"):
             assert token not in src, (mod, token)
+    # (3) the EXTEND form's SDPA body carries no sites, so the block never hands it the switch: stage (4) launches plain (the link
+    # serializes), the readback says which stages took the attribute, and the form's envelope names stage (4) among neither form's
+    assert blk_on._sdpa.use_pdl is False and blk_on.decode_route is None and _Sdpa.pdl_capable(None) is False
+    assert blk_on.pdl_stages == tuple(st.name for st in blk_on._stages if getattr(st, "use_pdl", False)) and "cache_write" in blk_on.pdl_stages
+    assert "sdpa" not in blk_on.pdl_stages and blk_on.use_pdl_effective is False and blk.pdl_stages == ()
+    env_on = GatedAttentionBlockFwd.serving_envelope(GatedAttentionBlockGeometry(**_EXTEND_GEOM), torch.bfloat16, _DEV)
+    assert env_on.extend.pdl_stages == ("qk_norm_rope", "cache_write", "sigmoid_gate") and "sdpa" not in env_on.extend.pdl_stages
+    if torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) == (10, 7):
+        blk_on._sdpa.check_support()
+        blk_on._sdpa.compile()  # the paged body, plain: no decline
+        forced, *_ = _declare_extend(2, 128, max_kv_len=128, use_pdl=True)
+        forced._sdpa.use_pdl = True  # a stage forced to carry the switch onto a kernel without the sites: the adapter's typed decline
+        forced._sdpa.check_support()
+        with pytest.raises(NotImplementedError, match="programmatic-dependent-launch sites"):
+            forced._sdpa.compile()
 
 
 # ---------------------------------------------------------------------------
