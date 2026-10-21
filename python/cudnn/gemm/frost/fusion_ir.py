@@ -964,6 +964,67 @@ class FusionChain:
         )
 
 
+COMBINE_PROLOGUE_MAX_SPLITS = 16
+"""The split count up to which the combine prologue's fold is bitwise the combine kernel's (``split_combine.py``: the decode-grid kernel's
+chain 0 holds every split up to 16, so every form of that module computes one sequence there; past it the kernel merges chain partials)."""
+
+COMBINE_PROLOGUE_MAX_TOKENS = 8
+"""The widest B tile the combine prologue forms: the swizzle atom's 8 token rows (``cta_tile_n`` 8); more tokens are another GEMM tile."""
+
+
+@dataclass(frozen=True)
+class CombinePrologueSpec:
+    """The plan-time facts of the COMBINE PROLOGUE arm of the sm100 matmul template (``@@COMBINE_PROLOGUE_ONLY@@``): the split
+    combine of a split-KV attention step -- fp32 partial O rows ``(S x B, S_q, H, D)``, fp32 partial LSEs ``(S x B, H, S_q)`` and the gate
+    ``(B, S_q, H, D)`` in the operand dtype -- formed as the GEMM's B operand (the tokens, under ``swap_ab``) in the operand ring by the
+    epilogue warps, so the combine launch disappears.  Every field is a declaration fact (never a runtime value): the compiler bakes them
+    into the rendering and refuses a chain whose ``N`` (the tokens) or ``K`` (``heads x d_head``) disagrees; the launch checks the three
+    operands against them.  ``gate_token_stride`` / ``gate_head_stride`` are the gate's strides in elements along the token row ``t = b x
+    S_q + s_q`` and the head (the batch stride must be ``S_q x gate_token_stride``, the dim stride 1 -- the slab column slice or a compact
+    ``[T, H, D]``)."""
+
+    n_splits: int
+    batch: int
+    s_q: int
+    heads: int
+    d_head: int
+    gate_token_stride: int
+    gate_head_stride: int
+
+    def __post_init__(self) -> None:
+        for name in ("n_splits", "batch", "s_q", "heads", "d_head", "gate_token_stride", "gate_head_stride"):
+            v = getattr(self, name)
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"CombinePrologueSpec.{name} must be an int >= 1, got {v!r}")
+        if self.n_splits > COMBINE_PROLOGUE_MAX_SPLITS:
+            raise ValueError(
+                f"CombinePrologueSpec.n_splits={self.n_splits}: the combine prologue folds at most {COMBINE_PROLOGUE_MAX_SPLITS} splits "
+                "(the bound up to which its fold is bitwise the combine kernel's)"
+            )
+        if self.batch * self.s_q > COMBINE_PROLOGUE_MAX_TOKENS:
+            raise ValueError(
+                f"CombinePrologueSpec: batch x s_q = {self.batch} x {self.s_q} = {self.batch * self.s_q} tokens exceed the {COMBINE_PROLOGUE_MAX_TOKENS}-row "
+                "B tile the combine prologue forms"
+            )
+        if self.gate_head_stride < self.d_head:
+            raise ValueError(f"CombinePrologueSpec.gate_head_stride={self.gate_head_stride} must cover a head of d_head={self.d_head} elements")
+
+    @property
+    def tokens(self) -> int:
+        """``batch x s_q``: the GEMM's N under ``swap_ab``."""
+        return self.batch * self.s_q
+
+    @property
+    def k(self) -> int:
+        """``heads x d_head``: the GEMM's K."""
+        return self.heads * self.d_head
+
+    @property
+    def gate_span_elems(self) -> int:
+        """The elements a flat view of the gate must hold from its base: the last token row's last head's last dim, plus one."""
+        return 1 + (self.tokens - 1) * self.gate_token_stride + (self.heads - 1) * self.gate_head_stride + (self.d_head - 1)
+
+
 def swap_ab(chain: FusionChain) -> FusionChain:
     """Return the logical-transpose view ``C.T = B.T @ A.T`` of ``chain``.
 

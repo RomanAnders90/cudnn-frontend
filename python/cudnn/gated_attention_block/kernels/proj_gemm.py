@@ -1199,6 +1199,11 @@ class ProjGemmPlan:
     # (no backend plan, no FROST-engine compile, whatever the opt-in flag said) and ends on the forced-tile JIT route by
     # construction (never the graph route, which creates a cuDNN handle at the first execute per (device, stream)).
     capture_safe: bool = False
+    # Combine-prologue addition (append-only; None = the plain GEMM): the `CombinePrologueSpec` this plan's JIT was rendered with -- the
+    # out projection's B operand (the tokens) formed in the operand ring from a split-KV step's fp32 partial O / LSE slabs and its gate
+    # (the sm100 matmul template's `@@COMBINE_PROLOGUE_ONLY@@` arm), so the step's combine launch disappears.  Such a plan takes
+    # `run_proj_gemm(..., o_partial=, lse_partial=, gate=)` at every call; `tile_config_name` carries `COMBINE_PROLOGUE_SUFFIX`.
+    combine_prologue: Any = None
     # The forced-tile JIT route's pack resolution (`_resolved_pack`): `(jit, {id(graph tensor key): id(bound tensor)})`, taken
     # once BY ROLE (the graph tensors the plan declares, never the buffers of a call) and OWNED BY THE PLAN, so it lives exactly
     # as long as the JIT it describes.  A cache slot, not a plan fact: no constructor argument (init=False), outside eq / repr.
@@ -1311,6 +1316,13 @@ def _forced_tile_config(n: int) -> Optional[str]:
 # does not whose 64-row tiles FIT one wave keeps today's resolution (the narrow and one-wave branches are unmeasured off the 256 grid).
 SMALL_M_MAX = 128
 _SMALL_M_SPLIT_K_MAX = 8
+COMBINE_IN_OUT_PROJ_MAX_TOKENS = 4
+"""The widest step (tokens ``T = B x S_q``) on which the gated attention block's AUTO reading of ``combine_in_out_proj`` may take the
+combine prologue; ``T`` up to :data:`cudnn.gemm.frost.fusion_ir.COMBINE_PROLOGUE_MAX_TOKENS` (8, the B tile's rows) is served behind the
+explicit knob.  The producer warps' work per k-tile grows with ``T`` (8 T tasks per k-tile against the GEMM's stage cadence), so the
+threshold is a MEASUREMENT (the end-to-end gate's T 4 cells set it), never a correctness bound."""
+COMBINE_PROLOGUE_SUFFIX = "+combineB"
+"""Appended to ``ProjGemmPlan.tile_config_name`` when the plan's JIT renders the combine prologue (the kernel symbol carries ``_combineB``)."""
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
 _SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 bytes): below it the reducer costs more than it buys
 _SMALL_M_MIN_K_TILES_PER_SLICE = 8
@@ -1439,6 +1451,7 @@ def build_proj_gemm(
     b_major: str = "k",
     split_k: int = 0,
     capture_safe: bool = False,
+    combine_prologue: Optional[Any] = None,
 ) -> ProjGemmPlan:
     """Compile one projection GEMM and pin the FROST plan.
 
@@ -1597,11 +1610,48 @@ def build_proj_gemm(
     FROST GEMM engine, and a refusal there is neither typed for the tile nor caught by the
     fallback arm -- the driver's forced-tile compile has to be the ONLY compile for the
     refusal to be the typed one on every host, under either flag state.
+
+    **``combine_prologue`` (appended, default None) -- the split combine formed INSIDE this GEMM.** A
+    :class:`cudnn.gemm.frost.fusion_ir.CombinePrologueSpec` (the step's split count, batch, ``S_q``, heads, ``d_head`` and the gate's
+    strides) renders the sm100 matmul template's ``@@COMBINE_PROLOGUE_ONLY@@`` arm: the GEMM's B operand -- the gated, split-combined O
+    rows the plain plan reads from a bf16 / f16 ``a`` -- is formed in the operand ring by the kernel's epilogue warps from the step's
+    fp32 partial O / LSE slabs and the gate, with the combine kernel's own arithmetic (bitwise), so the combine launch disappears.  Served
+    on the dense bf16 / f16 K-major plan whose resolved tile is a ``swap_ab`` 1-CTA-MMA cluster-1x1 config with an 8-row N tile (the
+    small-M route at ``m <= 8`` tokens; an explicit ``tile_config`` of that shape too), ``pin_frost=True``, no ``alpha`` / block scale /
+    8-bit operand, ``m == spec.tokens`` and ``k == spec.heads x spec.d_head``; everything else is a typed decline naming
+    ``combine_in_out_proj`` (the compiler's own reasons included -- never the graph-heuristic fallback, which has no arm).  The plan then
+    takes :func:`run_proj_gemm` ``(..., o_partial=, lse_partial=, gate=)`` at every call, ``plan.combine_prologue`` is the record and
+    ``plan.tile_config_name`` carries ``COMBINE_PROLOGUE_SUFFIX``.
     """
     import cudnn
 
     if w_dtype is None:
         w_dtype = dtype
+    if combine_prologue is not None:
+        from cudnn.gemm.frost.fusion_ir import CombinePrologueSpec
+
+        if not isinstance(combine_prologue, CombinePrologueSpec):
+            raise TypeError(f"{label}: combine_prologue must be a CombinePrologueSpec or None, got {type(combine_prologue).__name__}")
+        if not pin_frost:
+            raise ValueError(
+                f"{label}: combine_prologue selects a FROST JIT rendering (combine_in_out_proj) and cannot be combined with pin_frost=False (the "
+                "deselected-FROST graph route has no JIT, so the arm would be silently dropped)"
+            )
+        if block_scale or alpha or _is_fp8(dtype) or _is_fp4(dtype) or _is_fp4(w_dtype) or dtype not in (torch.bfloat16, torch.float16) or w_dtype != dtype:
+            raise NotImplementedError(
+                f"{label}: combine_in_out_proj (the split combine formed in the GEMM's B operand ring) is served on the dense bf16 / f16 plan only "
+                f"(no alpha, no block scale, no 8-bit or fp4 operand); got dtype={dtype}, w_dtype={w_dtype}, alpha={alpha}, block_scale={block_scale}"
+            )
+        if a_major != "k" or b_major != "k":
+            raise NotImplementedError(
+                f"{label}: combine_in_out_proj needs the K-major operands of the forward projection (the arm writes K-major B rows); got "
+                f"a_major={a_major!r}, b_major={b_major!r}"
+            )
+        if combine_prologue.tokens != m or combine_prologue.k != k:
+            raise ValueError(
+                f"{label}: combine_in_out_proj: the plan's (m, k) = ({m}, {k}) is not the record's (tokens {combine_prologue.tokens} = batch "
+                f"{combine_prologue.batch} x s_q {combine_prologue.s_q}, heads x d_head = {combine_prologue.heads} x {combine_prologue.d_head} = {combine_prologue.k})"
+            )
     if a_major not in _A_MAJORS:
         raise ValueError(f"{label}: a_major must be one of {_A_MAJORS} (the axis of A [1, m, k] the graph declares contiguous), got {a_major!r}")
     if b_major not in _B_MAJORS:
@@ -1631,6 +1681,13 @@ def build_proj_gemm(
         # No JIT would be built: the plan would run the GRAPH route, whose first execute per (device, stream) creates a cuDNN
         # handle -- inside the capture a serving stack records with no warm-up.  Typed, before any graph or backend call.
         raise NotImplementedError(_capture_safe_graph_route_message(label, m, k, n, tile_config, "the graph heuristic's tile"))
+    if combine_prologue is not None and name is None and not (split_k >= 1 or mma_tile_k_bytes is not None):
+        # The graph route has no arm: a plan whose tile the driver's resolver does not name would run the backend's plan, which reads a
+        # bf16 B operand that never exists under the arm.  Typed, before any graph or backend call.
+        raise NotImplementedError(
+            f"{label}: combine_in_out_proj needs a FROST JIT tile the driver resolves itself (the small-M route at m <= 8 tokens on a dense bf16 / f16 "
+            f"K-major projection, or an explicit tile_config), but (m={m}, k={k}, n={n}, tile_config={tile_config!r}) resolves to the graph route"
+        )
     if mma_tile_k_bytes is not None:
         # The MMA K width's contract, checked ONCE and up front for the block-scale and the dense path alike, so an invalid
         # value is always named as such whatever else the call combines it with.  (1) 32 or 64, the tcgen05 MMA K widths.
@@ -1948,8 +2005,15 @@ def build_proj_gemm(
         # refuses it with the admission's own NotImplementedError -- the table is validated at the forced tile on the FROST
         # JIT only, and the graph heuristic's tile is not that tile.
         try:
-            compiled = jit_from_cudnn_graph(g, config=cfg)
+            compiled = jit_from_cudnn_graph(g, config=cfg, combine_prologue=combine_prologue)
         except Exception as exc:
+            if combine_prologue is not None and not capture_safe:
+                # The arm has no fallback: the graph heuristic's plan reads a bf16 B operand that never exists under it.  The compiler's own
+                # refusal (it names combine_in_out_proj) surfaces typed, chained.
+                raise NotImplementedError(
+                    f"{label}: combine_in_out_proj pins the FROST JIT at {cfg.name!r}, and that compile was refused ({type(exc).__name__}: {str(exc)[:400]}); "
+                    "the graph-heuristic fallback is refused too (its plan reads the bf16 O the arm never writes)"
+                ) from exc
             if capture_safe:
                 # The serving declaration: the graph-heuristic fallback would create a cuDNN handle at the first execute per
                 # stream -- inside the capture a serving stack records with no warm-up -- so a refused forced compile is a
@@ -2001,6 +2065,9 @@ def build_proj_gemm(
             plan.mma_tile_k_bytes = getattr(compiled.config, "mma_tile_k_bytes", None)
             if plan.route == "graph":
                 plan.route = "graph+jit"
+            plan.combine_prologue = getattr(compiled, "combine_prologue", None)
+            if plan.combine_prologue is not None:
+                plan.tile_config_name = f"{plan.tile_config_name}{COMBINE_PROLOGUE_SUFFIX}"
     plan.capture_safe = bool(capture_safe)
     if capture_safe and plan.jit is None:
         # Unreachable by the checks above (the graph route was declined up front, a refused compile raised typed); kept so the
@@ -2039,6 +2106,9 @@ def run_proj_gemm(
     sf_w: Optional[torch.Tensor] = None,
     *,
     stream=None,
+    o_partial: Optional[torch.Tensor] = None,
+    lse_partial: Optional[torch.Tensor] = None,
+    gate: Optional[torch.Tensor] = None,
 ) -> None:
     """Launch. No allocation, no conversion — the caller owns every buffer.
 
@@ -2088,6 +2158,14 @@ def run_proj_gemm(
     so a same-size buffer of another dtype would hold wrong bit patterns and a narrower
     one would be overrun -- refused by name before any route, for the forward and both
     backward drivers alike.
+
+    **The combine prologue (``plan.combine_prologue``; appended kwargs, all three REQUIRED there, REFUSED elsewhere).**
+    ``o_partial`` is the step's fp32 partial O slab ``(S x B, S_q, H, D)`` (split-major, contiguous), ``lse_partial`` the fp32 partial
+    LSE slab ``(S x B, H, S_q)`` (contiguous), ``gate`` the gate ``(B, S_q, H, D)`` in the plan's dtype at the record's strides (a slab
+    column slice or compact; its dim stride 1, its batch stride ``S_q x`` the token stride) -- each on a 16-byte base, checked against the
+    spec before the launch and handed to the kernel as FLAT views (no copy, no allocation).  ``a`` stays REQUIRED on such a plan as the
+    launch's token-count carrier (the kernel's B TMA descriptor needs a valid base of the declared ``[M, K]`` form); its BYTES are never
+    read -- the B tile is formed from the slabs -- so the block hands the never-written O slot of its workspace.
     """
     _check_operand(plan, a, "a", plan.dtype)
     _check_operand(plan, w, "w", _w_dtype_of(plan))
@@ -2111,6 +2189,13 @@ def run_proj_gemm(
         alpha3 = alpha.reshape(1, 1, 1)  # a view: 1 element is always contiguous
     elif alpha is not None:
         raise ValueError(f"{plan.label}: this plan has no alpha epilogue (built with alpha=False); refusing to drop the value silently")
+    jit_extra = {}
+    if plan.combine_prologue is not None:
+        jit_extra["combine_operands"] = _combine_operands(plan, o_partial, lse_partial, gate)
+    elif o_partial is not None or lse_partial is not None or gate is not None:
+        raise ValueError(
+            f"{plan.label}: this plan forms no combine prologue (built without combine_prologue); refusing to drop o_partial / lse_partial / gate silently"
+        )
     # Resolve the launch stream FIRST (Rule 5), before any route is taken.
     if handle is not None:
         import cudnn
@@ -2156,14 +2241,18 @@ def run_proj_gemm(
 
             ws_obj = Workspace(workspace, need, plan.label, device=out.device.index)
             if resolved is None:
-                plan.jit(vp, stream=stream, workspace=ws_obj)
+                plan.jit(vp, stream=stream, workspace=ws_obj, **jit_extra)
             else:
-                plan.jit.run_resolved(resolved, stream=stream, workspace=ws_obj)
+                plan.jit.run_resolved(resolved, stream=stream, workspace=ws_obj, **jit_extra)
         elif resolved is None:
-            plan.jit(vp, stream=stream)
+            plan.jit(vp, stream=stream, **jit_extra)
         else:
-            plan.jit.run_resolved(resolved, stream=stream)
+            plan.jit.run_resolved(resolved, stream=stream, **jit_extra)
         return
+    if plan.combine_prologue is not None:
+        raise RuntimeError(
+            f"{plan.label}: a combine-prologue plan reached a route without its JIT (route={plan.route!r}) -- build_proj_gemm refuses that at compile time"
+        )
     if plan.route == "jit-only":
         raise RuntimeError(f"{plan.label}: the backend declined this graph (route=jit-only) and no JIT artifact was built -- nothing can launch it")
     if plan.capture_safe:
@@ -2177,6 +2266,45 @@ def run_proj_gemm(
     if handle is None:
         handle = handle_for_stream(out.device, stream)
     plan.graph.execute(vp, workspace, handle)
+
+
+def _combine_operands(plan: ProjGemmPlan, o_partial, lse_partial, gate) -> tuple:
+    """The combine prologue's three operands checked against the plan's spec (shape, dtype, strides, device, the 16-byte bases) and
+    returned as the FLAT 1-D views the kernel binds (``run_resolved(combine_operands=)``): no copy, no allocation (Rule 1)."""
+    sp = plan.combine_prologue
+    S, B, SQ, H, D = sp.n_splits, sp.batch, sp.s_q, sp.heads, sp.d_head
+    missing = [name for name, t in (("o_partial", o_partial), ("lse_partial", lse_partial), ("gate", gate)) if t is None]
+    if missing:
+        raise ValueError(
+            f"{plan.label}: this plan forms its B operand from the split combine (combine_in_out_proj) and needs o_partial, lse_partial and gate at every "
+            f"call; missing {missing}"
+        )
+    for name, t in (("o_partial", o_partial), ("lse_partial", lse_partial), ("gate", gate)):
+        if not isinstance(t, torch.Tensor) or not t.is_cuda:
+            raise ValueError(f"{plan.label}: combine_in_out_proj: {name} must be a CUDA tensor, got {type(t).__name__}")
+        if t.data_ptr() % 16:
+            raise ValueError(f"{plan.label}: combine_in_out_proj: {name} must start on a 16-byte boundary; got data_ptr=0x{int(t.data_ptr()):x}")
+    if o_partial.dtype != torch.float32 or tuple(o_partial.shape) != (S * B, SQ, H, D) or not o_partial.is_contiguous():
+        raise ValueError(
+            f"{plan.label}: combine_in_out_proj: o_partial must be the contiguous fp32 partial O slab (S x B, S_q, H, D) = ({S * B}, {SQ}, {H}, {D}); "
+            f"got {tuple(o_partial.shape)} {o_partial.dtype} strides {tuple(o_partial.stride())}"
+        )
+    if lse_partial.dtype != torch.float32 or tuple(lse_partial.shape) != (S * B, H, SQ) or not lse_partial.is_contiguous():
+        raise ValueError(
+            f"{plan.label}: combine_in_out_proj: lse_partial must be the contiguous fp32 partial LSE slab (S x B, H, S_q) = ({S * B}, {H}, {SQ}); "
+            f"got {tuple(lse_partial.shape)} {lse_partial.dtype} strides {tuple(lse_partial.stride())}"
+        )
+    want_strides = (SQ * sp.gate_token_stride, sp.gate_token_stride, sp.gate_head_stride, 1)
+    # a UNIT dim's stride is unobservable (the kernel never multiplies it by a non-zero index, and torch's `.view` picks its own value for it --
+    # the block's gate view at B 1 or S_q 1), so the declaration is held on the dims with an extent above 1 only
+    stride_off = any(int(g) != int(w) for n, g, w in zip(gate.shape, gate.stride(), want_strides) if int(n) > 1)
+    if gate.dtype != plan.dtype or tuple(gate.shape) != (B, SQ, H, D) or stride_off:
+        raise ValueError(
+            f"{plan.label}: combine_in_out_proj: gate must be the (B, S_q, H, D) = ({B}, {SQ}, {H}, {D}) {plan.dtype} view at the declared strides "
+            f"{want_strides} (a unit dim's stride is free); got {tuple(gate.shape)} {gate.dtype} strides {tuple(gate.stride())}"
+        )
+    gate_flat = gate.as_strided((sp.gate_span_elems,), (1,), gate.storage_offset())  # the storage span from the base: a VIEW, no copy
+    return (o_partial.view(-1), lse_partial.view(-1), gate_flat)
 
 
 def _resolved_pack(plan: ProjGemmPlan, vp: dict) -> Optional[dict]:

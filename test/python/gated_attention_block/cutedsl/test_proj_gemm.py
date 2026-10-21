@@ -1177,3 +1177,536 @@ def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
     cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
     assert cos > 0.999, f"cos {cos}"
     assert torch.isfinite(out.float()).all()
+
+
+# ---------------------------------------------------------------------------
+# The combine prologue (`combine_in_out_proj`): the split combine formed in the out projection's B operand ring
+# ---------------------------------------------------------------------------
+
+# the 24/2 shard's out projection (N 2560, K 6144 = 24 heads x 256): the 128x8 splitK8 swap-AB tile at T <= 8 tokens
+_COMBINE_H, _COMBINE_D, _COMBINE_N = 24, 256, _FLASH_NEXT_24_2["d_model"]
+_COMBINE_K = _COMBINE_H * _COMBINE_D
+_COMBINE_SLAB_N = _FLASH_NEXT_24_2["n_qkvg"] + 640  # the indexer band slab: the gate as a column slice at this token stride
+_COMBINE_GATE_COL = _COMBINE_H * _COMBINE_D  # the slab's gate band offset (any 16-byte-aligned column inside the slab serves)
+
+
+def _combine_spec(S, B, SQ, *, h=_COMBINE_H, d=_COMBINE_D, gate_slab=False):
+    from cudnn.gemm.frost.fusion_ir import CombinePrologueSpec
+
+    return CombinePrologueSpec(n_splits=S, batch=B, s_q=SQ, heads=h, d_head=d, gate_token_stride=_COMBINE_SLAB_N if gate_slab else h * d, gate_head_stride=d)
+
+
+def _combine_inputs(S, B, SQ, *, dtype, seed, gate_slab, dead_splits=(), dead_row=None, h=_COMBINE_H, d=_COMBINE_D):
+    """Random fp32 partial slabs in the sparse core's split-major layout -- O ``(S x B, S_q, H, D)``, LSE ``(S x B, H, S_q)`` -- with
+    ``dead_splits`` (``(t, s)``: the LSE of token row ``t``'s split ``s`` is -inf and its payload NaN, the core's identity for an empty
+    chunk, which the SELECT must mask) and ``dead_row`` (every split of row ``t`` dead: ``O := 0``) planted; the gate in the activation
+    dtype, compact or a column slice of a slab at the band's token stride."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    T = B * SQ
+    o_partial = torch.randn(S * B, SQ, h, d, generator=g, device="cuda", dtype=torch.float32)
+    lse_partial = torch.randn(S * B, h, SQ, generator=g, device="cuda", dtype=torch.float32) * 3.0 + 8.0
+    o_v, lse_v = o_partial.view(S, B, SQ, h, d), lse_partial.view(S, B, h, SQ)
+    for t, s in dead_splits:
+        b, sq = divmod(t, SQ)
+        lse_v[s, b, :, sq] = float("-inf")
+        o_v[s, b, sq] = float("nan")
+    if dead_row is not None:
+        b, sq = divmod(dead_row, SQ)
+        lse_v[:, b, :, sq] = float("-inf")
+        o_v[:, b, sq] = float("nan")
+    if gate_slab:
+        slab = torch.randn(T, _COMBINE_SLAB_N, generator=g, device="cuda", dtype=torch.float32).to(dtype)
+        # the block's own form: `[T, h, d]` columns of the slab viewed `(B, S_q, h, d)` -- torch's `.view` picks a unit dim's stride itself
+        # (6144 where the band's token stride is 13952 at B 1 or S_q 1), which the driver's check must treat as unobservable
+        gate = slab[:, _COMBINE_GATE_COL : _COMBINE_GATE_COL + h * d].view(B, SQ, h, d)
+        assert all(int(s_) == int(w) for n_, s_, w in zip(gate.shape, gate.stride(), (SQ * _COMBINE_SLAB_N, _COMBINE_SLAB_N, d, 1)) if int(n_) > 1)
+    else:
+        gate = torch.randn(B, SQ, h, d, generator=g, device="cuda", dtype=torch.float32).to(dtype)
+    return o_partial, lse_partial, gate
+
+
+def _combine_kernel_reference(o_partial, lse_partial, gate, *, S, B, SQ, dtype, h=_COMBINE_H, d=_COMBINE_D):
+    """The split combine KERNEL of the sparse decode chain (``sm100/split_combine.py``, the form the sparse adapter pins for this grid,
+    the gate in the combine) applied to the slabs: the bf16 / f16 O the plain out projection reads.  The reference of the arm."""
+    from cudnn.frost.compiled_cache import positional_entry
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import _sparse_combine_decode_grid
+
+    tag = "bf16" if dtype == torch.bfloat16 else "f16"
+    form = _sparse_combine_decode_grid(B, h, SQ, S, tuple(torch.cuda.get_device_capability()))
+    compile_combine = getattr(split_combine.compile_ptr, "__wrapped__", split_combine.compile_ptr)
+    owner = compile_combine(dtype_o=tag, dtype_partial="f32", has_lse=True, stats_log2=False, gate=True, dtype_gate=tag, decode_grid=form, use_pdl=False)
+    entry = positional_entry(owner)
+    assert entry is not None
+    o = torch.full((B, SQ, h, d), float("nan"), device="cuda", dtype=dtype)
+    lse_final = torch.full((B, h, SQ), float("nan"), device="cuda", dtype=torch.float32)
+    args = [
+        o_partial.data_ptr(),
+        lse_partial.data_ptr(),
+        o.data_ptr(),
+        lse_final.data_ptr(),
+        (B, h, SQ, d),
+        S,
+        tuple(o.stride()),
+        tuple(lse_final.stride()),
+        gate.data_ptr(),
+        tuple(gate.stride()),
+    ]
+    entry(*args, int(torch.cuda.current_stream().cuda_stream))
+    torch.cuda.synchronize()
+    del owner
+    assert torch.isfinite(o.float()).all(), "the combine kernel left a NaN (a dead split's payload reached the sum)"
+    return o
+
+
+def _combine_plans(T, S, B, SQ, dtype, *, gate_slab, label):
+    arm = build_proj_gemm(
+        m=T, k=_COMBINE_K, n=_COMBINE_N, dtype=dtype, label=f"{label}_arm", capture_safe=True, combine_prologue=_combine_spec(S, B, SQ, gate_slab=gate_slab)
+    )
+    plain = build_proj_gemm(m=T, k=_COMBINE_K, n=_COMBINE_N, dtype=dtype, label=f"{label}_plain", capture_safe=True)
+    assert arm.combine_prologue is not None and plain.combine_prologue is None
+    assert arm.tile_config_name == plain.tile_config_name + "+combineB", (arm.tile_config_name, plain.tile_config_name)
+    assert plain.tile_config_name == small_m_tile_config(T, _COMBINE_N, _COMBINE_K, dtype=dtype) and plain.tile_config_name.endswith("_swapAB")
+    assert arm.route == "jit-only" and arm.jit is not None and arm.jit.combine_prologue is arm.combine_prologue
+    return arm, plain
+
+
+def _run_arm(arm, a_carrier, w, out, ws, o_partial, lse_partial, gate, stream=None):
+    run_proj_gemm(arm, a_carrier, w, out, ws, stream=stream, o_partial=o_partial, lse_partial=lse_partial, gate=gate)
+
+
+# (T = (B, S_q), splits, the gate as a slab column slice, dtype): the bitwise cells -- T 1 / 4 / 8 x splits 2 / 7 / 8 / 16 x both gate
+# layouts; uneven k-tiles per slice at split 7; dead splits and a dead row planted in every cell with T >= 2
+_COMBINE_CELLS = [
+    pytest.param((1, 1), 2, False, torch.bfloat16, id="T1-S2-compact-bf16"),
+    pytest.param((1, 1), 8, True, torch.bfloat16, id="T1-S8-slab-bf16"),
+    pytest.param((1, 1), 16, True, torch.bfloat16, id="T1-S16-slab-bf16"),
+    pytest.param((1, 1), 8, False, torch.float16, id="T1-S8-compact-f16"),
+    pytest.param((4, 1), 7, True, torch.bfloat16, id="T4-B4-S7-slab-bf16"),
+    pytest.param((1, 4), 16, False, torch.bfloat16, id="T4-Sq4-S16-compact-bf16"),
+    pytest.param((2, 3), 8, True, torch.bfloat16, id="T6-B2-Sq3-S8-slab-bf16"),
+    pytest.param((2, 4), 16, True, torch.bfloat16, id="T8-B2-Sq4-S16-slab-bf16"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("bs, S, gate_slab, dtype", _COMBINE_CELLS)
+def test_combine_prologue_is_bitwise_the_combine_kernel_plus_the_plain_gemm(bs, S, gate_slab, dtype):
+    """The out projection with the combine formed in its B operand ring (``build_proj_gemm(combine_prologue=)``) against the chain it
+    replaces -- the split combine KERNEL (the sparse adapter's pinned form, the gate in the combine) into a bf16 / f16 O, then the plain
+    split-K GEMM over that O -- on random fp32 partials with dead splits (``lse = -inf``, NaN payload) and a dead row planted: ``out``
+    BITWISE, two launches of the arm bitwise, the never-read ``a`` carrier left NaN (a read would poison ``out``)."""
+    B, SQ = bs
+    T = B * SQ
+    arm, plain = _combine_plans(T, S, B, SQ, dtype, gate_slab=gate_slab, label=f"combine_{T}_{S}")
+    dead_splits = ((0, 1), (T - 1, S - 1)) if T >= 2 else ((0, S - 1),)
+    o_partial, lse_partial, gate = _combine_inputs(
+        S, B, SQ, dtype=dtype, seed=7 * T + S, gate_slab=gate_slab, dead_splits=dead_splits, dead_row=(1 if T >= 3 else None)
+    )
+    g = torch.Generator(device="cuda").manual_seed(100 + T)
+    w = (torch.randn(_COMBINE_N, _COMBINE_K, generator=g, device="cuda", dtype=torch.float32) * 0.05).to(dtype)
+    # the reference: the combine kernel's O, then the plain GEMM over it
+    o_ref = _combine_kernel_reference(o_partial, lse_partial, gate, S=S, B=B, SQ=SQ, dtype=dtype)
+    out_ref = torch.full((T, _COMBINE_N), float("nan"), device="cuda", dtype=dtype)
+    _run(plain, o_ref.view(T, _COMBINE_K), w, out_ref)
+    if T >= 3:
+        assert (out_ref[1] == 0).all(), "the dead row's reference is not exactly 0"
+    # the arm: the B operand formed from the slabs; `a` is the token-count carrier, never read
+    a_carrier = torch.full((T, _COMBINE_K), float("nan"), device="cuda", dtype=dtype)
+    out = torch.full((T, _COMBINE_N), float("nan"), device="cuda", dtype=dtype)
+    ws = torch.empty(arm.workspace_bytes, dtype=torch.uint8, device="cuda")
+    _run_arm(arm, a_carrier, w, out, ws, o_partial, lse_partial, gate)
+    torch.cuda.synchronize()
+    assert torch.isfinite(out.float()).all(), "the arm read the NaN carrier or a dead split's payload"
+    assert torch.equal(out.view(torch.int16), out_ref.view(torch.int16)), (
+        f"the arm's out is not bitwise the combine kernel + GEMM: max |d| {(out.float() - out_ref.float()).abs().max().item():.3e}, "
+        f"{int((out.view(torch.int16) != out_ref.view(torch.int16)).sum())} of {out.numel()} elements differ"
+    )
+    first = out.clone()
+    out.fill_(float("nan"))
+    _run_arm(arm, a_carrier, w, out, ws, o_partial, lse_partial, gate)
+    torch.cuda.synchronize()
+    assert torch.equal(first.view(torch.int16), out.view(torch.int16)), "two launches of the arm are not bitwise"
+    assert torch.isnan(a_carrier.float()).all()
+    print(f"\n[T {T} = {B} x {SQ}, S {S}, gate {'slab' if gate_slab else 'compact'}, {dtype}] {arm.tile_config_name}: bitwise ({out.numel()} elements)")
+
+
+@requires_rubin
+def test_combine_prologue_launches_one_gemm_kernel_named_for_the_arm_and_no_combine_kernel():
+    """The CUPTI census of one arm execute at T 1 (the 24/2 out projection): the GEMM kernel named ``_combineB`` + the split-K reducer,
+    no ``_combine*`` kernel and no memset / memcpy -- against the plain plan's two kernels (the same reducer; the GEMM without the tag)."""
+    import os
+    import sys
+
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from gated_block_census import cupti_kernels
+
+    S, B, SQ = 8, 1, 1
+    arm, plain = _combine_plans(1, S, B, SQ, torch.bfloat16, gate_slab=False, label="census")
+    o_partial, lse_partial, gate = _combine_inputs(S, B, SQ, dtype=torch.bfloat16, seed=3, gate_slab=False)
+    w = (torch.randn(_COMBINE_N, _COMBINE_K, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    a = torch.zeros(1, _COMBINE_K, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(1, _COMBINE_N, device="cuda", dtype=torch.bfloat16)
+    ws = torch.empty(max(arm.workspace_bytes, plain.workspace_bytes), dtype=torch.uint8, device="cuda")
+    k_arm, m_arm = cupti_kernels(lambda: _run_arm(arm, a, w, out, ws, o_partial, lse_partial, gate))
+    k_plain, m_plain = cupti_kernels(lambda: run_proj_gemm(plain, a, w, out, ws))
+    if k_arm is None or k_plain is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    print(f"\narm: {k_arm}\nplain: {k_plain}")
+    assert not m_arm and not m_plain, "a memset / memcpy on the execute path"
+    assert len(k_arm) == len(k_plain) == (2 if arm.jit.config.split_k_slices > 1 else 1), (k_arm, k_plain)
+    assert sum("_combineB" in n for n in k_arm) == 1 and not any("_combineB" in n for n in k_plain)
+    assert not any(n.startswith("cudnn_kernel__combine") for n in k_arm + k_plain)
+    assert sum("splitk_reduce" in n for n in k_arm) == sum("splitk_reduce" in n for n in k_plain)
+
+
+@requires_rubin
+def test_combine_prologue_capture_of_the_first_execute_replays_bitwise():
+    """A FRESH arm plan (never executed) captured on a NEW stream with no eager warm-up under ``set_sync_debug_mode("error")`` (no host
+    sync on the path): the capture launches nothing (``out`` stays NaN), three replays are bitwise the eager reference chain."""
+    S, B, SQ = 8, 1, 4
+    T = B * SQ
+    arm, plain = _combine_plans(T, S, B, SQ, torch.bfloat16, gate_slab=True, label="capture")
+    o_partial, lse_partial, gate = _combine_inputs(S, B, SQ, dtype=torch.bfloat16, seed=11, gate_slab=True, dead_splits=((2, 3),))
+    w = (torch.randn(_COMBINE_N, _COMBINE_K, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    o_ref = _combine_kernel_reference(o_partial, lse_partial, gate, S=S, B=B, SQ=SQ, dtype=torch.bfloat16)
+    out_ref = torch.empty(T, _COMBINE_N, device="cuda", dtype=torch.bfloat16)
+    _run(plain, o_ref.view(T, _COMBINE_K), w, out_ref)
+    a = torch.full((T, _COMBINE_K), float("nan"), device="cuda", dtype=torch.bfloat16)
+    out = torch.full((T, _COMBINE_N), float("nan"), device="cuda", dtype=torch.bfloat16)
+    ws = torch.empty(arm.workspace_bytes, dtype=torch.uint8, device="cuda")
+    s = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.cuda.stream(s), torch.cuda.graph(graph, stream=s):
+            _run_arm(arm, a, w, out, ws, o_partial, lse_partial, gate, stream=s.cuda_stream)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert torch.isnan(out.float()).all(), "the capture launched something"
+    for _ in range(3):
+        out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(out.view(torch.int16), out_ref.view(torch.int16))
+
+
+def test_combine_prologue_arm_is_whole_marker_blocks_in_the_template():
+    """The arm lives in ``@@COMBINE_PROLOGUE_ONLY@@`` blocks and the plain rendering's B copy + two-operand ``expect_tx`` in
+    ``@@COMBINE_PROLOGUE_OFF@@`` blocks, so a rendering without the arm is the text it always was: resolving the arm away leaves no
+    identifier of it outside the module docstring (whose barrier and SMEM tables name it), and resolving it in leaves no B TMA copy."""
+    from cudnn.gemm.frost.kernel_registry import template_path
+    from cudnn.gemm.frost.sm100.compiler import _resolve_blocks
+
+    src = template_path("sm100_matmul.py").read_text()
+    assert src.count("# @@COMBINE_PROLOGUE_ONLY:BEGIN@@") == src.count("# @@COMBINE_PROLOGUE_ONLY:END@@") >= 10
+    assert src.count("# @@COMBINE_PROLOGUE_OFF:BEGIN@@") == src.count("# @@COMBINE_PROLOGUE_OFF:END@@") == 3
+    doc = src.split('"""', 2)[1]
+    assert "COMBINE_AB_FULL_COUNT (5" in doc and "SMEM table of the arm" in doc and "Barrier table of the arm" in doc  # the tables precede the body
+    off = _resolve_blocks(_resolve_blocks(src, "COMBINE_PROLOGUE_ONLY", False), "COMBINE_PROLOGUE_OFF", True)
+    body = off.split('"""', 2)[2]
+    for ident in ("COMBINE_", "_combine_fold_task", "mComb_", "comb_", "_cb_", "_cz_", "combine_tokens", "combine_n_splits"):
+        assert ident not in body, ident
+    assert "mbarrier_init(ab_full_mbar_ptr.subview(i), 1)" in body
+    assert "num_tma_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes" in body
+    assert "for _bj in cutlass.range_constexpr(num_b_operands):" in body
+    on = _resolve_blocks(_resolve_blocks(src, "COMBINE_PROLOGUE_ONLY", True), "COMBINE_PROLOGUE_OFF", False)
+    on_body = on.split('"""', 2)[2]
+    assert "mbarrier_init(ab_full_mbar_ptr.subview(i), COMBINE_AB_FULL_COUNT)" in on_body and "mbarrier_init(ab_full_mbar_ptr.subview(i), 1)" not in on_body
+    assert "for _bj in cutlass.range_constexpr(num_b_operands):" not in on_body  # no B TMA copy under the arm
+    assert "num_tma_copy_bytes = num_a_operands * sA_bytes\n" in on_body and "num_b_operands * sB_bytes" not in on_body
+    assert on_body.count("mbarrier_arrive(ab_full_mbar_ptr.subview(_cb_stage))") == 1  # ONE elected arrive site, executed by every producer warp per k-tile
+    assert on_body.count('cute.arch.fence_proxy("async.shared", space="cta")') == body.count('cute.arch.fence_proxy("async.shared", space="cta")') + 2
+    assert "nvvm.bar_warp_sync(0xFFFFFFFF)" in on_body.split("_combine_fold_task(_cb_o_addr")[1]
+    for forbidden in ("mapa(", "atomicrmw", "barrier_cluster"):
+        assert on_body.count(forbidden) == body.count(forbidden), forbidden  # no cluster / DSMEM / atomic added
+
+
+_COMBINE_PTX_PROBE = """
+import glob, hashlib, os, re, subprocess, sys
+dump, m, S, B, SQ, arm = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
+cands = sys.argv[7:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "ptx,cubin"
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"  # the arm's part: a host trace-compile for sm_107a, whatever GPU this process sees
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"  # a compiled-plan cache HIT skips ptxas and dumps nothing
+import torch
+import cudnn
+import cudnn.gemm.frost  # noqa: F401
+from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+from cudnn.gemm.frost.fusion_ir import CombinePrologueSpec, swap_ab
+from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+from cudnn.gemm.frost.sm100 import compiler as C
+from cudnn.gemm.frost.sm100.epilogue_codegen import generate
+from cudnn.gemm.frost.tile_config import by_name
+from cudnn.gated_attention_block.kernels.proj_gemm import small_m_tile_config
+C._current_arch = lambda device=None: 107  # bake --gpu-arch sm_107a into the rendering
+H, D, N = 24, 256, 2560
+K = H * D
+spec = CombinePrologueSpec(n_splits=S, batch=B, s_q=SQ, heads=H, d_head=D, gate_token_stride=H * D, gate_head_stride=D) if arm == "on" else None
+g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+a = g.tensor(name="A", dim=[1, m, K], stride=[m * K, K, 1])
+b = g.tensor(name="B", dim=[1, K, N], stride=[K * N, 1, K])
+c = g.matmul(A=a, B=b, name="proj")
+c.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+g.validate()
+g.build_operation_graph()
+chain, _ = analyze_with_binding(g)
+cfg = by_name(small_m_tile_config(m, N, K, dtype=torch.bfloat16, sm_count=212))
+chain = swap_ab(chain)
+use_tma = C._use_tma_store_epi(chain, cfg)
+snippets = generate(chain, vec_bytes_epi=C._epi_chunk_bytes(chain, cfg, use_tma), output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+                    tma_slots=frozenset({0}) if use_tma else frozenset(), packed_lanes=C._epi_packed_lanes(cfg), split_k_slices=cfg.split_k_slices)
+src = C._render_template(chain, snippets, cfg, **({"combine_prologue": spec} if spec is not None else {}))
+print("TILE", cfg.name)
+mod = C._import_kernel(src)
+print("AB_STAGES", mod.ab_stages)
+mod.compile()
+ptxs = sorted(glob.glob(os.path.join(dump, "**", "*.ptx"), recursive=True), key=os.path.getmtime)
+if not ptxs:
+    print("FAIL no ptx dumped into", dump); sys.exit(3)
+ptx = open(ptxs[-1]).read()
+entries = re.findall(r"\\.entry\\s+(\\w+)", ptx)
+print("ENTRIES", " ".join(entries))
+five = re.findall(r"mov\\.b32\\s+(%r\\d+),\\s*5;", ptx)
+print("INIT_COUNT_5_REGS", " ".join(five))
+print("INIT5", sum(len(re.findall(r"mbarrier\\.init\\.shared(?:::cta)?\\.b64\\s+\\[[^\\]]+\\],\\s*" + re.escape(r) + ";", ptx)) for r in five))
+print("INIT", len(re.findall(r"mbarrier\\.init", ptx)))
+print("ARRIVE_LOCAL", len(re.findall(r"mbarrier\\.arrive\\.shared(?:::cta)?\\.b64", ptx)))
+print("ARRIVE_EXPECT_TX", len(re.findall(r"mbarrier\\.arrive\\.expect_tx", ptx)))
+print("FENCE_PROXY_ASYNC", len(re.findall(r"fence\\.proxy\\.async\\.shared::cta", ptx)))
+print("BULK_TENSOR", len(re.findall(r"cp\\.async\\.bulk\\.tensor", ptx)))
+print("ST_SHARED_V4", len(re.findall(r"st\\.shared\\.v4", ptx)))
+print("TANH", len(re.findall(r"tanh\\.approx", ptx)))
+print("LOCAL", len(re.findall(r"\\.local\\b", ptx)))
+print("ATOM", len(re.findall(r"\\batom\\.", ptx)) + len(re.findall(r"\\bred\\.", ptx)))
+print("CLUSTER_BARRIER", len(re.findall(r"barrier\\.cluster", ptx)))
+print("MAPA", len(re.findall(r"\\bmapa\\b", ptx)))
+print("GRIDDEP", " ".join(re.findall(r"griddepcontrol\\.\\w+", ptx)))
+cubins = sorted(glob.glob(os.path.join(dump, "**", "*.cubin"), recursive=True), key=os.path.getmtime)
+for cand in cands:
+    if not (os.path.isfile(cand) and os.access(cand, os.X_OK)) or not cubins:
+        continue
+    proc = subprocess.run([cand, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    if proc.returncode == 0 and proc.stdout.strip():
+        sass = proc.stdout.splitlines()
+        print("SASS_STL", sum(1 for ln in sass if re.search(r"\\bSTL\\b", ln)))
+        print("SASS_LDL", sum(1 for ln in sass if re.search(r"\\bLDL\\b", ln)))
+        break
+print("DONE")
+"""
+
+
+def _combine_ptx_census(tmp_path, m, S, B, SQ, arm):
+    import os
+    import shutil
+    import subprocess
+    import sys as _sys
+
+    cands = []
+    if os.environ.get("CUDA_PATH"):
+        cands.append(os.path.join(os.environ["CUDA_PATH"], "bin", "nvdisasm"))
+    if shutil.which("nvdisasm"):
+        cands.append(shutil.which("nvdisasm"))
+    dump = tmp_path / f"combine_{arm}_{m}_{S}"
+    dump.mkdir()
+    proc = subprocess.run(
+        [_sys.executable, "-c", _COMBINE_PTX_PROBE, str(dump), str(m), str(S), str(B), str(SQ), arm, *cands], capture_output=True, text=True, timeout=900
+    )
+    assert proc.returncode == 0 and "DONE" in proc.stdout, f"trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    stats = {}
+    for ln in proc.stdout.splitlines():
+        key, _, val = ln.partition(" ")
+        stats[key] = int(val) if val.strip().lstrip("-").isdigit() else val
+    return stats
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="the PTX census trace-compiles the rendering for sm_107a; the DSL sizes its SMEM pipeline off a device"
+)
+@pytest.mark.parametrize("m, S, B, SQ", [(1, 8, 1, 1), (4, 16, 1, 4)], ids=["T1-S8", "T4-S16"])
+def test_combine_prologue_rendering_census_in_ptx(m, S, B, SQ, tmp_path):
+    """The ON rendering of the 24/2 out projection trace-compiled for sm_107a in a fresh process (no GPU of that arch needed): the kernel
+    symbol carries ``_combineB``; ``ab_full`` is initialised with 5 on every stage (one register loaded with 5 feeds ``ab_stages`` inits);
+    exactly ONE plain local arrive site more than the plain rendering (the elected producer arrive -- every producer warp executes it per
+    k-tile), two more ``fence.proxy.async.shared::cta`` (the padding zero and the producer fence), one ``cp.async.bulk.tensor`` fewer (no B
+    copy), the stores and the gate's tanh in, no ``.local`` (no spill), no atomic, no cluster barrier, the ``griddepcontrol`` sites
+    unchanged; STL / LDL 0 in the SASS where an nvdisasm decodes it."""
+    on = _combine_ptx_census(tmp_path, m, S, B, SQ, "on")
+    off = _combine_ptx_census(tmp_path, m, S, B, SQ, "off")
+    print(f"\nON {on}\nOFF {off}")
+    assert any("_combineB" in e for e in str(on["ENTRIES"]).split()) and not any("_combineB" in e for e in str(off["ENTRIES"]).split())
+    assert on["INIT5"] == on["AB_STAGES"] >= 2 and off["INIT5"] == 0, (on["INIT5"], on["AB_STAGES"], off["INIT5"])
+    assert on["INIT"] == off["INIT"]  # no new mbarrier
+    assert on["ARRIVE_LOCAL"] == off["ARRIVE_LOCAL"] + 1 and on["ARRIVE_EXPECT_TX"] == off["ARRIVE_EXPECT_TX"]
+    assert on["FENCE_PROXY_ASYNC"] == off["FENCE_PROXY_ASYNC"] + 2
+    assert on["BULK_TENSOR"] == off["BULK_TENSOR"] - 1 and on["BULK_TENSOR"] >= 1
+    assert on["ST_SHARED_V4"] >= 2 and off["ST_SHARED_V4"] == 0 and on["TANH"] >= 8 and off["TANH"] == 0
+    assert on["LOCAL"] == off["LOCAL"] == 0 and on["ATOM"] == off["ATOM"] == 0 and on["CLUSTER_BARRIER"] == off["CLUSTER_BARRIER"] == 0
+    assert on["MAPA"] == off["MAPA"] and on["GRIDDEP"] == off["GRIDDEP"]
+    if "SASS_STL" in on:
+        assert on["SASS_STL"] == 0 and on["SASS_LDL"] == 0, (on["SASS_STL"], on["SASS_LDL"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the render pins build a cuDNN graph (a handle on any device); no device here")
+def test_combine_prologue_compiler_refusals_name_the_knob():
+    """Rendered (text only, any GPU): the compiler's typed refusals of the arm each carry the knob's token -- a 2-CTA MMA pair, a
+    cluster launch, a config without swap_ab, an N tile wider than the atom, a spec whose tokens / K disagree with the chain, more than
+    16 splits (the record refuses that itself)."""
+    import cudnn
+    import cudnn.gemm.frost  # noqa: F401
+    from cudnn.gemm.frost.dtypes import DTYPE_BYTES
+    from cudnn.gemm.frost.fusion_ir import COMBINE_PROLOGUE_MAX_SPLITS, COMBINE_PROLOGUE_MAX_TOKENS, CombinePrologueSpec, swap_ab
+    from cudnn.gemm.frost.graph_analyzer import analyze_with_binding
+    from cudnn.gemm.frost.sm100 import compiler as C
+    from cudnn.gemm.frost.sm100.epilogue_codegen import generate
+    from cudnn.gemm.frost.tile_config import by_name
+
+    def render(m, name, spec):
+        g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+        a = g.tensor(name="A", dim=[1, m, _COMBINE_K], stride=[m * _COMBINE_K, _COMBINE_K, 1])
+        b = g.tensor(name="B", dim=[1, _COMBINE_K, _COMBINE_N], stride=[_COMBINE_K * _COMBINE_N, 1, _COMBINE_K])
+        c = g.matmul(A=a, B=b, name="proj")
+        c.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+        g.validate()
+        g.build_operation_graph()
+        chain, _ = analyze_with_binding(g)
+        cfg = by_name(name)
+        if cfg.swap_ab:
+            chain = swap_ab(chain)
+        use_tma = C._use_tma_store_epi(chain, cfg)
+        snippets = generate(
+            chain,
+            vec_bytes_epi=C._epi_chunk_bytes(chain, cfg, use_tma),
+            output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+            tma_slots=frozenset({0}) if use_tma else frozenset(),
+            packed_lanes=C._epi_packed_lanes(cfg),
+            split_k_slices=cfg.split_k_slices,
+        )
+        return C._render_template(chain, snippets, cfg, combine_prologue=spec)
+
+    good = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"
+    spec = _combine_spec(8, 1, 1)
+    on = render(1, good, spec)
+    assert "_combineB" in on.split('"""', 2)[2] and "combine_n_splits = 8" in on
+    for name, token in (
+        ("CONFIG_sm100_256x8x128_128x8x32_cluster2x1_2ctamma_splitK8_swapAB", "2-CTA MMA pair"),
+        ("CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB", "cluster launch"),
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8", "without swap_ab"),
+    ):
+        with pytest.raises(NotImplementedError, match="combine_in_out_proj") as e:
+            render(1, name, spec)
+        assert token in str(e.value), (name, str(e.value))
+    with pytest.raises(NotImplementedError, match="N tile of 16") as e:
+        render(8, "CONFIG_sm100_128x16x128_128x16x32_cluster1x1_1ctamma_splitK8_swapAB", _combine_spec(8, 2, 4))  # 8 tokens in a 16-row tile
+    assert "combine_in_out_proj" in str(e.value)
+    with pytest.raises(NotImplementedError, match="is not the step's tokens"):
+        render(4, good, _combine_spec(8, 1, 1))  # m 4 against a 1-token spec
+    with pytest.raises(NotImplementedError, match="is not heads x d_head"):
+        render(1, good, CombinePrologueSpec(n_splits=8, batch=1, s_q=1, heads=16, d_head=256, gate_token_stride=4096, gate_head_stride=256))
+    with pytest.raises(ValueError, match=f"at most {COMBINE_PROLOGUE_MAX_SPLITS} splits"):
+        _combine_spec(17, 1, 1)
+    with pytest.raises(ValueError, match=f"exceed the {COMBINE_PROLOGUE_MAX_TOKENS}-row"):
+        _combine_spec(8, 3, 3)
+    with pytest.raises(ValueError, match="must be an int >= 1"):
+        CombinePrologueSpec(n_splits=0, batch=1, s_q=1, heads=24, d_head=256, gate_token_stride=6144, gate_head_stride=256)
+
+
+def test_combine_prologue_plan_arguments_are_checked_before_any_graph():
+    """``build_proj_gemm(combine_prologue=)``'s own refusals, device-free: the record's type, ``pin_frost=False`` (no JIT), an fp8 / alpha
+    / block-scale / MN-major plan, a spec whose tokens or K disagree with the plan, a shape the driver resolves no JIT tile for (the
+    graph route has no arm) -- each naming ``combine_in_out_proj``; ``run_proj_gemm`` refuses the operands on a plan without the arm and
+    their absence on a plan with it (no silent zero B tile)."""
+    spec = _combine_spec(8, 1, 1)
+    kw = dict(m=1, k=_COMBINE_K, n=_COMBINE_N, dtype=torch.bfloat16, label="combine_args")
+    with pytest.raises(TypeError, match="CombinePrologueSpec"):
+        build_proj_gemm(**kw, combine_prologue=object())
+    with pytest.raises(ValueError, match="combine_in_out_proj.*pin_frost=False"):
+        build_proj_gemm(**kw, pin_frost=False, combine_prologue=spec)
+    with pytest.raises(NotImplementedError, match="combine_in_out_proj"):
+        build_proj_gemm(**dict(kw, dtype=torch.float8_e4m3fn), alpha=True, combine_prologue=spec)
+    with pytest.raises(NotImplementedError, match="combine_in_out_proj"):
+        build_proj_gemm(**kw, alpha=True, combine_prologue=spec)
+    with pytest.raises(NotImplementedError, match="combine_in_out_proj"):
+        build_proj_gemm(**kw, a_major="m", combine_prologue=spec)
+    with pytest.raises(ValueError, match="combine_in_out_proj.*tokens"):
+        build_proj_gemm(**dict(kw, m=4), combine_prologue=spec)
+    with pytest.raises(ValueError, match="combine_in_out_proj.*heads x d_head"):
+        build_proj_gemm(**dict(kw, k=4096), combine_prologue=spec)  # a 24 x 256 spec against K 4096
+    with pytest.raises(NotImplementedError, match="combine_in_out_proj.*graph route"):
+        build_proj_gemm(**dict(kw, n=1000), combine_prologue=spec)  # N off every tile grid: no JIT tile -> the graph route, refused
+    # run_proj_gemm on the two kinds of plan, before any launch
+    plain = _plan_with_fake_jit("plain", m=1, k=_COMBINE_K, n=_COMBINE_N)
+    with pytest.raises(ValueError, match="forms no combine prologue"):
+        run_proj_gemm(plain, object(), object(), None, None, gate=object())
+    arm = _plan_with_fake_jit("arm", m=1, k=_COMBINE_K, n=_COMBINE_N)
+    arm.combine_prologue = spec
+    with pytest.raises(ValueError, match="needs o_partial, lse_partial and gate"):
+        run_proj_gemm(arm, object(), object(), None, None)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the operand checks read CUDA tensors")
+def test_combine_prologue_operands_are_checked_against_the_record(monkeypatch):
+    """``run_proj_gemm`` on an arm plan (a stand-in JIT): a slab of the wrong shape / dtype / layout, a gate off the declared strides or
+    off a 16-byte base, a CPU tensor -- each a ``ValueError`` naming the operand before any launch; the well-formed set reaches the JIT as
+    three FLAT spans that share the operands' storage (no copy)."""
+
+    class _ArmJit(_FakeJit):
+        def run_resolved(self, resolved, stream=None, workspace=None, combine_operands=None):
+            self.calls.append((dict(resolved), stream, workspace, combine_operands))
+
+    S, B, SQ = 8, 2, 3
+    T = B * SQ
+    spec = _combine_spec(S, B, SQ, gate_slab=True)
+    from cudnn.gated_attention_block.kernels.proj_gemm import ProjGemmPlan
+
+    arm = ProjGemmPlan(graph=None, a=object(), b=object(), c=object(), m=T, k=_COMBINE_K, n=_COMBINE_N, label="arm_ops", jit=_ArmJit())
+    arm.combine_prologue = spec
+    arm.dtype = torch.bfloat16  # the operand dtype the gate is checked against (a hand-built plan carries none otherwise)
+    bound = {arm.a: 1, arm.b: 2, arm.c: 3}
+    _counting_resolver(monkeypatch, bound)
+    o_partial, lse_partial, gate = _combine_inputs(S, B, SQ, dtype=torch.bfloat16, seed=5, gate_slab=True)
+    a = torch.zeros(T, _COMBINE_K, device="cuda", dtype=torch.bfloat16)
+    w = torch.zeros(_COMBINE_N, _COMBINE_K, device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros(T, _COMBINE_N, device="cuda", dtype=torch.bfloat16)
+
+    def run(**over):
+        kw = dict(o_partial=o_partial, lse_partial=lse_partial, gate=gate)
+        kw.update(over)
+        run_proj_gemm(arm, a, w, out, None, **kw)
+
+    with pytest.raises(ValueError, match="needs o_partial, lse_partial and gate"):
+        run(gate=None)
+    with pytest.raises(ValueError, match="o_partial must be the contiguous fp32"):
+        run(o_partial=o_partial.half())
+    with pytest.raises(ValueError, match="o_partial must be the contiguous fp32"):
+        run(o_partial=o_partial.transpose(1, 2))
+    with pytest.raises(ValueError, match="lse_partial must be the contiguous fp32"):
+        run(lse_partial=lse_partial[:, :, :1].expand(S * B, _COMBINE_H, SQ))
+    with pytest.raises(ValueError, match="gate must be the"):
+        run(gate=gate.contiguous())  # compact strides on a slab-declared spec
+    with pytest.raises(ValueError, match="gate must be the"):
+        run(gate=gate.float())
+    with pytest.raises(ValueError, match="16-byte boundary"):
+        run(
+            o_partial=torch.empty(S * B * SQ * _COMBINE_H * _COMBINE_D + 4, device="cuda", dtype=torch.float32)[
+                1 : 1 + S * B * SQ * _COMBINE_H * _COMBINE_D
+            ].view(S * B, SQ, _COMBINE_H, _COMBINE_D)
+        )  # a 4-byte base
+    with pytest.raises(ValueError, match="must be a CUDA tensor"):
+        run(lse_partial=lse_partial.cpu())
+    assert arm.jit.calls == []
+    run()
+    ((_resolved, _stream, _ws, ops),) = arm.jit.calls
+    o_flat, lse_flat, gate_flat = ops
+    assert o_flat.data_ptr() == o_partial.data_ptr() and o_flat.shape == (S * B * SQ * _COMBINE_H * _COMBINE_D,) and o_flat.stride() == (1,)
+    assert lse_flat.data_ptr() == lse_partial.data_ptr() and lse_flat.shape == (S * B * _COMBINE_H * SQ,)
+    assert (
+        gate_flat.data_ptr() == gate.data_ptr() and gate_flat.shape == (spec.gate_span_elems,) and gate_flat.stride() == (1,) and gate_flat.dtype == gate.dtype
+    )
+    assert (
+        gate_flat[spec.gate_token_stride * (T - 1) + spec.gate_head_stride * (_COMBINE_H - 1) + _COMBINE_D - 1]
+        == gate[B - 1, SQ - 1, _COMBINE_H - 1, _COMBINE_D - 1]
+    )

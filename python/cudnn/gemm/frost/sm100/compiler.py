@@ -80,6 +80,9 @@ from ..dtypes import (
 )
 from .epilogue_codegen import EpilogueSnippets, generate, tma_out_ready_marker, tma_out_value
 from ..fusion_ir import (
+    COMBINE_PROLOGUE_MAX_SPLITS,
+    COMBINE_PROLOGUE_MAX_TOKENS,
+    CombinePrologueSpec,
     ZERO_PRESERVING_OPS,
     FusionChain,
     MoeSwapAbSpec,
@@ -2188,10 +2191,78 @@ def _replace_marker_lines(src: str, replacements: dict[str, str], *, template_ki
     return rendered
 
 
+COMBINE_PROLOGUE_TOKEN = "combine_in_out_proj"
+"""The one token every typed decline of the combine-prologue arm carries (the block's knob of the same name)."""
+
+
+def _combine_prologue_reject_reason(chain: FusionChain, config: TileConfig, tmpl, src: str, spec: CombinePrologueSpec) -> "str | None":
+    """Why the combine prologue (the split combine formed in the GEMM's B operand ring, the sm100 matmul template's
+    ``@@COMBINE_PROLOGUE_ONLY@@`` arm) cannot render for this (chain, config, template, spec), or None.  The arm forms ONE swizzle atom
+    of B per k-tile (an 8-row N tile, K-major, bf16 / f16) per CTA -- never multicast, never a 2-CTA pair -- from the partial slabs of a
+    step whose tokens are the chain's N and whose ``heads x d_head`` is its K, at most 16 splits (the bitwise bound)."""
+    reasons = []
+    if "@@COMBINE_PROLOGUE_ONLY:BEGIN@@" not in src:
+        reasons.append(f"template {tmpl.file} has no combine-prologue arm")
+    if not config.swap_ab:
+        reasons.append(f"a config without swap_ab ({config.name}: the tokens must be the kernel's B operand)")
+    if config.ctas_per_mma != 1:
+        reasons.append(f"the 2-CTA MMA pair ({config.name}: a pair MMA's B operand is split across the pair)")
+    if tuple(config.cluster_shape) != (1, 1, 1):
+        reasons.append(f"a cluster launch ({config.name}: the B tile is formed per CTA, never multicast)")
+    if chain.num_gemms != 1 or chain.num_a_operands != 1 or chain.num_b_operands != 1:
+        reasons.append("multi-GEMM")
+    if chain.has_block_scale or chain.has_moe or chain.has_mainloop_fusion:
+        reasons.append("a block-scale / MoE / mainloop-fusion chain")
+    a_dt, b_dt = _mma_a_dtype(chain), _mma_b_dtype(chain)
+    if b_dt not in ("bf16", "fp16") or a_dt != b_dt:
+        reasons.append(f"operand dtypes A {a_dt} / B {b_dt} (the arm packs bf16 / f16 B tiles of the A operand's dtype)")
+    if chain.matmul.b_major != "k":
+        reasons.append("an N-major B operand (the arm writes K-major rows)")
+    if chain.matmul.a_batch != 1 or chain.matmul.b_batch != 1:
+        reasons.append("a batched matmul")
+    n_tile = config.cta_smem_tile_n
+    if n_tile != COMBINE_PROLOGUE_MAX_TOKENS:
+        reasons.append(f"an N tile of {n_tile} rows (the arm forms the {COMBINE_PROLOGUE_MAX_TOKENS}-row swizzle atom)")
+    if spec.tokens > n_tile:
+        reasons.append(f"{spec.tokens} tokens in an N tile of {n_tile}")
+    if spec.n_splits > COMBINE_PROLOGUE_MAX_SPLITS:
+        reasons.append(f"{spec.n_splits} splits (bitwise the combine kernel up to {COMBINE_PROLOGUE_MAX_SPLITS})")
+    if b_dt in DTYPE_BYTES:
+        k_tile = config.cta_tile_k(DTYPE_BYTES[b_dt])
+        if spec.d_head % k_tile:
+            reasons.append(f"d_head {spec.d_head} not a multiple of the K tile ({k_tile} elements: a k-tile would straddle two heads)")
+        if k_tile % 8:
+            reasons.append(f"a K tile of {k_tile} elements (the arm stores 8-element chunks)")
+    if chain.matmul.N != spec.tokens:
+        reasons.append(f"the chain's N {chain.matmul.N} is not the step's tokens {spec.tokens} (= batch {spec.batch} x s_q {spec.s_q})")
+    if chain.matmul.K != spec.k:
+        reasons.append(f"the chain's K {chain.matmul.K} is not heads x d_head = {spec.heads} x {spec.d_head}")
+    if reasons:
+        return f"{COMBINE_PROLOGUE_TOKEN} (the split combine formed in the GEMM's B operand ring) is not served with: {', '.join(reasons)}"
+    return None
+
+
+def _combine_prologue_constants(spec: CombinePrologueSpec) -> list[str]:
+    """The arm's injected tile constants (read by the template's ``COMBINE_*`` derivations)."""
+    return [
+        f"# Combine prologue: {spec}",
+        f"combine_n_splits = {spec.n_splits}",
+        f"combine_n_batch = {spec.batch}",
+        f"combine_s_q = {spec.s_q}",
+        f"combine_tokens = {spec.tokens}",
+        f"combine_heads = {spec.heads}",
+        f"combine_d_head = {spec.d_head}",
+        f"combine_gate_token_stride = {spec.gate_token_stride}",
+        f"combine_gate_head_stride = {spec.gate_head_stride}",
+    ]
+
+
 def _render_template(
     chain: FusionChain,
     snippets: EpilogueSnippets,
     config: TileConfig,
+    *,
+    combine_prologue: "CombinePrologueSpec | None" = None,
 ) -> str:
     # Template selected by the kernel registry from the pure-geometry config +
     # execution strategy (cta_group); mainloop/graph_type from chain.
@@ -2212,6 +2283,15 @@ def _render_template(
         src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
     elif splitk:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    # The combine prologue (the B operand formed in the ring by the epilogue warps): whole marker blocks, so a rendering without it is
+    # the text it always was; the arm's own refusals come before any render.
+    combine_arm = combine_prologue is not None
+    if combine_arm:
+        reason = _combine_prologue_reject_reason(chain, config, tmpl, src, combine_prologue)
+        if reason is not None:
+            raise NotImplementedError(reason)
+    src = _resolve_blocks(src, "COMBINE_PROLOGUE_ONLY", combine_arm)
+    src = _resolve_blocks(src, "COMBINE_PROLOGUE_OFF", not combine_arm)
     # For splitK, `snippets` is is kernel 1's partials store. Re-generate epilogue for reduce kernel
     plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
@@ -2293,6 +2373,8 @@ def _render_template(
     tile_constants = _render_tile_constants(config, chain, tmpl)
     if plumb.tap_constants:
         tile_constants += "\n" + "\n".join(plumb.tap_constants)
+    if combine_arm:
+        tile_constants += "\n" + "\n".join(_combine_prologue_constants(combine_prologue))
     # Multi-output tap plumbing. Empty lists → markers expand to nothing (kernel
     # signature shrinks back to single-output form).
     kernel_tap_params = ",\n".join(plumb.tap_kernel_params)
@@ -2395,7 +2477,7 @@ def _render_template(
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}{'_combineB' if combine_arm else ''}")
     src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
@@ -2956,6 +3038,10 @@ class CompiledFusedGemm:
     vec_bytes_epi: "int | None" = None
     # workspace for split-K
     workspace_bytes: int = 0
+    # The combine prologue (the sm100 matmul template's `@@COMBINE_PROLOGUE_ONLY@@` arm): the B operand -- the tokens under swap_ab -- is
+    # formed in the operand ring from a split-KV step's fp32 partial O / LSE slabs and the gate, by the epilogue warps.  Such a plan takes
+    # the three operands at every call (`combine_operands=`: flat 16-byte-aligned spans, see `run_resolved`); None = the plain template.
+    combine_prologue: "CombinePrologueSpec | None" = None
 
     def workspace_bytes_for(self, batch: int, m: int, n: int) -> int:
         """workspace for a given shape."""
@@ -2993,7 +3079,7 @@ class CompiledFusedGemm:
             self.recipe = build_recipe(self)
             self.lowered = self._lower()
 
-    def __call__(self, variant_pack, stream=None, workspace=None):
+    def __call__(self, variant_pack, stream=None, workspace=None, combine_operands=None):
         # The runtime call is a variant-pack dict keyed by cuDNN tensor object
         # (or uid / name) -> buffer; (M, N, K) is inferred from the buffer shapes.
         if not isinstance(variant_pack, dict):
@@ -3002,10 +3088,13 @@ class CompiledFusedGemm:
             )
         if self.binding is None:
             raise NotImplementedError("variant-pack call is not wired up for this graph type")
-        return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream, workspace=workspace)
+        return self.run_resolved(resolve_variant_pack(variant_pack, self.binding), stream=stream, workspace=workspace, combine_operands=combine_operands)
 
-    def run_resolved(self, resolved, stream=None, workspace=None):
-        """Launch over ``{id(bound_tensor): buffer}``, already resolved."""
+    def run_resolved(self, resolved, stream=None, workspace=None, combine_operands=None):
+        """Launch over ``{id(bound_tensor): buffer}``, already resolved.  ``combine_operands`` (a combine-prologue plan only, required
+        there, refused elsewhere) is the triple ``(o_partial, lse_partial, gate)`` as FLAT 1-D spans -- the fp32 partial O slab
+        ``(S x B, S_q, H, D)`` contiguous, the fp32 partial LSE slab ``(S x B, H, S_q)`` contiguous, the gate's storage span in the
+        operand dtype (``CombinePrologueSpec.gate_span_elems`` elements from its base) -- each 16-byte aligned."""
         operands = []
         for i, t in enumerate(self.bound):
             buf = resolved.get(id(t))
@@ -3014,7 +3103,7 @@ class CompiledFusedGemm:
             operands.append(buf)
         if self.lowered is None:
             raise NotImplementedError(f"cudnn.frost gemm: this kernel has no launch path -- {self.declined}")
-        return self.lowered(operands, stream=stream, workspace=workspace)
+        return self.lowered(operands, stream=stream, workspace=workspace, combine_operands=combine_operands)
 
     def _lower(self):
         """The recipe as one loop over flat tuples: this kernel's only call path.
@@ -3111,11 +3200,16 @@ class CompiledFusedGemm:
         if needs_workspace:
             cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
+        # The combine prologue's three operands: checked against the record's plan-time facts at every call (flat spans, dtype, length,
+        # 16-byte base) -- the kernel reads them through the record's strides, so a short or misaligned span would be a silent wrong B tile.
+        combine = self.combine_prologue
+        combine_dtype = {"bf16": "bfloat16", "fp16": "float16"}.get(_mma_b_dtype(self.chain)) if combine is not None else None
+        dtype_name = buffers.dtype_name
         # Named so a test can assert which rule refused a call, and that a legal
         # call trips none. Incremented only on the path that is already raising.
         gave_up = self.deferrals
 
-        def lowered(operands, graph_order=None, stream=None, workspace=None):
+        def lowered(operands, graph_order=None, stream=None, workspace=None, combine_operands=None):
             _check_plan_device(device)
             # Which axis order each input arrived in, by the backend's own rule:
             # the descriptor defines the tensor and the pack supplies a pointer,
@@ -3253,6 +3347,35 @@ class CompiledFusedGemm:
                         f"this plan was built with — rebuild for this shape"
                     )
                 extra = (workspace.view(0, "float32", (split_k_slices * batch * m * n,)),)
+            if combine is not None:
+                if combine_operands is None or len(combine_operands) != 3:
+                    raise ValueError(
+                        f"cudnn.frost gemm: this plan forms its B operand from a split combine ({COMBINE_PROLOGUE_TOKEN}) and needs "
+                        "combine_operands=(o_partial, lse_partial, gate) at every call -- the flat fp32 partial O slab, the flat fp32 partial "
+                        "LSE slab and the gate's flat storage span (CombinePrologueSpec.gate_span_elems elements); no silent zero B tile"
+                    )
+                if batch != 1 or n != combine.tokens or k != combine.k:
+                    raise ValueError(
+                        f"cudnn.frost gemm: {COMBINE_PROLOGUE_TOKEN}: the launch's (batch, N, K) = ({batch}, {n}, {k}) is not the step this plan "
+                        f"was built for (1, {combine.tokens} tokens, {combine.k} = heads x d_head); the partial slabs are indexed by that step"
+                    )
+                need = (
+                    ("o_partial", combine.n_splits * combine.tokens * combine.k, "float32"),
+                    ("lse_partial", combine.n_splits * combine.batch * combine.heads * combine.s_q, "float32"),
+                    ("gate", combine.gate_span_elems, combine_dtype),
+                )
+                for (role, elems, dt), v in zip(need, combine_operands):
+                    sh = tuple(getattr(v, "shape", ()))
+                    if len(sh) != 1 or int(sh[0]) < elems or tuple(v.stride()) != (1,) or dtype_name(v) != dt or _pow2_floor(v.data_ptr()) < 16:
+                        raise ValueError(
+                            f"cudnn.frost gemm: {COMBINE_PROLOGUE_TOKEN}: {role} must be a flat, contiguous, 16-byte-aligned {dt} span of at least "
+                            f"{elems} elements; got shape {sh}, stride {tuple(v.stride()) if hasattr(v, 'stride') else '?'}, {dtype_name(v)}"
+                        )
+                extra = extra + tuple(combine_operands)
+            elif combine_operands is not None:
+                raise ValueError(
+                    f"cudnn.frost gemm: this plan forms no combine prologue ({COMBINE_PROLOGUE_TOKEN}); refusing to drop combine_operands silently"
+                )
             return launchable(
                 tuple(problem),
                 *(v.permute(1, 2, 0) for v in vs),
@@ -4399,8 +4522,17 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
+    *,
+    combine_prologue: "CombinePrologueSpec | None" = None,
 ) -> CompiledFusedGemm:
     """End-to-end: cuDNN frontend graph -> rendered + cute-compiled GEMM kernel.
+
+    ``combine_prologue`` (appended; a :class:`CombinePrologueSpec`, None = the plain template) renders the sm100 matmul template's
+    ``@@COMBINE_PROLOGUE_ONLY@@`` arm: the B operand -- a split-KV attention step's tokens under ``swap_ab`` -- is formed in the operand
+    ring by the epilogue warps from the step's fp32 partial O / LSE slabs and its gate (the split combine kernel's arithmetic, bitwise),
+    so the combine launch disappears; such a plan takes ``combine_operands=`` at every call (:meth:`CompiledFusedGemm.run_resolved`).
+    Refused, typed, off a ``swap_ab`` 1-CTA-MMA cluster-1x1 config with an 8-row N tile, bf16 / f16 operands, one GEMM, K-major B,
+    at most 16 splits (``_combine_prologue_reject_reason``).
 
     Eagerly analyze → codegen → render → import → cute.compile; returns a
     directly-callable :class:`CompiledFusedGemm`.
@@ -4429,6 +4561,14 @@ def jit_from_cudnn_graph(
     _check_cta_group_geometry(config)
     _check_mma_n_dim(chain, config)
     _check_splitk_supported(chain, config)
+    if combine_prologue is not None:
+        if not isinstance(combine_prologue, CombinePrologueSpec):
+            raise TypeError(f"combine_prologue must be a CombinePrologueSpec or None, got {type(combine_prologue).__name__}")
+        if chain.has_block_scale or chain.has_moe:
+            raise NotImplementedError(
+                f"{COMBINE_PROLOGUE_TOKEN} (the split combine formed in the GEMM's B operand ring) is rendered by the plain sm100 matmul template only, "
+                "not the block-scale / MoE ones"
+            )
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
@@ -4468,7 +4608,7 @@ def jit_from_cudnn_graph(
         packed_lanes=_epi_packed_lanes(config),
         split_k_slices=config.split_k_slices,
     )
-    src = _render_template(chain, snippets, config)
+    src = _render_template(chain, snippets, config, combine_prologue=combine_prologue)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
@@ -4483,6 +4623,7 @@ def jit_from_cudnn_graph(
         use_tma_store=use_tma,
         vec_bytes_epi=_out_vec_bytes(chain, config, use_tma),
         workspace_bytes=_splitk_workspace_bytes(chain, config),
+        combine_prologue=combine_prologue,
     )
 
 

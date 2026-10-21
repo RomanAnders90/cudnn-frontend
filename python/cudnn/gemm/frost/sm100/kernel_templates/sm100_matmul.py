@@ -38,6 +38,83 @@ scheduler, same TMEM pipeline, same epilogue.
 **Any correctness fix or performance improvement here should be applied there
 too, and vice versa.**  The fork carries the matching note and a list of the
 points where the two intentionally differ.
+
+Combine prologue: the split combine formed in the B operand ring (``combine_prologue``)
+--------------------------------------------------------------------------------------
+The gated attention block's block-sparse DECODE step runs its sparse core split-KV: every
+split leaves an fp32 partial O row and an fp32 partial LSE per (token, head) in the
+workspace, and a separate combine kernel merges them (the online-softmax weights, the gate,
+one bf16 / f16 rounding) into the O the out projection reads as its B operand (``swap_ab``:
+the weight is A, the tokens are B).  The ``@@COMBINE_PROLOGUE_ONLY@@`` arm folds that
+combine into THIS kernel: the four epilogue warps -- idle through the mainloop -- form every
+k-tile's B tile (``cta_tile_n`` = 8 token rows x ``cta_tile_k`` = 64 K elements, ONE
+SWIZZLE_128B atom of 1 KiB) in the operand ring by lane stores from the partials, the LSEs
+and the gate, under the same ``ab_full`` / ``ab_empty`` protocol the TMA writer follows for
+A; the TMA warp loads A only (``@@COMBINE_PROLOGUE_OFF@@`` holds the B copy and the two-
+operand ``expect_tx`` of the plain rendering, so a rendering without the arm is byte for byte
+the text it always was).  No new SMEM, no new mbarrier, no cluster, no atomic; ONE init count
+changes.  The arithmetic per element is the combine kernel's own in its order
+(``sdpa/fwd/kernels/sm100/split_combine.py`` ``_combine_decode_grid_kernel``, chain 0; the
+module's forms agree up to 16 splits): ``m = max_s lse_s``; ``m_safe = SELECT(m == -inf, 0, m)``;
+``w_s = SELECT(lse_s > -inf, exp(lse_s - m_safe), 0)``; ``v_s = SELECT(live, v_s, 0)``;
+``den += w_s``, ``acc += w_s * v_s`` in split order from +0; ``inv_den = 1 / max(den, 1e-30)``,
+0 when every split is dead; the gate ``hg = acc * (inv_den * 0.5)``, ``s = fmul2(g, 0.5)``,
+``t = tanh(s)``, ``y = ffma2(t, hg, hg)``, the dead-row SELECT after the fma, ONE rounding
+to the operand dtype -- so the arm's ``out`` is BITWISE the combine kernel + the plain GEMM
+(pinned by ``test_proj_gemm.py``).
+
+Work decomposition (``cta_tile_n`` 8, ``T`` = the step's tokens <= 8; rows ``t >= T`` of every
+``sB`` stage are zeroed ONCE at kernel start by the producer threads -- the TMA never touches
+``sB`` under the arm, so they persist): a TASK is one (token row t, k-tile, 16-byte chunk c)
+= eight consecutive dims of one head folded over the splits by ONE thread (16 LSE words, 16 x
+32 B of partials, 16 B of gate in; 16 B of B tile out).  The slice's k-tiles are walked in
+WAVES of ``COMBINE_WAVE_K_TILES`` = floor(64 / T) k-tiles (= 512 / (8 T) tasks, at most
+``COMBINE_TASKS_PER_THREAD`` = 4 per producer thread): phase A forms the wave's tasks (every
+load independent of the ring, so the round trips overlap), phase B stores them k-tile by
+k-tile in ring order (wait ``ab_empty``, the owning lanes' ``st.shared.v4`` at the swizzled
+offsets, ``fence.proxy.async.shared::cta`` by every lane, ``bar.warp.sync``, ONE elected
+``mbarrier.arrive`` on ``ab_full`` -- unconditionally, every producer warp, every k-tile).
+The producer warps mirror the TMA warp's ``ab_iter`` / ``ab_empty`` parity walk (the flip at
+stage 0; pre-armed parity 1) across the CTA's tiles; a CTA's producer work for tile ``i + 1``
+starts after its epilogue drain of tile ``i`` (the same warps).
+
+Barrier table of the arm (per CTA; the template's rows, the delta marked ARM; ``SUM(issuing
+lanes) == init`` per row):
+
+  ab_full[ab_stages]   TMA_LOAD + THREAD (ARM)   init 1 + 4 = COMBINE_AB_FULL_COUNT (5; today 1)
+                       the TMA warp's ONE elected lane ``arrive.expect_tx(num_tma_copy_bytes)``
+                       where ARM: ``num_tma_copy_bytes = num_a_operands * sA_bytes`` (A only;
+                       today A + B), + EACH of the 4 producer warps ONE elected lane
+                       ``mbarrier.arrive`` after its lanes' stores -> proxy fence -> warp sync.
+                       Waited by the MMA warp per k-tile (``try_wait_parity``, unchanged).
+  ab_empty[ab_stages]  MMA_COMMIT   init ab_empty_count (1 at cluster 1x1; unchanged)
+                       the MMA warp's ONE elected lane ``tcgen05.commit`` after the stage's MMAs.
+                       Waited by the TMA warp before refilling A, and ARM: by the 4 producer
+                       warps before writing B (every lane ``try_wait_parity``; a non-consuming
+                       wait, five waiters read one phase).  Pre-armed (parity 1) for both.
+  acc_full / acc_empty / clc_full / clc_empty / tmem_dealloc / the named barriers: unchanged.
+  Every producer arrive on ``ab_full`` is consumed by the MMA warp's wait of that k-tile in
+  grid (the tile's ``acc_full`` commit follows the last of them, and the epilogue drain waits
+  it) -- a reachable wait before exit for every arrive (P6); the arm adds no cross-CTA arrive.
+  PDL: the producers' first global reads (the predecessor's partials / LSEs / the gate) sit
+  below the epilogue role's existing ``griddepcontrol("wait")``; the TMA warp's wait stays
+  above its first A load; no site is added or moved.
+
+SMEM table of the arm (the delta row; every other row of the layout is unchanged):
+
+  sB[ab_stages] (ab_dtype, 8 x 64 per stage = 1 KiB)   ARM writer: the producer threads, per
+                       task ONE ``st.shared.v4`` (8 elements) at ``stage x 1024 + t x 128 +
+                       ((c ^ (t & 7)) << 4)`` bytes; rows ``t >= T`` zeroed once at init (today:
+                       the TMA warp's ``cp.async.bulk.tensor``).  Reader: the MMA SMEM
+                       descriptor (K-major, SWIZZLE_128B, ``b_smem_desc_*`` unchanged).  Per-lane
+                       stride 16 B: eight consecutive lanes = one row's eight chunks = 128 B =
+                       every bank once; the XOR by ``t & 7`` is the descriptor's swizzle (JOB 1)
+                       and spreads two rows' same-chunk stores over the bank groups (JOB 2).
+                       Budget unchanged (per stage A 16 KiB + B 1 KiB; ``ab_stages`` identical).
+
+Served by the compiler on a ``swap_ab`` 1-CTA-MMA cluster-1x1 config with an 8-row N tile,
+bf16 / f16 operands, one GEMM, K-major B, ``d_head % cta_tile_k == 0``, at most 16 splits and
+at most 8 tokens (``_combine_prologue_reject_reason``); the kernel symbol carries ``_combineB``.
 """
 
 from __future__ import annotations
@@ -140,6 +217,97 @@ def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, au
 
 
 # @@SPLITK_ONLY:END@@
+# @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+
+
+from cutlass._mlir.dialects import arith as _arith
+from cudnn.frost.tile_dsl.pointwise import (
+    f16x2_to_f32 as _f16x2_to_f32,
+    ffma2 as _ffma2,
+    fmul2 as _fmul2,
+    fp32_to_fp16 as _fp32_to_fp16,
+    opaque_f32_zero as _opaque_f32_zero,
+)
+from cudnn.frost.tile_dsl.tma import ld_global as _ld_global, ld_global_v4 as _ld_global_v4, st_shared_v4 as _st_shared_v4
+
+# The combine prologue (module docstring): the four epilogue warps produce the B tiles.  Every constant below is derived from the
+# injected tile constants (`combine_*`, `cta_tile_mnk`, `ab_stages`, `ab_dtype`); the compiler refuses the geometries the arm does not serve.
+COMBINE_PRODUCER_WARPS = 4  # == num_epilogue_warps: one elected arrive each per k-tile on ab_full
+COMBINE_AB_FULL_COUNT = 1 + COMBINE_PRODUCER_WARPS  # the TMA warp's expect_tx (the A bytes) + the four producer warps
+COMBINE_CHUNK_ELEMS = 8  # one 16-byte st.shared.v4 of eight bf16 / f16 B elements = eight consecutive dims of one head
+COMBINE_CHUNKS_PER_ROW = cta_tile_mnk[2] // COMBINE_CHUNK_ELEMS  # 64 K elements = 128 B = 8 chunks: one SWIZZLE_128B row of the B tile
+COMBINE_TASKS_PER_THREAD = 4  # tasks a producer thread forms per wave (four packed words each): a register budget, not a correctness bound
+COMBINE_TASKS_PER_K_TILE = COMBINE_CHUNKS_PER_ROW * combine_tokens  # 8 T (the padding rows t >= T are zero, never a task)
+COMBINE_WAVE_K_TILES = (COMBINE_PRODUCER_WARPS * 32 * COMBINE_TASKS_PER_THREAD) // COMBINE_TASKS_PER_K_TILE  # floor(512 / 8 T) k-tiles per wave
+COMBINE_WAVE_TASKS = COMBINE_WAVE_K_TILES * COMBINE_TASKS_PER_K_TILE  # <= 512 = one task per thread per slot
+COMBINE_PAD_CHUNKS_PER_STAGE = max(1, (cta_tile_mnk[1] - combine_tokens) * COMBINE_CHUNKS_PER_ROW)  # the zero rows t >= T, in 16-byte chunks
+COMBINE_PAD_CHUNKS = (cta_tile_mnk[1] - combine_tokens) * COMBINE_CHUNKS_PER_ROW * ab_stages
+COMBINE_K_TILES_PER_HEAD = combine_d_head // cta_tile_mnk[2]  # 4 at d_head 256 (a k-tile never straddles a head: the compiler checks)
+COMBINE_O_SPLIT_STRIDE_BYTES = combine_tokens * combine_heads * combine_d_head * 4  # the fp32 partial slab (S x B, S_q, H, D): one split = T x H x D words
+COMBINE_LSE_SPLIT_STRIDE_BYTES = combine_n_batch * combine_heads * combine_s_q * 4  # the fp32 LSE slab (S x B, H, S_q): one split = B x H x S_q words
+COMBINE_ELEM_BYTES = ab_dtype.width // 8
+
+
+@cute.jit
+def _combine_ld_f32(addr):
+    r = _ld_global(addr, cutlass.Float32)
+    return cutlass.Float32(r[0] if isinstance(r, (tuple, list)) else r)
+
+
+@cute.jit
+def _combine_fold_task(o_addr, lse_addr, gate_addr):
+    """ONE task of the combine prologue: the eight dims at ``o_addr`` (split 0; the splits ``COMBINE_O_SPLIT_STRIDE_BYTES`` apart)
+    folded over ``combine_n_splits`` with the LSEs at ``lse_addr`` (``COMBINE_LSE_SPLIT_STRIDE_BYTES`` apart) and gated by the eight gate
+    values at ``gate_addr`` -- the combine kernel's operation sequence per element (module docstring) -- packed to four words of
+    ``ab_dtype`` pairs (the lower half = the even dim): the B tile's 16-byte chunk."""
+    neg_inf = cutlass.Float32(float("-inf"))
+    zero = cutlass.Float32(0.0)
+    lse_v = []
+    for s in cutlass.range_constexpr(combine_n_splits):
+        lse_v.append(_combine_ld_f32(lse_addr + s * COMBINE_LSE_SPLIT_STRIDE_BYTES))
+    m = neg_inf
+    for s in cutlass.range_constexpr(combine_n_splits):
+        m = cute.math.max(m, lse_v[s])
+    # every split dead (a padding row, an empty sequence): O := 0 by SELECT, never exp(-inf - -inf); m_safe feeds the exponentials only
+    all_dead = m == neg_inf
+    m_safe = cutlass.Float32(_arith.select(all_dead.ir_value(), zero.ir_value(), m.ir_value()))
+    den = zero
+    acc = [zero, zero, zero, zero, zero, zero, zero, zero]
+    for s in cutlass.range_constexpr(combine_n_splits):
+        lse_s = lse_v[s]
+        v_lo = _ld_global_v4(o_addr + s * COMBINE_O_SPLIT_STRIDE_BYTES, cutlass.Float32)
+        v_hi = _ld_global_v4(o_addr + s * COMBINE_O_SPLIT_STRIDE_BYTES + 16, cutlass.Float32)
+        live = lse_s > neg_inf
+        e = cute.math.exp(lse_s - m_safe, fastmath=True)
+        w = cutlass.Float32(_arith.select(live.ir_value(), e.ir_value(), zero.ir_value()))
+        den = den + w
+        for i in cutlass.range_constexpr(8):
+            v_i = cutlass.Float32(v_lo[i] if i < 4 else v_hi[i - 4])
+            v_i = cutlass.Float32(_arith.select(live.ir_value(), v_i.ir_value(), zero.ir_value()))
+            acc[i] = acc[i] + w * v_i
+    inv_den = cutlass.Float32(1.0) / cute.math.max(den, cutlass.Float32(1e-30))
+    inv_den = cutlass.Float32(_arith.select(all_dead.ir_value(), zero.ir_value(), inv_den.ir_value()))
+    # the gate, the combine kernel's form: FMUL2, MUFU.TANH, FFMA2 on the fp32 merged value, the dead-row SELECT after the fma; the
+    # 0.5 is opaque so the packed-asm operand never folds to an immediate (frost-tile-dsl.md section 7)
+    gate_half = _opaque_f32_zero() + cutlass.Float32(0.5)
+    inv_den_half = inv_den * cutlass.Float32(0.5)
+    gw = _ld_global_v4(gate_addr, cutlass.Int32)
+    words = []
+    for p in cutlass.range_constexpr(4):
+        g_lo, g_hi = _f16x2_to_f32(gw[p], dtype=ab_dtype)
+        hg_lo = acc[2 * p] * inv_den_half
+        hg_hi = acc[2 * p + 1] * inv_den_half
+        s_lo, s_hi = _fmul2(g_lo, g_hi, gate_half, gate_half)
+        t_lo = cute.math.tanh(s_lo, approx=True)
+        t_hi = cute.math.tanh(s_hi, approx=True)
+        y_lo, y_hi = _ffma2(t_lo, t_hi, hg_lo, hg_hi, hg_lo, hg_hi)
+        y_lo = cutlass.Float32(_arith.select(all_dead.ir_value(), zero.ir_value(), y_lo.ir_value()))
+        y_hi = cutlass.Float32(_arith.select(all_dead.ir_value(), zero.ir_value(), y_hi.ir_value()))
+        words.append(_fp32_to_fp16(y_lo, y_hi, dtype=ab_dtype))
+    return words[0], words[1], words[2], words[3]
+
+
+# @@COMBINE_PROLOGUE_ONLY:END@@
 
 
 def _a_collector_op(g):
@@ -172,6 +340,11 @@ def _kernel(
     # @@SPLITK_ONLY:BEGIN@@
     mSplitK_partials: cute.Tensor,
     # @@SPLITK_ONLY:END@@
+    # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+    mComb_o_partial: cute.Tensor,
+    mComb_lse_partial: cute.Tensor,
+    mComb_gate: cute.Tensor,
+    # @@COMBINE_PROLOGUE_ONLY:END@@
     # @@INJECT_KERNEL_REDUCTION_STRIDE_PARAMS@@
     # @@INJECT_KERNEL_AUX_PARAMS@@
     # @@TMA_STORE_ONLY:BEGIN@@
@@ -386,8 +559,14 @@ def _kernel(
             if elect_one:
                 nvvm.mbarrier_init(tmem_dealloc_mbar_ptr, 32)
         for i in range(ab_stages):
+            # @@COMBINE_PROLOGUE_OFF:BEGIN@@
             if elect_one:
                 nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), 1)
+            # @@COMBINE_PROLOGUE_OFF:END@@
+            # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+            if elect_one:
+                nvvm.mbarrier_init(ab_full_mbar_ptr.subview(i), COMBINE_AB_FULL_COUNT)
+            # @@COMBINE_PROLOGUE_ONLY:END@@
             if elect_one:
                 nvvm.mbarrier_init(ab_empty_mbar_ptr.subview(i), ab_empty_count)
         for i in range(acc_stages):
@@ -400,6 +579,25 @@ def _kernel(
                 nvvm.mbarrier_init(clc_full_mbar_ptr.subview(i), 1)
             if elect_one:
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), clc_empty_count)
+    # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+    # The B tile's padding rows t >= T of every ring stage stay zero for the whole kernel: the producer threads zero them ONCE here (the
+    # TMA never touches sB under the arm) and fence the generic stores to the async proxy the MMA reads through; barrier 0 below orders
+    # them before the first MMA.
+    if warp_idx < num_epilogue_warps:
+        if cutlass.const_expr(COMBINE_PAD_CHUNKS > 0):
+            _cz_zero = cutlass.Int32(0)
+            for _cz in cutlass.range(tidx, COMBINE_PAD_CHUNKS, num_epilogue_warps * 32, unroll=1):
+                _cz_stage = _cz // COMBINE_PAD_CHUNKS_PER_STAGE
+                _cz_r = _cz % COMBINE_PAD_CHUNKS_PER_STAGE
+                _cz_t = combine_tokens + _cz_r // COMBINE_CHUNKS_PER_ROW
+                _cz_c = _cz_r % COMBINE_CHUNKS_PER_ROW
+                _st_shared_v4(
+                    smem_b_list[0].data_ptr(sB_elems * _cz_stage + _cz_t * cta_tile_mnk[2] + _cz_c * COMBINE_CHUNK_ELEMS),
+                    [_cz_zero, _cz_zero, _cz_zero, _cz_zero],
+                    cutlass.Int32,
+                )
+            cute.arch.fence_proxy("async.shared", space="cta")
+    # @@COMBINE_PROLOGUE_ONLY:END@@
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
 
@@ -413,10 +611,16 @@ def _kernel(
 
     sA_bytes = sA_elems * (ab_dtype.width // 8)
     sB_bytes = sB_elems * (ab_dtype.width // 8)
+    # @@COMBINE_PROLOGUE_OFF:BEGIN@@
     if cutlass.const_expr(cta_group == 1):
         num_tma_copy_bytes = num_a_operands * sA_bytes + num_b_operands * sB_bytes
     else:
         num_tma_copy_bytes = (num_a_operands * sA_bytes + num_b_operands * sB_bytes) * 2
+    # @@COMBINE_PROLOGUE_OFF:END@@
+    # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+    # the TMA warp's expect_tx counts the A bytes alone: the B tile is formed by the producer warps (cta_group 1, asserted by the compiler)
+    num_tma_copy_bytes = num_a_operands * sA_bytes
+    # @@COMBINE_PROLOGUE_ONLY:END@@
 
     # One descriptor for every MMA instruction of the tile — the CTA tile spans
     # mma_size_m of them, all the same shape.
@@ -676,6 +880,7 @@ def _kernel(
                                         group=_CTA_GROUP,
                                     )
 
+                # @@COMBINE_PROLOGUE_OFF:BEGIN@@
                 for _bj in cutlass.range_constexpr(num_b_operands):
                     sB_stage = smem_b_list[_bj].subview(sB_elems * stage)
                     tma_b_desc = tma_b_descs[_bj]
@@ -766,6 +971,7 @@ def _kernel(
                                     group=_CTA_GROUP,
                                 )
 
+                # @@COMBINE_PROLOGUE_OFF:END@@
                 ab_iter += 1
 
             consumer_stage = tile_iter % CLC_SCHED_STAGES
@@ -1076,6 +1282,15 @@ def _kernel(
         tile_l = init_tile_l
         is_valid = cutlass.Int32(1)
         clc_full_phase_epi = cutlass.Int32(0)
+        # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+        # the producer walk's ring state: the TMA warp's ab_iter / ab_empty parity mirror (pre-armed parity 1, the flip at stage 0); the
+        # operand bases of the arm (the predecessor's partials / LSEs and the gate: read below the role's griddepcontrol.wait above)
+        comb_ab_iter = cutlass.Int32(0)
+        comb_empty_phase = cutlass.Int32(1)
+        comb_o_base = mComb_o_partial.iterator.toint()
+        comb_lse_base = mComb_lse_partial.iterator.toint()
+        comb_gate_base = mComb_gate.iterator.toint()
+        # @@COMBINE_PROLOGUE_ONLY:END@@
 
         # @@EPILOGUE_SETUP:BEGIN@@
         if cutlass.const_expr(epi_packed_lanes):
@@ -1100,6 +1315,68 @@ def _kernel(
 
         while is_valid != 0:
             coord_m_tile = tile_m * cgrp_tile_m_cur + m_rank * cta_tile_mnk[0]
+            # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+            # ---- the combine prologue (module docstring): this tile's B tiles, formed in the ring before the drain ----
+            if cutlass.const_expr(split_k_slices > 1):
+                _cb_split = cutlass.Int64(tile_l % split_k_slices)
+                _cb_per = num_k_tiles // split_k_slices
+                _cb_rem = num_k_tiles % split_k_slices
+                _cb_k_begin = _cb_split * _cb_per + cutlass.min(_cb_split, _cb_rem)
+                _cb_k_end = (_cb_split + 1) * _cb_per + cutlass.min(_cb_split + 1, _cb_rem)
+            else:
+                _cb_k_begin = cutlass.Int64(0)
+                _cb_k_end = num_k_tiles
+            _cb_n_kt = cutlass.Int32(_cb_k_end - _cb_k_begin)
+            for _cb_wave_lo in cutlass.range(0, _cb_n_kt, COMBINE_WAVE_K_TILES, unroll=1):
+                # phase A: this thread's tasks of the wave -- task i = kt_rel x 8 T + t x 8 + c; thread tidx holds i = 128 j + tidx
+                _cb_words = []
+                _cb_meta = []
+                for _j in cutlass.range_constexpr(COMBINE_TASKS_PER_THREAD):
+                    _cb_i = _j * (COMBINE_PRODUCER_WARPS * 32) + tidx
+                    _cb_kt_rel = _cb_wave_lo + _cb_i // COMBINE_TASKS_PER_K_TILE
+                    _cb_rem_i = _cb_i % COMBINE_TASKS_PER_K_TILE
+                    _cb_t = _cb_rem_i // COMBINE_CHUNKS_PER_ROW
+                    _cb_c = _cb_rem_i % COMBINE_CHUNKS_PER_ROW
+                    _cb_ok = (_cb_i < COMBINE_WAVE_TASKS) & (_cb_kt_rel < _cb_n_kt)
+                    _cb_w0 = cutlass.Int32(0)
+                    _cb_w1 = cutlass.Int32(0)
+                    _cb_w2 = cutlass.Int32(0)
+                    _cb_w3 = cutlass.Int32(0)
+                    if _cb_ok:
+                        _cb_kt = _cb_k_begin + cutlass.Int64(_cb_kt_rel)
+                        _cb_h = _cb_kt // COMBINE_K_TILES_PER_HEAD
+                        _cb_d0 = (_cb_kt % COMBINE_K_TILES_PER_HEAD) * cta_tile_mnk[2] + _cb_c * COMBINE_CHUNK_ELEMS
+                        _cb_t64 = cutlass.Int64(_cb_t)
+                        _cb_o_addr = comb_o_base + (_cb_t64 * (combine_heads * combine_d_head) + _cb_h * combine_d_head + _cb_d0) * 4
+                        _cb_lse_addr = (
+                            comb_lse_base + ((_cb_t64 // combine_s_q) * (combine_heads * combine_s_q) + _cb_h * combine_s_q + (_cb_t64 % combine_s_q)) * 4
+                        )
+                        _cb_g_addr = comb_gate_base + (_cb_t64 * combine_gate_token_stride + _cb_h * combine_gate_head_stride + _cb_d0) * COMBINE_ELEM_BYTES
+                        _cb_w0, _cb_w1, _cb_w2, _cb_w3 = _combine_fold_task(_cb_o_addr, _cb_lse_addr, _cb_g_addr)
+                    _cb_words.append((_cb_w0, _cb_w1, _cb_w2, _cb_w3))
+                    _cb_meta.append((_cb_ok, _cb_kt_rel, _cb_t, _cb_c))
+                # phase B: the wave's k-tiles in ring order -- the TMA writer's protocol: wait empty, write, fence, warp sync, one arrive
+                _cb_wave_hi = cutlass.min(_cb_wave_lo + COMBINE_WAVE_K_TILES, _cb_n_kt)
+                for _cb_kt_cur in cutlass.range(_cb_wave_lo, _cb_wave_hi, 1, unroll=1):
+                    _cb_stage = comb_ab_iter % ab_stages
+                    if _cb_stage == 0 and comb_ab_iter != 0:
+                        comb_empty_phase = comb_empty_phase ^ 1
+                    while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(_cb_stage), comb_empty_phase, time_limit=10_000_000):
+                        pass
+                    for _j in cutlass.range_constexpr(COMBINE_TASKS_PER_THREAD):
+                        _cb_ok_j, _cb_kt_j, _cb_t_j, _cb_c_j = _cb_meta[_j]
+                        if _cb_ok_j & (_cb_kt_j == _cb_kt_cur):
+                            _st_shared_v4(
+                                smem_b_list[0].data_ptr(sB_elems * _cb_stage + _cb_t_j * cta_tile_mnk[2] + ((_cb_c_j ^ (_cb_t_j & 7)) * COMBINE_CHUNK_ELEMS)),
+                                [_cb_words[_j][0], _cb_words[_j][1], _cb_words[_j][2], _cb_words[_j][3]],
+                                cutlass.Int32,
+                            )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    nvvm.bar_warp_sync(0xFFFFFFFF)
+                    if elect_one:
+                        nvvm.mbarrier_arrive(ab_full_mbar_ptr.subview(_cb_stage))
+                    comb_ab_iter += 1
+            # @@COMBINE_PROLOGUE_ONLY:END@@
             # @@EPILOGUE_DRAIN:BEGIN@@
             coord_n_c = tile_n * cgrp_tile_n_cur + n_rank * pair_n_size
             if cutlass.const_expr(epi_dp22):
@@ -1246,6 +1523,11 @@ def _host(
     # @@SPLITK_ONLY:BEGIN@@
     splitk_partials: cute.Tensor,
     # @@SPLITK_ONLY:END@@
+    # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+    comb_o_partial: cute.Tensor,
+    comb_lse_partial: cute.Tensor,
+    comb_gate: cute.Tensor,
+    # @@COMBINE_PROLOGUE_ONLY:END@@
     stream: _cuda.CUstream,
 ) -> None:
     # @@INJECT_HOST_AB_LISTS@@
@@ -1371,6 +1653,11 @@ def _host(
         # @@SPLITK_ONLY:BEGIN@@
         splitk_partials,
         # @@SPLITK_ONLY:END@@
+        # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+        comb_o_partial,
+        comb_lse_partial,
+        comb_gate,
+        # @@COMBINE_PROLOGUE_ONLY:END@@
         # @@INJECT_HOST_REDUCTION_STRIDE_PASS@@
         # @@INJECT_HOST_AUX_PASS@@
         # @@TMA_STORE_ONLY:BEGIN@@
@@ -1506,6 +1793,15 @@ def compile() -> Callable:
     sym_partials_elems = cute.sym_int64()
     fake_splitk_partials = make_fake_tensor(cutlass.Float32, (sym_partials_elems,), stride=(1,), assumed_align=16)
     # @@SPLITK_ONLY:END@@
+    # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+    # the combine prologue's operands, flat 16-byte-aligned spans: the fp32 partial O slab, the fp32 partial LSE slab, the gate (ab_dtype)
+    sym_comb_o_elems = cute.sym_int64()
+    fake_comb_o_partial = make_fake_tensor(cutlass.Float32, (sym_comb_o_elems,), stride=(1,), assumed_align=16)
+    sym_comb_lse_elems = cute.sym_int64()
+    fake_comb_lse_partial = make_fake_tensor(cutlass.Float32, (sym_comb_lse_elems,), stride=(1,), assumed_align=16)
+    sym_comb_gate_elems = cute.sym_int64()
+    fake_comb_gate = make_fake_tensor(ab_dtype, (sym_comb_gate_elems,), stride=(1,), assumed_align=16)
+    # @@COMBINE_PROLOGUE_ONLY:END@@
     _fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
     return _compile_cached(
         _host,
@@ -1519,6 +1815,11 @@ def compile() -> Callable:
         # @@SPLITK_ONLY:BEGIN@@
         fake_splitk_partials,
         # @@SPLITK_ONLY:END@@
+        # @@COMBINE_PROLOGUE_ONLY:BEGIN@@
+        fake_comb_o_partial,
+        fake_comb_lse_partial,
+        fake_comb_gate,
+        # @@COMBINE_PROLOGUE_ONLY:END@@
         stream=_fake_stream,
         options=frost_compile_options,
         # persistent object across processes (cudnn.frost.compiled_cache); the digest of THIS source is the key
