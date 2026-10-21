@@ -1046,12 +1046,14 @@ _RUBIN_SMS = 212
     ],
 )
 def test_small_m_route_names_a_swap_ab_tile_for_decode_row_counts(m, n, k, expect):
-    """The route is a pure function of the shape and the SM count: the token tile is the power of two >= T, the weight
-    tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar, and the weight
-    tile it names divides N (no partial weight tile on any row -- the 128-row tiles of the band slab included)."""
+    """The route is a pure function of the shape and the SM count (and, for the split's FORM, the cluster capacity: this table is read
+    with NO cluster admitted -- the two-kernel split's names, what a part whose table admits no K cluster runs; the K-cluster rows are
+    pinned by ``test_small_m_route_names_the_k_cluster_split_where_the_cluster_capacity_admits_it``): the token tile is the power of
+    two >= T, the weight tile and the slice count follow the weight's width.  Every name it spells resolves in the catalog grammar, and
+    the weight tile it names divides N (no partial weight tile on any row -- the 128-row tiles of the band slab included)."""
     from cudnn.gemm.frost.tile_config import by_name
 
-    name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    name = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity={})
     assert name == expect
     cfg = by_name(name)
     assert cfg.swap_ab == name.endswith("_swapAB")
