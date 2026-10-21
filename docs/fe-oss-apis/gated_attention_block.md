@@ -687,6 +687,7 @@ blk = GatedAttentionBlockFwd(
     index_state_slot_mapping_present=False,   # that step: execute(index_state_slot_mapping=) names the ring's write rows (block x cap + pos % cap, -1 dead; slot_mapping's dtype) instead of the rows the kernels derive from the ring table
     index_commit_present=False,  # that step: a per-sequence commit count at execute (a follow-up: True is a typed NotImplementedError)
     rope_position_tables_only=False,   # that step under fuse_prepare=True: cos / sin REFUSED at execute; the fused launch rotates Q / K and the indexer queries from cos_pos / sin_pos at the device-derived position (the unfused twin with it is a typed decline)
+    proj_tile_configs=None,      # performance-only: a catalog tile config name pinned per dense projection GEMM ({"proj": ..., "out_proj": ...}); None = the small-M route / the forced tile -- "Serving: the decode form" (the out projection's K-cluster split-K)
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -1067,7 +1068,8 @@ the small-M projection route's bound) a `fuse_norm_rope=True` declaration LOWERS
 (the V band rides the launch, the pools bitwise the separate write) at `B x S_q < 128` rows or at `S_q = 1` (measured to B 128; past it
 the rule is reachable only under an explicit `fuse_norm_rope=False`, the C0 lowering handing rows > 128 to the fused fork), the separate
 cache-write launch at `B x S_q >= 128` with `S_q > 1` and wherever an explicit `fuse_cache_write=False` asks for it by name (the request
-outranks the AUTO fold) -- six launches with the split combine (seven with the separate write) instead of
+outranks the AUTO fold) -- six launches with the split combine (seven with the separate write; one fewer wherever the out projection runs the
+K-cluster split-K) instead of
 the 256-wide fused fork, which pads the step's handful of rows to one token tile and streams the slab weight from a quarter of the SMs (the
 measured B 1 .. 32 decode step is faster on the unfused chain). The write-through rule is the measurement on a 212-SM cc 10.7 part: the arm
 wins on every B 1 .. 4 cell (+1.1 .. +3.2 % per step on the plain chain, +2.4 .. +4.9 % with PDL on) and at B 32 / 128 x `S_q = 1`, and
@@ -1087,8 +1089,9 @@ run `fuse_norm_rope` as declared.
 chain anywhere, `True` the switched chain where it is served): the norm + RoPE pass, the separate cache write, the separate gate, the
 decode tile and its split combine launch with the programmatic-stream-serialization attribute and carry their `griddepcontrol` pair (a
 wait before the first read of a predecessor's output, a release after the prologue), bitwise the plain chain eagerly and under capture;
-the FROST GEMM stages -- the slab GEMM, the out projection and its split-K reducer -- launch with the attribute whatever the switch says
-(their templates' own constant), so a `use_pdl=False` chain still holds three programmatic launches. `blk.use_pdl` is the resolved switch,
+the FROST GEMM stages -- the slab GEMM, the out projection and, where the two-kernel split-K runs it, its split-K reducer -- launch with the
+attribute whatever the switch says (their templates' own constant), so a `use_pdl=False` chain still holds two or three programmatic
+launches. `blk.use_pdl` is the resolved switch,
 `blk.use_pdl_requested` the declaration (`None` = auto), `blk.pdl_stages` / `blk.use_pdl_effective` count the switched stages only, and
 `serving_envelope().decode.pdl_default` says what auto resolves to on a part before anything is declared (`False` wherever the form is not
 served -- another part, an unserved dtype -- and under the block-sparse mode; the per-step reading is `decode.pdl_default and
@@ -1096,6 +1099,19 @@ decode.route(s_q, batch).pdl_capable`, a prefill-route step launching plain). Me
 part: 1.1-1.5 us per decode step at B 1 (B 1 x KV 4K +5.0 %, 32K +4.0 %, 128K +2.5 %; +2.8 % geomean over the B 1 .. 4 cells), flat within
 the control pair where the tile dominates; with the write-through folded in, B 1 x KV 4K 32.3 -> 29.3 us (+10.2 %) against the plain
 seven-launch chain. The fused kernel the stage runs is a declaration fact:
+
+**The out projection's split-K reduces inside one thread-block cluster** (the small-M route's narrow-weight branch: N `d_model` x K `h_q * D`
+at `T = B x S_q <= 128` rows). The split-K slice count is the one-wave count as before (8 at the 24/2 shard's 20 x 128-row weight tiles); its
+FORM follows the part's cluster capacity, the route's second device fact beside the SM count (`cudnn.frost.occupancy`): where every slice CTA
+of every tile is co-resident (`max_active_clusters(S) >= the tile count`, `S <= 8`, `S` dividing the 128 rows), the split is the K-CLUSTER form
+`CONFIG_sm100_128x{tn}x128_..._cluster1x1x{S}_1ctamma_splitK{S}_swapAB` -- the S slices of one tile are one cluster, the fp32 planes are exchanged
+through distributed shared memory and each CTA sums its rows in the two-kernel reducer's FIXED order, so the GEMM is ONE launch (the kernel
+symbol carries `_kcluster`), no reducer launch, no fp32 partials in the workspace and `out` BITWISE the two-kernel form's; past 64 tokens that
+split replaces the plain `64x32` tile. Elsewhere (a part whose table admits fewer clusters, a slice count that does not divide the tile's
+rows -- the 32/2 shard's `splitK6` --, a shallow K) the two-kernel split runs as before. The chain's launch census is therefore one shorter on
+such a part (the decode step's seven / eight launches read six / seven), `blk._out_proj` names the form through its plan, and
+`proj_tile_configs={"out_proj": <today's splitK name>}` pins the two-kernel form -- the A/B arm (bitwise) and an escape hatch. The slab GEMM is
+unchanged: its 109-tile launch sits at the ceiling of any uniform tile on a 212-SM part.
 
 The route is TABLE-DRIVEN (the default policy, `decode_route_policy="single_unit"`): ONE ordered table of the Rubin decode tile's
 single-unit widths, `config_sm107.D256_DECODE_SINGLE_UNIT_Q_TILES = (16, 32, 64)` (the 64-column tile landed 2026-10-15: four
@@ -1187,6 +1203,7 @@ under every value, measured or not -- so a replaying stack whose optimum differs
 | `decode_q_tile_max` (declaration) | `None` (= the whole table `(16, 32, 64)`) or a width of it (`32` = the route before the 64-column tile landed) | the width cap on the decode tile's single-unit table: a performance-only knob, the same function under every width; `DecodeRoute.q_tile_max` reads it back and the compiled width is pinned against the route at `compile()`; a cap held below the width an unpacked step needs is a typed decline naming it |
 | `use_pdl` (declaration) | `None` (default = auto: `True` on the DECODE form's decode-tile routes for the bf16 / f16 block on the parts of `DECODE_PDL_DEFAULT_CCS` -- cc 10.7, the measured part --, `False` everywhere else), `True` or `False` (explicit, honoured on every part) | programmatic dependent launch over the chain: a performance-only knob (bitwise the plain chain, eagerly and under capture), bf16 / f16 only (an explicit `True` is a typed decline with `quant`, the e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`) or a `QsaSpec`; auto reads `False` there and never `True` where the explicit `True` is refused -- pools in the activation dtype, `kv_cache_dtype=None` or that dtype, are the bf16 / f16 block). PER STAGE: the norm + RoPE pass, the separate cache write, the separate sigmoid gate and the decode tile with its split combine take it; the paged prefill tile of the prefill route carries no sites and launches plain (the link serializes, correct by PDL's semantics), so auto stays `False` on that route; the FROST GEMM stages launch with the attribute regardless. `blk.use_pdl` is the resolved switch, `blk.use_pdl_requested` the declaration, `blk.pdl_stages` / `blk.use_pdl_effective` read back what launched with the attribute, `DecodeRoute.pdl_capable` says it per route, `serving_envelope().decode.pdl_stages` / `.pdl_default` (the latter for a served dense form; the per-step reading is `decode.pdl_default and decode.route(s_q, batch).pdl_capable`) and `.extend.pdl_stages` per form |
 | `fuse_cache_write_small_m` (declaration) | `None` (default = auto: the paged write-through folded into the norm + RoPE launch at `B x S_q < CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128` rows or at `S_q = 1`, the separate launch at 128+ rows with `S_q > 1` -- the measured rule -- and under an explicit `fuse_cache_write=False`, the separate launch asked for by name), `True` (folded in; a typed decline where the arm is not served; the strongest request, followed beside `fuse_cache_write=False` too) or `False` (the separate launch) | where the paged write-through runs on the DECODE form's UNFUSED chain (the lowered `fuse_norm_rope=True` declaration or `fuse_norm_rope=False`): bf16 / f16, no `quant`, no indexer band, 16-bit pools, the TMA norm + RoPE kernel; a performance-only knob (the pools and the slab bitwise either way, one launch fewer); `blk.cache_write_in_norm_rope` reads back what runs, the stage list loses `"cache_write"` under the arm |
+| `proj_tile_configs` (declaration) | `None` / `{}` (default: the driver's route for both projections) or a mapping of `"proj"` (the slab GEMM of the unfused chain) / `"out_proj"` (stage (6)) to catalog tile config names (`cudnn.gemm.frost.tile_config.by_name` spells them; an unknown spelling is a typed `ValueError` at declaration, a name the compiler refuses for the shape its typed `NotImplementedError` at `compile()`) | a performance-only pin: the same function under every value (the K-cluster split-K `cluster1x1x{S}` and the two-kernel `splitK{S}` of one slice count are BITWISE: one fixed-order sum); bf16 / f16 projections only; `"proj"` refused where the fused norm + RoPE fork runs; `blk.proj_tile_configs` reads it back, the stage's plan names what runs |
 | `block_table` (execute) | `[B, max_pages]` int32 at the declared strides; `0` = the NULL block of a padded entry | REQUIRED; page ids are device data |
 | `kv_lens` (execute) | `[B]` int32 contiguous: the LOGICAL KV length of every sequence INCLUDING the step's tokens; `0` = a padded entry | REQUIRED; bound to the SDPA's KV side ONLY (`seq_kv_lens = kv_lens`, `seq_q_lens = None`: every Q row of the step is live) |
 | `seq_lens` (execute) | -- | REFUSED under `kv_source="paged"` (the dense block's self-attention length is a Q-side length; the KV length is `kv_lens`) |
@@ -1269,7 +1286,8 @@ the per-row list.  A row at a negative position (`kv_lens[b] < S_q`) and a dead 
 nothing, score nothing (`counts 0`, every slot `-1`, `out = 0`, `LSE = -inf`).  Launches: under `fuse_prepare=True` the prepare
 launch (`frost_qsa_prepare`) carries the norm + RoPE, the K / V write-through, the indexer-query norm and the ring / compress arm,
 and the stage adds the scorer and the top-k -- eight kernels on the whole step with a split (the slab, the prepare, the scorer, the
-top-k, the sparse tile, the combine, the out projection and its split-K reducer); under `False` the norm + RoPE pass, the pool-1
+top-k, the sparse tile, the combine, the out projection and its split-K reducer -- one fewer where the out projection runs the K-cluster
+split-K, "Serving: the decode form"); under `False` the norm + RoPE pass, the pool-1
 query compress, the step compress (`frost_qsa_compress_step`) and the K / V write-through run as their own launches -- eleven;
 `None` is the MEASURED default (`serving_envelope(...).decode.fuse_prepare_default`: True on cc 10.7 -- the 2026-10-21 end-to-end
 gate on an exclusive 212-SM part measured the fused step +9.6 .. +14.5 % faster at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells,

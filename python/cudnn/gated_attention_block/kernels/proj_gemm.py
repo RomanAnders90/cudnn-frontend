@@ -143,7 +143,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import logging
 import os
-from typing import Any, Optional
+import re
+from typing import Any, Mapping, Optional
 
 import torch
 
@@ -1301,6 +1302,14 @@ def _forced_tile_config(n: int) -> Optional[str]:
 # 128-row weight tiles with the split-K slice count that fills one wave (capped at 8, every slice at least eight K tiles) up to
 # 64 tokens and the plain 64x32 tile past it while that grid fits one wave -- a shallow K (fewer than 64 K tiles) takes the
 # 64-row swap-AB tile instead of any split; a weight whose 64-row tiles fit one wave takes
+#
+# The split's FORM is the second device fact the rule reads, ``cluster_capacity`` (beside ``sm_count``): where the target runs
+# every slice CTA of every tile at once -- ``max_active_clusters(S) >= the 128-row tile count``, S <= 8, S dividing the 128
+# rows -- the split is the K-CLUSTER form (``cluster1x1x{S}_..._splitK{S}``: the S slices of a tile are one cluster and reduce
+# through distributed shared memory inside the GEMM kernel, no reducer launch, ``out`` bitwise the two-kernel reducer's), else
+# the two-kernel form as before; past 64 tokens the K-cluster split is preferred over the plain 64x32 tile wherever it is
+# admitted (the split GEMM alone streams the weight from 160 SMs; the plain tile from 80).  The capacity is the part's
+# ``cudnn.frost.occupancy`` table (a GPC-geometry fact, like the SM count); the tests pass one.
 # them (in a 2x1 cluster on a full machine) up to 64 tokens and the plain 128x64 tile past it; a weight whose 64-row tiles
 # overflow a wave takes 128-row weight tiles (one wave).  Dense bf16 / f16, K-major A and B, no epilogue -- the forward's two
 # projections; everything else keeps today's resolution.  N is a multiple of 256 (the forced tile's grid) on every branch but
@@ -1314,6 +1323,40 @@ _SMALL_M_SPLIT_K_MAX = 8
 _SMALL_M_CTA_K_ELEMS = 64  # the catalog's 128-byte K tile at 2 bytes per element
 _SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 bytes): below it the reducer costs more than it buys
 _SMALL_M_MIN_K_TILES_PER_SLICE = 8
+_SMALL_M_K_CLUSTER_MAX = 8  # the K-cluster split's slice cap: the portable cluster size (the compiler's own bound)
+_SMALL_M_K_CLUSTER_TILE_ROWS = 128  # the weight tile the K-cluster form splits into S equal owner slices
+
+
+def device_cluster_capacity(device=None) -> dict:
+    """``{cluster size: co-resident clusters}`` of the active device (``cudnn.frost.occupancy.occupancy_map``), the route's
+    second device fact; ``{}`` when no CUDA device is visible (a CPU-only replay admits no K cluster) or the probe cannot
+    answer.  Read through FROST's device layer so it follows a ``build_device()`` scope like ``sm_count``."""
+    try:
+        from cudnn.frost.device import is_available
+        from cudnn.frost.occupancy import occupancy_map
+
+        if not is_available():
+            return {}
+        return {i + 1: int(c) for i, c in enumerate(occupancy_map(device))}
+    except Exception:  # noqa: BLE001 -- a probe that cannot answer is "no cluster fits", never a failed plan
+        return {}
+
+
+def _k_cluster_fits(tiles: int, slices: int, cluster_capacity: Mapping[int, int]) -> bool:
+    """Whether the K-cluster split of ``slices`` is admitted for ``tiles`` 128-row weight tiles: every slice CTA of every tile
+    co-resident (ONE tile per CTA: the form's exchange planes alias the drained operand rings), the slice count within the
+    portable cluster size and dividing the 128 rows into equal owner slices -- the compiler's own admission, read here so the
+    route names a form the compile admits (a mismatch would be the compile's typed decline, never a silent route change)."""
+    return 2 <= slices <= _SMALL_M_K_CLUSTER_MAX and _SMALL_M_K_CLUSTER_TILE_ROWS % slices == 0 and tiles <= int(cluster_capacity.get(slices, 0) or 0)
+
+
+def launches_of_tile_config(name: Optional[str]) -> int:
+    """The kernel launches a resolved small-M tile costs per execute: 2 for the two-kernel split-K (the GEMM + its reducer), 1
+    for every other form -- the K-cluster split included (``cluster1x1x{S}``: the reduce is inside the GEMM).  ``None`` (the
+    graph route) reads 1: the backend's plan is one kernel for the shapes the block declares."""
+    if name is None or "splitK" not in name:
+        return 1
+    return 1 if re.search(r"_cluster\d+x\d+x\d+", name) else 2
 
 
 def small_m_tile_config(
@@ -1327,12 +1370,16 @@ def small_m_tile_config(
     block_scale: bool = False,
     alpha: bool = False,
     sm_count: Optional[int] = None,
+    cluster_capacity: Optional[Mapping[int, int]] = None,
 ) -> Optional[str]:
     """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
     apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
     operand, an extent the TMA 16-byte rule refuses, an N off the route's tile grids: 256 must divide N, or 128 where the 64-row
     tiles overflow a wave -- the indexer band's 13952-column slab).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
-    to the same name on every part of one SM-count class, so a recorded plan name replays."""
+    to the same name on every part of one SM-count class, so a recorded plan name replays.  ``cluster_capacity`` (appended) is
+    the target's ``{cluster size: co-resident clusters}`` table (the active device's when None; ``{}`` admits no K cluster): the
+    second device fact, deciding whether a split is the K-cluster form or the two-kernel form -- so a recorded name replays on
+    the same part class (SM count AND cluster capacity), and a table makes the rule a pure function on any host."""
     if m <= 0 or n <= 0 or k <= 0:
         # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
         # ``k`` at 0 would still spell a tile): the route declines and ``build_proj_gemm``'s own extent check names the extent
@@ -1356,6 +1403,8 @@ def small_m_tile_config(
         from cudnn.gemm.frost.tile_config import _sm_count
 
         sm_count = _sm_count()
+    if cluster_capacity is None:
+        cluster_capacity = device_cluster_capacity()
     tn = 8
     while tn < m:
         tn *= 2
@@ -1378,6 +1427,12 @@ def small_m_tile_config(
         slices = (
             max(1, min(_SMALL_M_SPLIT_K_MAX, sm_count // ctas_128, k_tiles // _SMALL_M_MIN_K_TILES_PER_SLICE)) if k_tiles >= _SMALL_M_SPLIT_K_MIN_K_TILES else 1
         )
+        # The split's form: the K-cluster split wherever the target co-schedules every slice CTA of every tile (the reduce
+        # inside the GEMM kernel, no reducer launch), else the two-kernel split; past 64 tokens the K-cluster split is
+        # preferred over the plain 64x32 tile (the plain tile streams the weight from half the SMs the split uses).
+        k_cluster = slices > 1 and _k_cluster_fits(ctas_128, slices, cluster_capacity)
+        if k_cluster:
+            return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1x{slices}_1ctamma_splitK{slices}_swapAB"
         if m > 64 and (slices == 1 or -(-m // 64) * -(-n // 32) <= sm_count):
             return "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
         if slices > 1:

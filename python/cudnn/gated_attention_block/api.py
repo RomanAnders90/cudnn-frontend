@@ -316,7 +316,7 @@ from abc import ABC, abstractmethod
 import dataclasses
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Callable, Dict, NamedTuple, Optional, Tuple, Union
+from typing import Callable, Dict, Mapping, NamedTuple, Optional, Tuple, Union
 
 import torch
 from cuda.bindings import driver as cuda
@@ -3048,12 +3048,17 @@ class _Projection(_Stage):
         w_dtype: Optional[torch.dtype] = None,
         block_size: int = MXFP8_BLOCK_SIZE,
         sf_dtype=None,
+        tile_config: Optional[str] = None,
     ) -> None:
         self.name = name
         self.m = int(m)
         self.k = int(k)
         self.n = int(n)
         self.dtype = dtype
+        # APPENDED (performance-only): a catalog tile name pinned for this stage (`GatedAttentionBlockFwd(proj_tile_configs=)`);
+        # None = the driver's "auto" resolution (the small-M route, the forced 256-wide tile, else the graph route).  A pinned
+        # name is a JIT tile by construction (never the graph route); a name the compiler refuses is its typed decline at compile().
+        self.tile_config: Optional[str] = tile_config
         # FP8: inputs e4m3, fp32 accumulate, `out_dtype` (bf16) out, and `alpha`
         # = descale_a * descale_w folded into the GEMM's scalar-multiply epilogue.
         self.out_dtype = out_dtype if out_dtype is not None else dtype
@@ -3112,6 +3117,8 @@ class _Projection(_Stage):
         sync): the SM count and the compiler family it reads are device properties."""
         from .kernels.proj_gemm import _auto_tile_name
 
+        if getattr(self, "tile_config", None) is not None:
+            return True  # a pinned catalog name IS a JIT tile (the forced-tile route by construction)
         return _auto_tile_name(self.m, self.n, self.k, dtype=self.dtype, a_major="k", b_major="k", block_scale=self.block_scale, alpha=self.alpha) is not None
 
     def compile(self) -> None:
@@ -3123,6 +3130,8 @@ class _Projection(_Stage):
             n=self.n,
             dtype=self.dtype,
             label=self.name,
+            # the pinned catalog name (proj_tile_configs), else the driver's own resolution
+            tile_config=self.tile_config if getattr(self, "tile_config", None) is not None else "auto",
             out_dtype=self.out_dtype,
             alpha=self.alpha,
             block_scale=self.block_scale,
@@ -8197,6 +8206,16 @@ class GatedAttentionBlockFwd(APIBase):
         index_state_slot_mapping_present: bool = False,
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
+        # APPENDED (performance-only): a catalog tile config name pinned per dense projection GEMM -- keys "proj" (the slab,
+        # stage (1) on its unfused chain) and "out_proj" (stage (6)), values catalog names (`cudnn.gemm.frost.tile_config.by_name`
+        # validates the spelling at declaration: an unknown one is a typed ValueError; a name the compiler refuses for the
+        # stage's shape is its typed NotImplementedError at compile()).  None / {} = the driver's own route for both.  The same
+        # function under every value (the GEMM suite's budget; the K-cluster split-K `cluster1x1x{S}` and the two-kernel
+        # `splitK{S}` of the same S are BITWISE: one fixed-order sum): the small-M route's A/B arm and an escape hatch -- pin
+        # today's two-kernel names to run the chain the K-cluster form replaces.  bf16 / f16 projections only (the quantized
+        # pipelines' GEMMs are their own validated tiles); "proj" needs the unfused slab (the fused norm + RoPE fork builds no
+        # catalog plan: a typed ValueError where `fuse_norm_rope_effective` is True).  `proj_tile_configs` reads it back.
+        proj_tile_configs: Optional[Mapping[str, str]] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -8497,6 +8516,8 @@ class GatedAttentionBlockFwd(APIBase):
         self.fuse_norm_rope_effective = self.fuse_norm_rope and not (
             lowering_applies and (self.fuse_norm_rope_small_m is False or (self.fuse_norm_rope_small_m is None and fuse_cache_write is not True))
         )
+        # The pinned projection tiles (performance-only, append-only): validated here, device-free, before any stage exists.
+        self.proj_tile_configs: Mapping[str, str] = self._check_proj_tile_configs(proj_tile_configs, quant)
         # The BLOCK-SPARSE decode / extend-with-prefix mode (a QsaSpec geometry over the pools; the packed form met the table's
         # `sparse` row above): stage (4) is the sparse core reading the pools, and the LIST FORM is a declaration fact --
         # `QsaSpec.index_list_form` as declared, or (None) derived from S_q under caller lists: ONE list per sequence at S_q <= the
@@ -8926,6 +8947,14 @@ class GatedAttentionBlockFwd(APIBase):
         # the driver's typed refusal at the first captured execute (the band's prefill / extend forms' documented limit); setting the
         # flag there would decline the whole block at compile.  Read off the resolver `build_proj_gemm` itself runs, never re-spelled,
         # so this predicate cannot drift from the route.
+        # The pinned projection tiles (proj_tile_configs; performance-only): set on the dense projection stages BEFORE the
+        # capture-safe predicate reads them (a pinned name is a JIT tile).  "proj" was refused above where the slab is the fused fork.
+        for key, st in (("proj", self._proj), ("out_proj", self._out_proj)):
+            name = self.proj_tile_configs.get(key)
+            if name is not None:
+                if not isinstance(st, _Projection):
+                    raise ValueError(f"proj_tile_configs[{key!r}]: the {key} stage of this declaration is not a catalog-tile GEMM")
+                st.tile_config = name
         if self.kv_source == KV_SOURCE_PAGED:
             for st in (self._proj, self._out_proj):
                 if isinstance(st, _Projection) and st.resolves_a_jit_tile():
@@ -9941,6 +9970,46 @@ class GatedAttentionBlockFwd(APIBase):
             )
 
     # -- the serving forms: the declaration table and the envelope ------------
+
+    _PROJ_TILE_CONFIG_KEYS = ("proj", "out_proj")
+
+    def _check_proj_tile_configs(self, proj_tile_configs, quant) -> Mapping[str, str]:
+        """``proj_tile_configs`` as declared: a mapping of ``"proj"`` / ``"out_proj"`` to catalog tile names (``tile_config.by_name``
+        spells them; an unknown spelling is a typed ValueError naming the grammar), bf16 / f16 projections only, ``"proj"`` only
+        where the slab runs the unfused chain.  ``None`` / ``{}`` = no pin."""
+        if proj_tile_configs is None:
+            return {}
+        if not isinstance(proj_tile_configs, Mapping):
+            raise TypeError(
+                f"proj_tile_configs must be a mapping of {{'proj' | 'out_proj': <catalog tile name>}} or None, got {type(proj_tile_configs).__name__}"
+            )
+        bad = [k for k in proj_tile_configs if k not in self._PROJ_TILE_CONFIG_KEYS]
+        if bad:
+            raise ValueError(f"proj_tile_configs: unknown projection key(s) {bad}; the dense projections are {list(self._PROJ_TILE_CONFIG_KEYS)}")
+        if not proj_tile_configs:
+            return {}
+        if quant is not None:
+            raise ValueError(
+                "proj_tile_configs pins catalog tiles for the bf16 / f16 projection GEMMs; a quantized pipeline (quant=...) runs its own validated tiles"
+            )
+        from cudnn.gemm.frost.tile_config import by_name
+
+        out = {}
+        for key, name in proj_tile_configs.items():
+            if not isinstance(name, str):
+                raise TypeError(f"proj_tile_configs[{key!r}] must be a catalog tile name (str), got {type(name).__name__}")
+            try:
+                by_name(name)
+            except (KeyError, NotImplementedError, ValueError) as exc:
+                # an unknown spelling (KeyError), or a spelling the grammar reads but the geometry refuses (its own typed reason)
+                raise ValueError(f"proj_tile_configs[{key!r}]={name!r} is not a catalog tile config name: {exc}") from None
+            if key == "proj" and self.fuse_norm_rope_effective:
+                raise ValueError(
+                    "proj_tile_configs['proj'] pins the slab GEMM of the UNFUSED chain, but this declaration runs the fused norm + RoPE "
+                    "projection (fuse_norm_rope_effective=True): declare fuse_norm_rope=False (or the small-M lowering) to pin the slab's tile"
+                )
+            out[key] = name
+        return dict(out)
 
     def _check_serving_declaration(
         self,

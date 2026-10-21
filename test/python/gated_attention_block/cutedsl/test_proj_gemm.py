@@ -1177,3 +1177,406 @@ def test_small_m_plans_run_the_named_tile_and_match_torch_linear(m, shape):
     cos = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item()
     assert cos > 0.999, f"cos {cos}"
     assert torch.isfinite(out.float()).all()
+
+
+# ---------------------------------------------------------------------------
+# The K-CLUSTER split-K of the small-M route: the out projection's split reduced inside one cluster (no reducer launch)
+# ---------------------------------------------------------------------------
+
+from cudnn.gated_attention_block.kernels.proj_gemm import launches_of_tile_config  # noqa: E402
+
+# The cluster capacities (``cudnn.frost.occupancy``: co-resident clusters per cluster size) the route reads as its second device
+# fact; the 204-SM development part's measured table admits exactly 20 clusters of 8 -- the out projection's 20 x 128-row tiles.
+_CAP_204 = {1: 204, 2: 102, 3: 56, 4: 42, 5: 30, 6: 28, 7: 20, 8: 20}
+_CAP_212_ADMITS = {8: 20, 4: 42, 6: 28, 2: 106}  # a 212-SM part whose table admits the S 8 form (read at the perf node's bring-up)
+_CAP_212_SHORT = {8: 19, 4: 42, 6: 28, 2: 106}  # one cluster short: the form is not admitted, the two-kernel split stays
+_OUT = (_FLASH_NEXT_24_2["d_model"], _FLASH_NEXT_24_2["k_o"])  # the 24/2 out projection: N 2560 x K 6144 = 20 tiles x 96 K tiles
+
+
+def _k_cluster_name(tn, s=8):
+    return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1x{s}_1ctamma_splitK{s}_swapAB"
+
+
+def _two_kernel_name(tn, s=8):
+    return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1_1ctamma_splitK{s}_swapAB"
+
+
+@pytest.mark.parametrize(
+    "m, expect_admitted",
+    [
+        (1, _k_cluster_name(8)),
+        (4, _k_cluster_name(8)),
+        (16, _k_cluster_name(16)),
+        (32, _k_cluster_name(32)),
+        (64, _k_cluster_name(64)),
+        (128, _k_cluster_name(128)),
+    ],
+)
+def test_small_m_route_names_the_k_cluster_split_where_the_cluster_capacity_admits_it(m, expect_admitted):
+    """The NARROW out projection: the split-K slice count is the one-wave count as before (8 at 20 tiles), and its FORM follows the
+    target's cluster capacity -- the K-cluster form (``cluster1x1x8``: the reduce inside the GEMM, one launch) where 20 clusters of 8 are
+    co-resident, the two-kernel form where they are not (19).  Past 64 tokens the K-cluster split replaces the plain ``64x32`` tile."""
+    n, k = _OUT
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_ADMITS) == expect_admitted
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=204, cluster_capacity=_CAP_204) == expect_admitted
+    short = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_SHORT)
+    assert short == ("CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma" if m > 64 else _two_kernel_name(min(128, 8 if m <= 8 else m)))
+    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity={}) == short  # no table: no K cluster
+    from cudnn.gemm.frost.tile_config import by_name
+
+    cfg = by_name(expect_admitted)
+    assert cfg.cga_size_k == cfg.split_k_slices == 8 and cfg.cluster_shape == (1, 1, 8) and n % cfg.cta_tile_m == 0
+    assert launches_of_tile_config(expect_admitted) == 1 and launches_of_tile_config(short) == (1 if m > 64 else 2)
+
+
+def test_small_m_route_keeps_every_other_row_whatever_the_cluster_capacity():
+    """The slab rows (no split), the shallow-K out projection (no split), the 32/2 out projection (``splitK6``: 6 does not divide the
+    128-row tile into equal owner slices, so the K-cluster form is never named for it, whatever the table says) are unchanged."""
+    kw = dict(dtype=torch.bfloat16, sm_count=_RUBIN_SMS)
+    for cap in ({}, _CAP_212_ADMITS, {6: 32, 8: 32}):
+        for m, n, k in ((1, _FLASH_NEXT_24_2["n_qkvg"], _FLASH_NEXT_24_2["d_model"]), (128, _FLASH_NEXT_24_2["n_qkvg"] + 640, _FLASH_NEXT_24_2["d_model"])):
+            assert small_m_tile_config(m, n, k, cluster_capacity=cap, **kw) == small_m_tile_config(m, n, k, **kw, cluster_capacity={})
+            assert "splitK" not in small_m_tile_config(m, n, k, cluster_capacity=cap, **kw)
+        assert small_m_tile_config(1, 4096, 8 * 256, cluster_capacity=cap, **kw) == "CONFIG_sm100_64x8x128_64x8x32_cluster1x1_1ctamma_swapAB"
+        assert small_m_tile_config(1, 4096, 32 * 256, cluster_capacity=cap, **kw) == "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK6_swapAB"
+        assert small_m_tile_config(128, 4096, 32 * 256, cluster_capacity=cap, **kw) == "CONFIG_sm100_128x128x128_128x128x32_cluster1x1_1ctamma_splitK6_swapAB"
+
+
+def test_small_m_route_reads_the_device_cluster_capacity_by_default(monkeypatch):
+    """``cluster_capacity=None`` reads the device's table through one module function (a device fact like ``sm_count``); ``{}`` on a
+    host without a CUDA device admits no K cluster, so the CPU-only replay of a recorded name stays a pure function of its arguments."""
+    from cudnn.gated_attention_block.kernels import proj_gemm as pg
+
+    n, k = _OUT
+    monkeypatch.setattr(pg, "device_cluster_capacity", lambda device=None: dict(_CAP_212_ADMITS))
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _k_cluster_name(8)
+    monkeypatch.setattr(pg, "device_cluster_capacity", lambda device=None: {})
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _two_kernel_name(8)
+    if not torch.cuda.is_available():
+        assert pg.device_cluster_capacity() == {}
+
+
+def test_launches_of_tile_config_counts_the_reducer_launch():
+    assert launches_of_tile_config(None) == 1
+    assert launches_of_tile_config("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB") == 1
+    assert launches_of_tile_config(_two_kernel_name(8)) == 2
+    assert launches_of_tile_config("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK6_swapAB") == 2
+    assert launches_of_tile_config(_k_cluster_name(8)) == 1
+    assert launches_of_tile_config("CONFIG_sm100_64x8x128_64x8x32_cluster1x1x4_1ctamma_splitK4_swapAB") == 1
+
+
+def _reducer_order_emulation(vals, slices):
+    """An INDEPENDENT spelling of the two-kernel reducer's association (``_splitk_reduce_kernel``): lane group ``g`` folds its slices
+    left to right (a zero last where it has no tail slice), then the shuffle tree folds group ``g + d`` into ``g``."""
+    import numpy as np
+
+    from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_reduce_slice_groups
+
+    groups = splitk_reduce_slice_groups(slices)
+    rounds, tail = slices // groups, slices - (slices // groups) * groups
+    lane = []
+    for g in range(groups):
+        acc = vals[g].copy()
+        for i in range(1, rounds):
+            acc = acc + vals[g + i * groups]
+        if tail:
+            acc = acc + (vals[rounds * groups + g] if g < tail else np.zeros_like(acc))
+        lane.append(acc)
+    d = groups // 2
+    while d >= 1:
+        lane = [lane[g] + lane[g + d] for g in range(d)] + lane[d:]
+        d //= 2
+    return lane[0]
+
+
+@pytest.mark.parametrize("slices", list(range(2, 13)))
+def test_the_fixed_order_sum_is_the_reducers_association(slices):
+    """``splitk_fixed_order_sum`` (the K-cluster kernel's in-SMEM sum) adds the S planes in EXACTLY the two-kernel reducer's association --
+    the bitwise claim between the two forms -- on fp32 values whose magnitudes make the order visible (a plain left-to-right sum differs
+    from it in some ulp for S >= 5, where the reducer has two lane groups)."""
+    import numpy as np
+
+    from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_fixed_order_sum
+
+    rng = np.random.default_rng(slices)
+    vals = [(rng.standard_normal(4096) * 10.0 ** rng.integers(-3, 4, 4096)).astype(np.float32) for _ in range(slices)]
+    got = splitk_fixed_order_sum(vals, slices, zero=np.zeros(4096, np.float32))
+    assert got.dtype == np.float32 and np.array_equal(got.view(np.uint32), _reducer_order_emulation(vals, slices).view(np.uint32))
+    naive = vals[0]
+    for v in vals[1:]:
+        naive = naive + v
+    if slices >= 5:
+        assert not np.array_equal(got.view(np.uint32), naive.view(np.uint32)), "the order is invisible on this data: strengthen the magnitudes"
+    with pytest.raises(ValueError, match="values for split_k_slices"):
+        splitk_fixed_order_sum(vals[:-1], slices)
+    if slices % 2 and slices > 4:
+        with pytest.raises(ValueError, match="without a tail slice"):
+            splitk_fixed_order_sum(vals, slices)
+
+
+def _oproj_graph(m, k, n):
+    import cudnn
+
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.BFLOAT16, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1])
+    b = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k])
+    c = g.matmul(A=a, B=b, name="oproj")
+    c.set_output(True).set_data_type(cudnn.data_type.BFLOAT16)
+    g.validate()
+    g.build_operation_graph()
+    return g
+
+
+_RUBIN_BUDGET = 334848  # max(opt-in 227 KiB, the oversized 327 KiB carveout) on cc 10.7
+_SM100_BUDGET = 227 * 1024
+
+
+def _pin_render(monkeypatch, *, arch=107, budget=_RUBIN_BUDGET, capacity=None):
+    """Render for the Rubin part whatever GPU (if any) this host has: the arch, the SMEM budget, the L2 budget and the K-cluster
+    capacity table are pinned (the sm107 layout test's recipe)."""
+    import cudnn.gemm.frost  # noqa: F401
+    from cudnn.gemm.frost import arch_family as AF
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost import tile_config as TC
+    from cudnn.gemm.frost.sm100 import compiler as C100
+
+    monkeypatch.setattr(AF, "current_arch", lambda device=None: arch)
+    monkeypatch.setattr(C, "_current_arch", lambda device=None: arch)
+    monkeypatch.setattr(C100, "_current_arch", lambda device=None: arch)
+    monkeypatch.setattr(TC, "_sm_smem_budget_bytes", lambda device=None: budget)
+    monkeypatch.setattr(TC, "_sm_smem_budget_bytes_of", lambda device: budget)
+    monkeypatch.setattr(TC, "l2_swizzle_budget_bytes", lambda device=None: 42 << 20)
+    table = dict(_CAP_212_ADMITS if capacity is None else capacity)
+    monkeypatch.setattr(C100, "_k_cluster_capacity", lambda s, device=None: int(table.get(s, 0)))
+    return C100
+
+
+@pytest.mark.parametrize(
+    "name, shape, match",
+    [
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster2x1x8_1ctamma_splitK8_swapAB", (1, 6144, 2560), "needs a 1x1 cluster along M x N"),
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1x16_1ctamma_splitK16_swapAB", (1, 6144, 2560), "at most 8 slices"),
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1x6_1ctamma_splitK6_swapAB", (1, 6144, 2560), "6 does not divide 128"),
+        ("CONFIG_sm100_256x8x128_128x8x32_cluster1x1x8_1ctamma_splitK8_swapAB", (1, 6144, 2560), "ONE MMA-M block per tile"),
+        (_k_cluster_name(8), (1, 448, 2560), "every slice owns at least one CTA K tile"),
+    ],
+    ids=["cluster_mn", "sixteen_slices", "six_of_128_rows", "two_mma_m_blocks", "shallow_k"],
+)
+def test_the_k_cluster_split_declines_typed_by_name(monkeypatch, name, shape, match):
+    """The compiler's admission of the K-cluster form: every rule a typed ``NotImplementedError`` naming itself, before any arch gate."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    C100 = _pin_render(monkeypatch)
+    m, k, n = shape
+    with pytest.raises(NotImplementedError, match=match):
+        C100._analyze_for_config(_oproj_graph(m, k, n), by_name(name))
+
+
+def test_the_k_cluster_split_declines_more_tiles_than_co_resident_clusters_and_an_exchange_past_the_ring(monkeypatch):
+    """ONE tile per CTA is an ADMISSION rule (the exchange planes alias the drained rings), typed: 20 tiles on a part running 19
+    clusters of 8 decline; and a plane larger than a drained ring (the 256-wide token tile on the 227 KiB budget) declines by its bytes."""
+    from cudnn.gemm.frost.tile_config import by_name
+
+    C100 = _pin_render(monkeypatch, capacity=_CAP_212_SHORT)
+    with pytest.raises(NotImplementedError, match=r"20 output tile\(s\) x 8 slices must be co-resident: the target runs 19 cluster\(s\) of 8"):
+        C100._analyze_for_config(_oproj_graph(1, 6144, 2560), by_name(_k_cluster_name(8)))
+    for budget in (_SM100_BUDGET, _RUBIN_BUDGET):
+        C100 = _pin_render(monkeypatch, budget=budget, capacity={8: 64})
+        # a 256-wide token plane (128 x 1040 B) is wider than the A ring at 6 stages on either budget: declined by its bytes
+        with pytest.raises(NotImplementedError, match=r"the exchange plane \(133120 B: 128 rows x 1040 B\) must fit each drained operand ring"):
+            C100._analyze_for_config(_oproj_graph(256, 6144, 2560), by_name(_k_cluster_name(256)))
+        # the 128-wide plane (67.5 KB) fits both rings on both budgets: no decline from the admission
+        C100._analyze_for_config(_oproj_graph(128, 6144, 2560), by_name(_k_cluster_name(128)))
+
+
+def test_the_k_cluster_split_declines_a_block_scale_chain(monkeypatch):
+    import cudnn
+    from cudnn.gemm.frost.tile_config import by_name
+
+    C100 = _pin_render(monkeypatch)
+    m, k, n, block = 1, 6144, 2560, 32
+    g = cudnn.pygraph(io_data_type=cudnn.data_type.HALF, intermediate_data_type=cudnn.data_type.FLOAT, compute_data_type=cudnn.data_type.FLOAT)
+    a = g.tensor(name="A", dim=[1, m, k], stride=[m * k, k, 1], data_type=cudnn.data_type.FP8_E4M3)
+    b = g.tensor(name="B", dim=[1, k, n], stride=[k * n, 1, k], data_type=cudnn.data_type.FP8_E4M3)
+    sf = dict(reordering_type=cudnn.tensor_reordering.F8_128x4, data_type=cudnn.data_type.FP8_E8M0)
+    sfa = g.tensor(name="SFA", dim=[1, m, k // block], stride=[m * k // block, k // block, 1], **sf)
+    sfb = g.tensor(name="SFB", dim=[1, k // block, n], stride=[k // block * n, 1, k // block], **sf)
+    c = g.matmul(
+        A=g.block_scale_dequantize(input=a, descale=sfa, block_size=[1, block]),
+        B=g.block_scale_dequantize(input=b, descale=sfb, block_size=[block, 1]),
+        name="mm",
+    )
+    c.set_output(True).set_data_type(cudnn.data_type.HALF)
+    g.validate()
+    g.build_operation_graph()
+    with pytest.raises(NotImplementedError, match="is a dense form; not with: block-scale operands"):
+        C100._analyze_for_config(g, by_name(_k_cluster_name(8)))
+
+
+@pytest.mark.skipif(
+    torch.cuda.is_available() and tuple(torch.cuda.get_device_capability()) == _SM107, reason="the live-part admission is the Rubin cells' business"
+)
+def test_build_proj_gemm_surfaces_the_k_cluster_decline_typed_under_capture_safe():
+    """On a host whose part runs no 8-CTA cluster (no cluster below sm_90; the probe answers 0) the pinned K-cluster name is the compiler's
+    typed decline at compile(), chained into the serving declaration's own typed refusal -- never a silent route change."""
+    with pytest.raises(NotImplementedError, match=r"capture_safe=True pins the forced-tile JIT route.*runs ONE tile per CTA"):
+        build_proj_gemm(m=1, k=6144, n=2560, dtype=torch.bfloat16, label="kc_decline", tile_config=_k_cluster_name(8), capture_safe=True)
+
+
+def _render(monkeypatch, name, shape, **pin):
+    from cudnn.gemm.frost import compiler as C
+    from cudnn.gemm.frost.tile_config import by_name
+
+    _pin_render(monkeypatch, **pin)
+    m, k, n = shape
+    return C.render_source_for_graph(_oproj_graph(m, k, n), by_name(name))
+
+
+def _const(src, name):
+    import re
+
+    m = re.search(rf"^{name} = ([^\n#]+?)\s*(?:#.*)?$", src, re.M)
+    assert m, f"the rendering has no constant {name!r}"
+    return m.group(1).strip()
+
+
+@pytest.mark.parametrize(
+    "m, name",
+    [(1, _k_cluster_name(8)), (32, _k_cluster_name(32)), (128, _k_cluster_name(128)), (1, "CONFIG_sm100_64x8x128_64x8x32_cluster1x1x4_1ctamma_splitK4_swapAB")],
+)
+def test_the_k_cluster_rendering_pins_its_barrier_table(monkeypatch, m, name):
+    """The barrier table in code: ``red_full`` initialised once at count 1 and armed once with ``(S - 1) * R * row_bytes`` tx bytes
+    (the S - 1 copies' sizes), ``ab_empty`` stays count 1 with the self arrive mask, ``clc_empty`` 7 x the cluster size, the cluster
+    launch is the fixed ``(1, 1, S)`` (no mixed-CGA fallback), the exit sync is one cluster arrive + wait at the kernel's end, the PDL
+    release has the dense placement, no reducer kernel and no partials parameter exist, the symbol carries ``_kcluster``."""
+    import re
+
+    from cudnn.gemm.frost.tile_config import by_name
+
+    cfg = by_name(name)
+    S, tn, rows = cfg.split_k_slices, cfg.cta_tile_n, cfg.cta_tile_m
+    src = _render(monkeypatch, name, (m, 6144, 2560))
+    assert _const(src, "cluster_shape_mnk") == f"(1, 1, {S})" and _const(src, "fallback_cluster_shape_mnk") == "None"
+    assert _const(src, "split_k_slices") == str(S)
+    R, row_bytes = rows // S, (tn + 4) * 4
+    assert int(_const(src, "xchg_rows_per_cta")) == R and int(_const(src, "xchg_row_elems")) == tn + 4
+    assert int(_const(src, "xchg_slice_bytes")) == R * row_bytes and int(_const(src, "xchg_expect_bytes")) == (S - 1) * R * row_bytes
+    assert (R * row_bytes) % 16 == 0 and (
+        (tn + 4) * 4 // 16
+    ) % 2 == 1, "a slice copy is a whole number of 16-byte units; the row stride an odd 16-byte-group count"
+    vsize = int(_const(src, "epi_chunk_elems"))
+    assert int(_const(src, "xchg_chunks")) == R * tn // vsize and int(_const(src, "xchg_chunk_iters")) == -(-(R * tn // vsize) // 128)
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    assert code.count("nvvm.mbarrier_init(red_full_mbar_ptr, 1)") == 1
+    assert code.count("nvvm.mbarrier_arrive_expect_tx(red_full_mbar_ptr, xchg_expect_bytes)") == 1
+    assert code.count("nvvm.cp_async_bulk_shared_cluster_shared_cta(") == 1 and "for _pi in cutlass.range_constexpr(split_k_slices - 1):" in code
+    assert code.index("cute.arch.fence_view_async_shared()") < code.index("nvvm.cp_async_bulk_shared_cluster_shared_cta(")
+    assert "ab_empty_count = cluster_m + cluster_n - 1" in src and "ab_empty_arrive_mask = cutlass.Int16(1) << cta_rank_in_cluster" in src
+    assert "clc_empty_count = num_consumer_warps_per_cta * cluster_size" in src and "k_rank = cta_rank_in_cluster" in src and "n_rank = 0" in src
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))  # the mode's comment block quotes its own sites
+    assert code.count("tile_l = l_idx + k_rank") == 2 and code.count("tile_l = _l_idx + k_rank") == 1 and "tile_l = l_idx\n" not in code
+    # the exit sync is the kernel's LAST statement: one release arrive + one acquire wait after every role block
+    kernel = code[code.index("def frost_") : code.index(".set_name_prefix")]
+    kernel = kernel[: kernel.rindex("\n")]  # drop the symbol line that carries the set_name_prefix call
+    assert kernel.rstrip().endswith("nvvm.barrier_cluster_arrive()\n    nvvm.barrier_cluster_wait()"), kernel[-400:]
+    assert (
+        kernel.count("nvvm.barrier_cluster_arrive()") == 1 and kernel.count("nvvm.barrier_cluster_arrive_relaxed()") == 2
+    )  # the init sync (2 arms) + the exit
+    # the MMA leader's release takes the dense placement; the grid-exit form survives only in the 2-CTA follower arm (never rendered live here)
+    assert 'if cutlass.const_expr(USE_PDL):\n                nvvm.griddepcontrol("launch_dependents")' in code
+    assert code.count("if cutlass.const_expr(USE_PDL and split_k_slices == 1):") == 1 and code.index("const_expr(USE_PDL):") < code.index(
+        "USE_PDL and split_k_slices == 1"
+    )
+    assert "_splitk_reduce_kernel" not in src and "mSplitK_partials" not in src and "splitk_partials" not in src
+    assert re.search(r"def frost_sm100_matmul_\w+_kcluster\(", src)
+    # the chain's own epilogue runs on the owner rows (the dense store, not the partials store), under the drain's guards
+    assert "gC_tap_0_ptr" in src and "_split_k_off" not in src
+    owner = src[src.index("The K-cluster reduce.") :]
+    assert "vec_f32 = splitk_fixed_order_sum(_planes, split_k_slices" in owner and "if row < M:" in owner and "if col_j + vsize <= N:" in owner
+
+
+@pytest.mark.parametrize(
+    "name, shape",
+    [
+        (_two_kernel_name(8), (1, 6144, 2560)),
+        ("CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB", (1, 2560, 13952)),
+        ("CONFIG_sm100_64x8x128_64x8x32_cluster2x1_1ctamma_swapAB", (1, 2560, 13312)),
+        ("CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma", (128, 6144, 2560)),
+    ],
+    ids=["two_kernel_split", "band_slab", "cluster2x1_slab", "plain_64x32"],
+)
+def test_a_one_deep_rendering_carries_no_k_cluster_code(monkeypatch, name, shape):
+    """Every ``cga_size_k == 1`` rendering is the template's text before the mode existed with the mode's blocks removed: no exchange
+    plane, no ``red_full``, no cluster exit sync, no ``_kcluster`` symbol; the two-kernel split keeps its reducer, the dense forms their
+    cluster init guard (the renderings were diffed byte for byte against the previous tree's for this set)."""
+    src = _render(monkeypatch, name, shape)
+    for token in ("xchg_", "red_full", "KCLUSTER", "k_rank", "_kcluster", "splitk_fixed_order_sum", "barrier_cluster_arrive()"):
+        assert token not in src, token
+    assert "if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):" in src
+    assert ("_splitk_reduce_kernel" in src) == ("splitK" in name)
+    assert "if cutlass.const_expr(USE_PDL and split_k_slices == 1):" in src
+
+
+@requires_rubin
+@pytest.mark.parametrize("m", [1, 4, 32, 128])
+def test_the_k_cluster_out_projection_is_bitwise_the_two_kernel_split_in_one_launch(m):
+    """On the measured part the route names the K-cluster form for the 24/2 out projection (20 tiles x 8 slices co-resident); its ``out``
+    is BITWISE the two-kernel split's of the same slice count (the shared fixed-order sum), within the module's budget of the fp32
+    reference, two launches bitwise, ONE kernel launched (the symbol carries ``_kcluster``; no reducer), no partials workspace."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import device_cluster_capacity
+
+    n, k = _OUT
+    auto = small_m_tile_config(m, n, k, dtype=torch.bfloat16)
+    cap = device_cluster_capacity()
+    assert cap.get(8, 0) >= 20 and "cluster1x1x8" in auto, (auto, cap)
+    two_kernel = auto.replace("x8_1ctamma", "_1ctamma")
+    torch.manual_seed(m)
+    a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+    plan_k = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="kc", capture_safe=True)
+    plan_2 = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="two_kernel", tile_config=two_kernel, capture_safe=True)
+    assert plan_k.tile_config_name == auto and plan_2.tile_config_name == two_kernel
+    assert plan_k.jit.workspace_bytes == 0 and plan_k.workspace_bytes == 1 and plan_2.jit.workspace_bytes > 0
+    out_k, out_2 = (torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16) for _ in range(2))
+    _run(plan_k, a, w, out_k)
+    _run(plan_2, a, w, out_2)
+    assert torch.isfinite(out_k.float()).all()
+    ref = torch.nn.functional.linear(a.float(), w.float())
+    cos = torch.nn.functional.cosine_similarity(out_k.float().flatten(), ref.flatten(), dim=0).item()
+    assert cos > 0.999, cos
+    assert torch.equal(
+        out_k.view(torch.int16), out_2.view(torch.int16)
+    ), f"K-cluster vs two-kernel differ: max|d| {(out_k.float() - out_2.float()).abs().max().item():.3e}"
+    again = torch.empty_like(out_k)
+    _run(plan_k, a, w, again)
+    assert torch.equal(again.view(torch.int16), out_k.view(torch.int16))
+    from gated_block_census import cupti_kernels
+
+    names_k, mem_k = cupti_kernels(lambda: _run(plan_k, a, w, out_k))
+    names_2, _ = cupti_kernels(lambda: _run(plan_2, a, w, out_2))
+    if names_k is None or names_2 is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    assert len(names_k) == 1 and "_kcluster" in names_k[0] and "cluster1x1x8" in names_k[0], names_k
+    assert len(names_2) == 2 and any("_splitk_reduce_kernel" in nm for nm in names_2), names_2
+    assert not [nm for nm in mem_k if "memcpy" in nm.lower()]
+
+
+@requires_rubin
+def test_the_k_cluster_plan_is_built_for_one_device():
+    """The grid / cluster count are baked for the build device: a plan built on device 0 refuses device 1 typed (``_check_plan_device``);
+    one built on device 1 runs there.  Two visible devices needed."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("one visible CUDA device: the two-device cell needs two")
+    n, k, m = _OUT[0], _OUT[1], 4
+    plan0 = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="dev0", capture_safe=True)
+    assert "cluster1x1x" in plan0.tile_config_name
+    with torch.cuda.device(1):
+        a = (torch.randn(m, k, device="cuda", dtype=torch.float32) * 0.1).to(torch.bfloat16)
+        w = (torch.randn(n, k, device="cuda", dtype=torch.float32) * 0.05).to(torch.bfloat16)
+        out = torch.empty(m, n, device="cuda", dtype=torch.bfloat16)
+        with pytest.raises(ValueError, match="built for cuda:0"):
+            _run(plan0, a, w, out)
+        plan1 = build_proj_gemm(m=m, k=k, n=n, dtype=torch.bfloat16, label="dev1", capture_safe=True)
+        _run(plan1, a, w, out)
+        ref = torch.nn.functional.linear(a.float(), w.float())
+        assert torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0).item() > 0.999

@@ -657,6 +657,7 @@ class _Case:
         shuffle=True,
         index_list_form=None,
         fuse_prepare=None,
+        proj_tile_configs=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
@@ -774,6 +775,8 @@ class _Case:
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
+        if proj_tile_configs is not None:
+            kw["proj_tile_configs"] = proj_tile_configs
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -1286,11 +1289,13 @@ def test_the_band_chain_census_is_one_launch_above_the_band_off_chain_with_the_s
     64-row tiles fit one wave (a 212-SM part), the same 128-row tile where they overflow it (a 204-SM part) -- so the two chains differ
     by the raw-key write alone, or by it plus the slab's name.  No split-K reducer on the slab, no graph-route kernel, no hidden copy
     on either execute path.  The pin names THIS tree's chain -- slab, norm + RoPE, the K / V cache write [+ the raw-key write], the
-    sparse tile, the combine, the out projection and its split-K reducer: 7 / 8 kernels; ``out`` within the oracle's budget on both."""
+    sparse tile, the combine, and the out projection in the launches its ROUTE costs (``launches_of_tile_config``): ONE kernel where the
+    part admits the K-cluster split-K (``cluster1x1x8``: the reduce inside the GEMM, the symbol carries ``_kcluster``, no reducer) -- 6 / 7
+    kernels --, the GEMM + its split-K reducer where it does not -- 7 / 8 as before; ``out`` within the oracle's budget on both."""
     from collections import Counter
 
     from cudnn.gemm.frost.tile_config import by_name
-    from cudnn.gated_attention_block.kernels.proj_gemm import small_m_tile_config
+    from cudnn.gated_attention_block.kernels.proj_gemm import launches_of_tile_config, small_m_tile_config
 
     cells = {}
     for band in (False, True):
@@ -1317,11 +1322,88 @@ def test_the_band_chain_census_is_one_launch_above_the_band_off_chain_with_the_s
     assert sum("frost_cache_write" in n for n in k_on) == sum("frost_cache_write" in n for n in k_off) + 1
     assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in k_on + k_off), "a non-FROST GEMM kernel on the chain"
     assert not [n for n in m_on + m_off if "memcpy" in n.lower()], "a hidden copy on an execute path"
-    assert (len(k_off), len(k_on)) == (7, 8), (len(k_off), len(k_on))
+    # the out projection: N d_model x K h_q * D at T = 1 -- one launch (the K-cluster form) or two (the GEMM + its reducer), by the route
+    oproj = small_m_tile_config(1, GEOM_FLASH_NEXT["d_model"], GEOM_FLASH_NEXT["h_q"] * D, dtype=BF16)
+    oproj_launches = launches_of_tile_config(oproj)
+    print(f"out projection: {oproj} -> {oproj_launches} launch(es)")
+    assert cells[False].blk._out_proj._plan.tile_config_name == oproj == cells[True].blk._out_proj._plan.tile_config_name
+    reducers = [sum("_splitk_reduce_kernel" in n for n in ks) for ks in (k_off, k_on)]
+    kclusters = [sum("_kcluster" in n for n in ks) for ks in (k_off, k_on)]
+    assert reducers == [oproj_launches - 1] * 2 and kclusters == [int("cluster1x1x" in oproj)] * 2, (reducers, kclusters, oproj)
+    assert (len(k_off), len(k_on)) == (5 + oproj_launches, 6 + oproj_launches), (len(k_off), len(k_on), oproj)
     torch.cuda.synchronize()
     for band, case in cells.items():
         case.run()
         case.check(what=f"census band={'on' if band else 'off'}")
+
+
+# ---------------------------------------------------------------------------
+# proj_tile_configs: a catalog tile pinned per dense projection (performance-only, append-only) -- the small-M route's A/B arm
+# ---------------------------------------------------------------------------
+
+_OPROJ_TWO_KERNEL = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_splitK8_swapAB"  # today's 24/2 out projection at T 1 .. 8
+_OPROJ_K_CLUSTER = "CONFIG_sm100_128x8x128_128x8x32_cluster1x1x8_1ctamma_splitK8_swapAB"  # the same split reduced inside one cluster
+
+
+def test_proj_tile_configs_is_validated_at_declaration_and_pinned_on_the_stage():
+    """The knob's contract, device-free: keys ``proj`` / ``out_proj`` only, catalog names only (the grammar's typed ValueError), bf16 / f16
+    only, ``proj`` only on the unfused slab; a declared pin lands on the stage (``tile_config``) and reads back (``proj_tile_configs``)."""
+    blk, _ = _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"out_proj": _OPROJ_TWO_KERNEL})
+    assert blk.proj_tile_configs == {"out_proj": _OPROJ_TWO_KERNEL} and blk._out_proj.tile_config == _OPROJ_TWO_KERNEL and blk._proj.tile_config is None
+    assert blk._out_proj.resolves_a_jit_tile()  # a pinned name IS a JIT tile: the capture-safe predicate reads True
+    blk2, _ = _declare(
+        GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"proj": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB", "out_proj": _OPROJ_K_CLUSTER}
+    )
+    assert blk2._proj.tile_config == "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB" and blk2._out_proj.tile_config == _OPROJ_K_CLUSTER
+    blk3, _ = _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={})
+    assert blk3.proj_tile_configs == {} and blk3._out_proj.tile_config is None
+    assert _declare(GEOM_FLASH_NEXT, 1, 1)[0].proj_tile_configs == {}
+    with pytest.raises(ValueError, match="unknown projection key"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"gate": _OPROJ_TWO_KERNEL})
+    with pytest.raises(ValueError, match="is not a catalog tile config name"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"out_proj": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1x3_1ctamma_splitK8_swapAB"})
+    with pytest.raises(ValueError, match="is not a catalog tile config name"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"out_proj": "not-a-config"})
+    with pytest.raises(TypeError, match="must be a mapping"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs=[_OPROJ_TWO_KERNEL])
+    with pytest.raises(TypeError, match="must be a catalog tile name"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, proj_tile_configs={"out_proj": 8})
+    # the fused norm + RoPE fork (the block-sparse mode runs fuse_norm_rope as declared) builds no catalog plan for the slab: "proj" is
+    # refused there, "out_proj" alone is fine
+    with pytest.raises(ValueError, match="pins the slab GEMM of the UNFUSED chain"):
+        _declare(GEOM_FLASH_NEXT, 1, 1, fuse_norm_rope=True, proj_tile_configs={"proj": "CONFIG_sm100_128x8x128_128x8x32_cluster1x1_1ctamma_swapAB"})
+    fused, _ = _declare(GEOM_FLASH_NEXT, 1, 1, fuse_norm_rope=True, proj_tile_configs={"out_proj": _OPROJ_TWO_KERNEL})
+    assert fused.fuse_norm_rope_effective and fused._out_proj.tile_config == _OPROJ_TWO_KERNEL
+
+
+@requires_rubin
+def test_proj_tile_configs_pins_the_two_kernel_split_bitwise_the_k_cluster_default_with_the_reducer_launch_back():
+    """The lever's A/B arm on the measured part: the DEFAULT 24/2 decode chain runs the out projection as the K-cluster split (one
+    kernel, ``_kcluster``), the pinned two-kernel name runs the GEMM + its split-K reducer (one launch more), and ``out`` is BITWISE
+    between the two (one fixed-order sum); the plan readback names what runs."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import device_cluster_capacity, small_m_tile_config
+
+    auto = small_m_tile_config(1, GEOM_FLASH_NEXT["d_model"], GEOM_FLASH_NEXT["h_q"] * D, dtype=BF16)
+    assert auto == _OPROJ_K_CLUSTER, (auto, device_cluster_capacity())
+    on = _Case(GEOM_FLASH_NEXT, 1, (4096,), page=16, seed=61, split=8, fuse_gate=True).compile()
+    off = _Case(GEOM_FLASH_NEXT, 1, (4096,), page=16, seed=61, split=8, fuse_gate=True, proj_tile_configs={"out_proj": _OPROJ_TWO_KERNEL}).compile()
+    assert on.blk.proj_tile_configs == {} and off.blk.proj_tile_configs == {"out_proj": _OPROJ_TWO_KERNEL}
+    assert on.blk._out_proj._plan.tile_config_name == _OPROJ_K_CLUSTER and off.blk._out_proj._plan.tile_config_name == _OPROJ_TWO_KERNEL
+    assert on.blk._out_proj._plan.route == off.blk._out_proj._plan.route == "jit-only"
+    a = on.run().clone()
+    b = off.run().clone()
+    on.check(what="K-cluster default")
+    off.check(what="two-kernel pin")
+    assert torch.equal(
+        a.view(torch.int16), b.view(torch.int16)
+    ), f"out differs between the two split forms: max|d| {(a.float() - b.float()).abs().max().item():.3e}"
+    k_on, _ = _cupti_kernels(lambda: on.execute())
+    k_off, _ = _cupti_kernels(lambda: off.execute())
+    if k_on is None or k_off is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the launch count is unverified here")
+    assert len(k_off) == len(k_on) + 1, (len(k_on), len(k_off))
+    assert sum("_kcluster" in n for n in k_on) == 1 and not any("_splitk_reduce_kernel" in n for n in k_on), k_on
+    assert sum("_splitk_reduce_kernel" in n for n in k_off) == 1 and not any("_kcluster" in n for n in k_off), k_off
 
 
 # ---------------------------------------------------------------------------

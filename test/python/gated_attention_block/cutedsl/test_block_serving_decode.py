@@ -1801,6 +1801,22 @@ def _capture_replay_cell(**blk_kw):
 
 
 @requires_rubin
+def test_the_k_cluster_out_projection_is_the_captured_first_execute_and_replays_bitwise():
+    """The serving declaration whose out projection resolves the K-cluster split-K (N 512 = 4 tiles x 8 slices at K 8192 here; the 24/2
+    shard's 20 tiles on the measured part) is captured at its FIRST execute on a new stream with no warm-up and replays bitwise the eager
+    run -- the cluster launch attribute is capture-legal and the form allocates nothing at execute (no partials workspace)."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import device_cluster_capacity, small_m_tile_config
+
+    case = _Case(16, 2, (300, 0, 1000, 77), seed=23)
+    case.blk.check_support()
+    case.blk.compile()
+    name = case.blk._out_proj._plan.tile_config_name
+    assert name == small_m_tile_config(8, _D_MODEL, _GROUPS[16][0] * 256, dtype=torch.bfloat16) and "cluster1x1x" in name, (name, device_cluster_capacity())
+    assert case.blk._out_proj._plan.jit.workspace_bytes == 0 and case.blk._out_proj._plan.route == "jit-only"
+    _capture_replay_cell()
+
+
+@requires_rubin
 def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_lengths_tables_slots_and_inputs():
     _capture_replay_cell()
 
@@ -2084,8 +2100,11 @@ def test_the_write_through_in_the_norm_rope_launch_serves_f16_pools_bitwise():
 def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_seven_to_six():
     """The DECODE chain's CUPTI census at the 24/2 shard's geometry (d_model 2560, B 1 x KV 4096, S_q 1, use_pdl): the separate-launch
     chain is 7 kernels (slab GEMM, norm + RoPE, cache write, decode tile, split combine, out-proj GEMM, split-K reduce); with the
-    write-through in the norm + RoPE launch it is 6 -- the dropped name is the cache write's, `out` bitwise.  The pin names THIS tree's
-    chain (the two-kernel split-K reduce); a tree with the in-GEMM split-K reduce reads 6 / 5."""
+    write-through in the norm + RoPE launch it is 6 -- the dropped name is the cache write's, `out` bitwise.  The out projection costs
+    the launches its ROUTE names (``launches_of_tile_config``): two on a part whose cluster capacity keeps the two-kernel split, ONE
+    where the K-cluster split-K is admitted (the reduce inside the GEMM: 6 / 5 there), so the pin follows the rule, not a number."""
+    from cudnn.gated_attention_block.kernels.proj_gemm import launches_of_tile_config, small_m_tile_config
+
     cells = {}
     for arm in (False, True):
         cells[arm] = _Case(12, 1, (4096,), seed=1, d_model=2560, blk_kw=dict(use_pdl=True, fuse_cache_write_small_m=arm)).compile()
@@ -2098,7 +2117,12 @@ def test_the_write_through_in_the_norm_rope_launch_drops_the_cache_write_launch_
     assert any("frost_cache_write" in n for n in k_off) and not any("frost_cache_write" in n for n in k_on)
     assert any("frost_qk_norm_rope_tma" in n for n in k_on)
     assert not [n for n in m_on if "memcpy" in n.lower()], "a hidden copy on the arm's execute path"
-    assert (len(k_off), len(k_on)) == (7, 6), (len(k_off), len(k_on))
+    oproj = small_m_tile_config(1, 2560, _GROUPS[12][0] * 256, dtype=torch.bfloat16)
+    oproj_launches = launches_of_tile_config(oproj)
+    assert cells[False].blk._out_proj._plan.tile_config_name == oproj == cells[True].blk._out_proj._plan.tile_config_name
+    assert all(sum("_splitk_reduce_kernel" in n for n in ks) == oproj_launches - 1 for ks in (k_off, k_on)), oproj
+    assert all(sum("_kcluster" in n for n in ks) == int("cluster1x1x" in oproj) for ks in (k_off, k_on)), oproj
+    assert (len(k_off), len(k_on)) == (5 + oproj_launches, 4 + oproj_launches), (len(k_off), len(k_on), oproj)
     torch.cuda.synchronize()
     cells[True].check_against_oracle(what="six launches")
     assert torch.equal(_bits(cells[True].out), _bits(cells[False].out))
