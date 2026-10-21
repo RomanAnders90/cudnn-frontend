@@ -2252,7 +2252,8 @@ def test_sparse_kernel_gate_arm_source_pins():
     freed Q^T slot (no sGate SmemTile: the SmemTile count stays 4), the MATH through the shared helpers with the dead-column
     SELECT per element AFTER the fma, sigmoid's 1/2 folded into the scale, the two gate waits on the default (per-item) form
     (the ring-wait constant count stays 11), every gate byte count the BOX (never the slot, never a literal), the gate
-    descriptor appended LAST so the ungated rendering's parameter offsets are untouched."""
+    descriptor appended LAST so the ungated rendering's parameter offsets are untouched; the two-slot arm's exit-path wait before
+    its last gate (the one-slot arm of the union rendering has its own order pins)."""
     code = _code(_kernel_source())
     assert code.count("bars.mb_gate_full.arrive(n_bytes=GATE_TX_BYTES, pred=nvvm.elect_sync())") == 1
     assert code.count("bars.mb_gate_empty.arrive()") == 1
@@ -2270,7 +2271,9 @@ def test_sparse_kernel_gate_arm_source_pins():
     assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" not in code, "the drain is STAGES_GATE deep once the exit path waits before the last gate"
     assert code.count("cutlass.range_constexpr(CFG.STAGES_GATE)") == 1
     i_exit_wait = code.index("if is_valid <= cutlass.Int32(0):\n                bars.mb_gate_empty.wait(ge_state.phase)")
-    i_last_gate = code.index("qgi, qgp = _tma_issue_gate(")
+    # the two-slot arm's gate issue is the one AFTER the exit-path wait; the one-slot arm (the union rendering, STAGES_Q 1) issues its gate
+    # BEFORE the next item's loads and takes no exit-path wait -- test_union_gated_arm_one_slot_order_pins pins that order
+    i_last_gate = code.index("qgi, qgp = _tma_issue_gate(", i_exit_wait)
     i_drain = code.index("cutlass.range_constexpr(CFG.STAGES_GATE)")
     assert i_exit_wait < i_last_gate < i_drain, "the exit-path mb_gate_empty wait precedes the last gate's issue, the drain follows the loop"
     # the gate barriers' parities come from PipelineStates advanced by the ring depth like every other ring (P2) -- never a scalar toggle
@@ -3923,6 +3926,60 @@ def test_union_form_gate_on_the_unsplit_item_and_in_the_combine():
     )
 
 
+@requires_rubin
+def test_union_form_gate_on_the_unsplit_item_at_two_or_more_items_per_cta():
+    """U6b: the fused gate on the UNSPLIT union item where every resident CTA runs TWO or more work items -- the persistent grid ``B x KH`` at
+    2.5 x the part's SM count (one CTA per SM) -- the ONE-slot discipline of the union rendering's Q slot (barrier rows 2 / 11 / 12): the slot
+    carries Q(i), then gate(i), then Q(i + 1), so the TMA warp issues gate(i) BEFORE Q(i + 1) and holds Q(i + 1) behind epilogue(i)'s release
+    of the gate.  The per-row tile's two-slot order (Q(i + 1) first on the pre-armed pass, gate(i) after) lands two loads in the one slot on a
+    CTA's second item: BMM1(i + 1) reads the gate as Q^T and / or epilogue(i) reads Q(i + 1) as the gate -- wrong O on that item, no hang,
+    every one-item-per-CTA cell green (U6 at B 2).  Asserted: the gated item equals the ungated item through the elementwise gate within
+    ONE rounding on EVERY row (U6's bound), the LSE bitwise the ungated item's, two launches bitwise, the gated per-row tile within the pinned
+    bound, the fp32 oracle on a strided subset of the sequences within the budget."""
+    S_q, H, KH, top_k = 4, 24, 2, 128
+    dtype = torch.bfloat16
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    B = -(-(5 * sms) // (2 * KH))  # B x KH >= 2.5 x SMs union items at split 1: two or more items on every resident CTA
+    SKV = 1024
+    kv_lens = [SKV - (i % 5) for i in range(B)]
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 83, SKV=SKV)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=0.995)
+    u_ids, u_lens = _union_of(ids, lens)
+    scale = 1.0 / math.sqrt(D)
+    gate = (torch.randn(B, S_q, H, D, device=q.device, dtype=torch.float32, generator=g) * 2.0).to(dtype)
+    outs_f = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, gate=gate)
+    outs_u = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, launches=1)
+    (o_f, lse_f, _), (o_f2, lse_f2, _) = outs_f
+    o_u, lse_u = outs_u[0][0], outs_u[0][1]
+    live = ~torch.isinf(lse_u).permute(0, 2, 1)  # [B, S, H]: every sequence is longer than the step, so every row is live
+    assert bool(live.all())
+    o_ug = _elementwise_gate(o_u, gate)
+    d = (o_f.float() - o_ug.float()).abs().cpu()
+    row_mag = torch.maximum(o_f.float().abs(), o_ug.float().abs()).amax(dim=-1, keepdim=True)
+    ulps = (d / _ulp_of(row_mag.expand_as(d), dtype)).amax(dim=-1)  # [B, S, H] at the row's scale
+    bad = ulps > 1.0
+    bad_seqs = bad.any(dim=2).any(dim=1).nonzero().flatten().tolist()
+    assert not bool(bad.any()), (
+        f"gated union vs unfused-then-gated at B {B} x KH {KH} = {B * KH} items on {sms} SMs: {float(ulps.max()):.3f} ulp at the row's scale "
+        f"(max|d| {float(d.max()):.3e}) on {int(bad.sum())} rows of {len(bad_seqs)} sequences (first {bad_seqs[:12]}) > 1.0 -- gate(i) and Q(i + 1) "
+        "shared the one Q slot on a CTA's second item"
+    )
+    assert torch.equal(lse_f, lse_u), "the gate must not touch the LSE"
+    assert torch.equal(o_f, o_f2) and torch.equal(lse_f, lse_f2), "two launches must be bitwise"
+    pr = _launch_perrow_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1, gate=gate)
+    ulp_pr, d_pr = _ulp_dist(o_f, pr[0][0], dtype, live)
+    assert (
+        ulp_pr <= UNION_VS_PERROW_O_ULP
+    ), f"gated union vs the gated per-row tile: {ulp_pr:.3f} ulp at the row's scale (max|d| {d_pr:.3e}) > {UNION_VS_PERROW_O_ULP}"
+    sel = list(range(0, B, max(1, B // 16)))
+    ref_o, ref_lse, _ = _reference_perrow_decode(q[sel], k[sel], v[sel], ids[sel], lens[sel], [kv_lens[i] for i in sel], scale, top_k)
+    max_o, max_lse = _check([(o_f[sel], lse_f[sel])], ref_o * torch.sigmoid(gate[sel].float()), ref_lse)
+    print(
+        f"\nunion gate at {B * KH} items on {sms} SMs (|U| median {int(u_lens.float().median())}): vs unfused-then-gated {float(ulps.max()):.3f} ulp "
+        f"(max|d| {float(d.max()):.3e}); vs the gated per-row tile {ulp_pr:.3f} ulp; vs oracle ({len(sel)} sequences) max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}"
+    )
+
+
 # ---------------------------------------------------------------------------- host: the union form's declines and the rendering's pins
 def _union_operands(S=4, H=24, KH=2, B=2, dtype="torch.bfloat16", top_k=512):
     o = _operands(B=B, S=S, H=H, KH=KH, SKV=8192, dtype=dtype, top_k=top_k)
@@ -4094,6 +4151,28 @@ def test_union_kernel_source_pins():
     assert "col_live.append(cutlass.Int32(c0 + jj) < n_live_cols)" in code
     assert "grid_shape = (SPLIT_KV, KH, B)" in code
     assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4
+
+
+def test_union_gated_arm_one_slot_order_pins():
+    """U8 (host): the gated arm's ONE-slot order on the union rendering (STAGES_Q 1; barrier rows 2 / 11 / 12) in the TMA warp's source -- Q(0)
+    takes the pre-armed ``mb_gate_empty`` pass (``not first or STAGES_Q == 1``), the loop issues gate(i) BEFORE the next item's Q / ids under
+    ``STAGES_Q == 1`` and keeps the two-slot order (Q(i + 1), the exit-path wait, then gate(i)) under ``STAGES_Q > 1``; row 12's exit drain
+    stays STAGES_GATE waits on both arms."""
+    code = _code(_kernel_source())
+    i_issue = code.index("def _tma_issue_item(")
+    issue = code[i_issue : code.index("\ndef ", i_issue + 1)]
+    assert "if cutlass.const_expr(not first or STAGES_Q == 1):" in issue, "Q(0) consumes the pre-armed pass on the one-slot arm"
+    i_tma = code.index("def _tmaldg_warp_group(")
+    tma = code[i_tma : code.index("\n@cute.jit", i_tma)]  # up to the gather warps' decorator (_code strips the section comment)
+    one = tma.index("if cutlass.const_expr(CFG.EPILOGUE_GATE and STAGES_Q == 1):")
+    two = tma.index("if cutlass.const_expr(CFG.EPILOGUE_GATE and STAGES_Q > 1):")
+    nxt = tma.index("_tma_issue_item(", tma.index("while is_valid"))
+    assert (
+        one < tma.index("_tma_issue_gate(", one) < nxt < two < tma.index("_tma_issue_gate(", two)
+    ), "gate(i) precedes Q(i + 1) on ONE slot and follows it on two"
+    assert tma.count("bars.mb_gate_empty.wait(ge_state.phase)") == 2, "the two-slot exit-path wait and the drain"
+    assert "if is_valid <= cutlass.Int32(0):" in tma[two:], "the exit-path wait belongs to the two-slot arm"
+    assert "for _ in cutlass.range_constexpr(CFG.STAGES_GATE):" in tma
 
 
 def test_union_rendering_trace_compile_is_spill_free(tmp_path):

@@ -59,7 +59,9 @@ SPARE_WARP_ID -- and the body dispatches on those names, never on a literal; tab
                                      copy of item i+1, the gate of item i into its freed sQ slot (gated arm); NO K/V bytes; exit drains PER ARM:
                                      mb_ids_empty x STAGES_IDS always; ungated mb_q_empty x STAGES_Q; gated: the exit-path mb_gate_empty wait
                                      BEFORE the last item's gate (the wait Q(n_items) would have taken), then mb_gate_empty x STAGES_GATE
-                                     (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain)
+                                     (every mb_q_empty commit is consumed by its item's gate load -- nothing of row 2 is left to drain);
+                                     on the UNION rendering's ONE Q slot (STAGES_Q 1) gate(i) is issued BEFORE Q(i+1), which waits
+                                     epilogue(i)'s release of it: the drain alone, no exit-path wait (the UNION BARRIER TABLE, rows 2 / 12)
     warp 18 (14)       WG4 (3)       scheduler (CFG.SCHED_WARP_ID; scheduler_warp_loop for BSHD, the persistent claim-counter form for THD) --
                                      never credits
     warp 19 (15)       WG4 (3)       spare (CFG.SPARE_WARP_ID): passes the init sync, then exits (no CTA-wide barrier-0 sync may follow that one
@@ -200,6 +202,10 @@ gather warp waits mb_kv_empty x STAGES_KV -- each with its carried state.  Gated
 mb_q_empty(i) -> gate(i) -> mb_gate_full -> epilogue(i) reads -> mb_gate_empty -> Q(i + 2); the TMA warp issues gate(i) AFTER
 queuing Q(i + 1) / ids(i + 1) (their waits are the EARLY ones: mb_gate_empty(i - 1) / mb_ids_empty; the gate's is the item's
 LAST BMM1) and before its next credit; the softmax warps find the item's gate at slot i % 2 through a carried qslot_state.
+ONE Q slot (STAGES_Q = 1, the UNION rendering): the slot's order is Q(i) -> MMA reads -> mb_q_empty(i) -> gate(i) -> mb_gate_full ->
+epilogue(i) reads -> mb_gate_empty -> Q(i + 1), so the TMA warp issues gate(i) BEFORE Q(i + 1) / ids(i + 1) and Q(i + 1) waits
+mb_gate_empty(i) (Q(0) takes the pre-armed pass; no exit-path wait: n waits for n completions, in order) -- the two-slot order
+would land Q(i + 1) and gate(i) in the one slot on a CTA's second item (the UNION BARRIER TABLE, rows 2 / 12).
 
 THE ONE HELPER ``_item_bounds``: n_tiles, count, the tail block id(s), dead and the split chunk are computed by ONE pure
 helper at the item-start site of EVERY role that loops over tiles (softmax, MMA, the 8 gather warps, the TMA warp) over the
@@ -393,7 +399,8 @@ function above per row -- row j (pos_j = L_b - S_q + j) sees its own list and it
     the stores:    column c -> O[b, j_c, hG + g_c, :] and LSE[b, hG + g_c, j_c] under live_c = (pos_0 + j_c >= 0) & (c < S_q x G) (a sequence
                    shorter than the step: its leading rows dead, nothing stored); under a split the fp32 partials at batch b + s x B of the
                    same (B x S, S_q, H_q, D) / (B x S, H_q, S_q) slabs the combine reads (unchanged).  The gate (unsplit): the box (S_q, G, 64)
-                   x 4 into the freed Q slot, read per pass at rows col0 + 8 p + jj.
+                   x 4 into the freed Q slot, read per pass at rows col0 + 8 p + jj; issued BEFORE Q(i + 1), which waits the epilogue's
+                   release of it (rows 2 / 12).
     the function:  the per-row tile's set per row, visited in the UNION's order with the non-member blocks masked (p = 0): the online-softmax
                    rescale sequence differs, so the result is the per-row tile's within fp32 rounding -- NEVER bitwise it (the adapter's and
                    the block's claims say so); two launches of this rendering ARE bitwise.  A duplicate INSIDE a row (a contract violation)
@@ -406,7 +413,8 @@ re-derived from this body 2026-10-21 -- the rows the per-row table does not alre
     1  mb_q_full[1]         TMA_LOAD     the TMA warp, arrive(n_bytes=Q_TX_BYTES=24,576, pred=elect_sync()); tma_load_tile x 4 subtiles of the (S_q, G, 64) box
                                                                                                         1 == 1       MMA before the item's first BMM1   0      q_state(1), once per item
     2  mb_q_empty[1]        MMA_COMMIT   the MMA warp, pred=elect_p once per item after the item's LAST BMM1 half (the second K half of the last tile)
-                                                                                                        1 == 1       the TMA warp before Q(i+1) / gate(i)  1 | 0  per item; advance(state, STAGES_Q) -- never a ^ 1
+                                                                                                        1 == 1       the TMA warp before Q(i+1) (ungated) / gate(i) (gated: issued BEFORE Q(i+1))
+                                                                                                                                                     1 | 0  per item; advance(state, STAGES_Q) -- never a ^ 1
     3  mb_ids_full[1]       TMA_LOAD     the TMA warp, arrive(n_bytes=IDS_TX_BYTES=8,192, pred=elect_sync()); bulk_copy(sIds, block_ids[b], 8,192) every item
                                                                                                         1 == 1       4 gather + 8 softmax warps, item top  0   ids_state(1), once per item
     4  mb_ids_empty[1]      THREAD       `if elect_sync(): arrive()` from each of the 12 consuming warps after its last read of the slot (IDS_EMPTY_ARRIVERS =
@@ -428,7 +436,10 @@ re-derived from this body 2026-10-21 -- the rows the per-row table does not alre
    11  mb_gate_full[1]      TMA_LOAD     the TMA warp, arrive(n_bytes=GATE_TX_BYTES=24,576, pred=elect_sync()); the gate box (S_q, G, 64) x 4 into the freed
                                          sQ slot [gated UNSPLIT arm only]                               1 == 1       all 256 softmax lanes, epilogue(i), the first pass  0  gf_state(1)
    12  mb_gate_empty[1]     THREAD       bare arrive() from all 256 softmax lanes after the item's last gate LDS (the last pass) [gated arm]
-                                                                                                        256 == 256   the TMA warp before Q(i+1) into the slot  1  ge_state(1); the exit-path order argument of the per-row table holds
+                                                                                                        256 == 256   the TMA warp before Q(i+1) into the slot (= epilogue(i)'s release of gate(i); Q(0) takes the pre-armed pass)
+                                                                                                                                                     1      ge_state(1); ONE slot: gate(i) is issued BEFORE Q(i+1) and n waits consume n
+                                                                                                                                                            completions in order, no exit-path wait (the per-row table's "Q(j) waits
+                                                                                                                                                            epilogue(j-2)" argument needs its two slots)
    13  sched.mb_scheduler[2]  TMA_LOAD   the scheduler warp's elected arrive_expect_tx(16) + the CLC response   1 == 1   every consuming warp
    14  sched.mb_read_tile_id[2]  THREAD  read_tile_id_arrive = one elected lane per calling warp: 8 softmax + 1 MMA + 1 TMA + 4 gather = READ_TILE_ARRIVERS
                                                                                                         14 == 14     the scheduler before refilling the slot
@@ -439,8 +450,9 @@ re-derived from this body 2026-10-21 -- the rows the per-row table does not alre
 
 Every item runs >= 1 tile (a dead item one -1 tile), so rows 1-4 and 11-14 advance exactly once per item and rows 5-10 at least once;
 rows 5-6 advance FOUR times per tile (two K halves, two V halves) in both roles that touch them.  Exit drains (P6): the TMA warp waits
-mb_ids_empty x 1 and, ungated, mb_q_empty x 1 (the pre-armed state) -- gated, the exit-path mb_gate_empty wait before the last gate and the
-drain x 1 as the per-row table; every gather warp waits mb_kv_empty x 5 with its carried state.  No cross-CTA arrive (cga1: P15 empty);
+mb_ids_empty x 1 and, ungated, mb_q_empty x 1 (the pre-armed state) -- gated, the drain x 1 alone (= epilogue(n_items - 1): the pre-armed
+pass before Q(0) and epilogue(i) before Q(i + 1) consume the rest in order; the per-row table's exit-path wait belongs to its two slots);
+every gather warp waits mb_kv_empty x 5 with its carried state.  No cross-CTA arrive (cga1: P15 empty);
 ``pred=`` only on TMA_LOAD / MMA_COMMIT (P16); ``if elect_sync():`` around the THREAD arrives of row 4.
 
 UNION SMEM TABLE (declaration order = address order; the config's d256_sparse_smem_layout, 1024-B alignment modelled by the validator):
@@ -1005,9 +1017,12 @@ def _tma_issue_item(
     bytes).  Both coordinates come from ``_decode_item`` (under THD the packed token row and batch 0: a dense coordinate that
     survived the port would read batch 0's rows for every sequence).  The ids slot is taken after its ``_empty`` wait (row
     4, pre-armed).  The Q slot's wait is the arm's: ungated, ``mb_q_empty[slot]`` (row 2, pre-armed: Q(0), Q(1) pass fresh);
-    gated, ``mb_gate_empty`` (row 12, pre-armed, ONE stage: Q(1) passes fresh, Q(j) waits epilogue(j - 2) -- the consumer of
-    gate(j - 2) in this same slot), skipped for the prologue's Q(0) (``first``: a fresh slot, and the pre-armed pass is
-    Q(1)'s); the wait Q(n_items) would have taken is the caller's exit-path wait before the last gate.  Returns the advanced
+    gated, ``mb_gate_empty`` (row 12, pre-armed, ONE stage) -- TWO Q slots: Q(1) passes fresh, Q(j) waits epilogue(j - 2) (the
+    consumer of gate(j - 2) in this same slot), skipped for the prologue's Q(0) (``first``: a fresh slot, and the pre-armed pass
+    is Q(1)'s), the wait Q(n_items) would have taken being the caller's exit-path wait before the last gate; ONE Q slot
+    (STAGES_Q == 1, the union rendering): Q(0) takes the pre-armed pass and Q(j) waits epilogue(j - 1) -- the slot carries
+    Q(j - 1), then gate(j - 1), then Q(j), so the caller issues gate(j - 1) BEFORE this load and no exit-path wait exists on
+    that arm (the two-slot skip would let Q(1) pass on the pre-armed phase while Q(0) / gate(0) still own the slot).  Returns the advanced
     PipelineStates as (idx, phase) pairs, the gate-empty consumer's (``ge``, one stage = CFG.STAGES_GATE, advanced per wait like
     every other ring -- never a scalar parity toggle) included."""
     # --- the list (row 4 wait -> row 3 arm + copy)
@@ -1018,7 +1033,7 @@ def _tma_issue_item(
     )
     # --- Q^T (the slot wait -> row 1 arm + 4 subtiles)
     if cutlass.const_expr(CFG.EPILOGUE_GATE):
-        if cutlass.const_expr(not first):
+        if cutlass.const_expr(not first or STAGES_Q == 1):
             bars.mb_gate_empty.wait(ge_phase)
             ge_state = advance(PipelineState(idx=ge_idx, phase=ge_phase), CFG.STAGES_GATE)
             ge_idx, ge_phase = ge_state.idx, ge_state.phase
@@ -1038,7 +1053,8 @@ def _tma_issue_gate(tma_gate, sQ, bars, out_tok, head, out_batch, qg_idx, qg_pha
     """Gated arm: the gate tile of the CURRENT item -- O's shape, the token's G query heads = exactly the item's Q^T box, the
     same 4-D tensor-map form and SW128 -- into the item's OWN sQ slot once the MMA warp freed it (row 2's commit after the
     item's last BMM1; ``qg`` is the wait-then-arrive consumer state: item i waits completion i // 2 of slot i % 2 = its own
-    commit).  The coordinate is the item's OUTPUT coordinate ``(out_tok, out_batch)`` of ``_decode_item`` -- the gate is
+    commit; on ONE Q slot -- STAGES_Q == 1, the union rendering -- this load is issued BEFORE Q(i + 1), which then waits
+    epilogue(i)'s release of the gate, row 12).  The coordinate is the item's OUTPUT coordinate ``(out_tok, out_batch)`` of ``_decode_item`` -- the gate is
     O-shaped, so under THD it is the packed token row and batch 0 on the ``[1, T_q, H, D]`` operand, exactly where O's rows
     go; under the paged read it is the dense ``(tok, batch)`` (the gate is never paged).  Arms row 11 with ``GATE_TX_BYTES``
     = the BOX bytes (Q_BOX_ROWS x TILE_O x GATE_BPE, never the 8 KiB slot).  Issued for every item, dead ones included, so
@@ -1060,8 +1076,9 @@ def _tmaldg_warp_group(
     # Producer states (slot to fill next) and the pre-armed consumer states of the matching _empty rings (P5b: Q(0), Q(1)
     # and ids(0), ids(1) pass fresh barriers) -- all four carried across items.  Gated arm: qg_state is the gate's
     # wait-then-arrive consumer state of mb_q_empty (every commit consumed by its item's gate load, nothing left to drain) and
-    # ge_state the pre-armed mb_gate_empty consumer (one stage = CFG.STAGES_GATE, advanced per wait like every other ring: Q(1)
-    # passes fresh; Q(j) waits epilogue(j - 2)); the ungated arm's qe_state keeps its role there and is unused here.
+    # ge_state the pre-armed mb_gate_empty consumer (one stage = CFG.STAGES_GATE, advanced per wait like every other ring: two Q
+    # slots -- Q(1) passes fresh, Q(j) waits epilogue(j - 2); ONE slot -- Q(0) takes the pass, Q(j) waits epilogue(j - 1)); the
+    # ungated arm's qe_state keeps its role there and is unused here.
     q_state = PipelineState.start(phase=0)
     qe_state = PipelineState.start(phase=1)
     i_state = PipelineState.start(phase=0)
@@ -1113,6 +1130,17 @@ def _tmaldg_warp_group(
         _tok, head, _batch, item_row, _kvb, _sq, out_tok, out_batch, _split = _decode_item(t0, t1, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
         is_valid = cute.arch.make_warp_uniform(nxt_v)
         sched_state = advance(sched_state, SCHEDULER_STAGES)
+        if cutlass.const_expr(CFG.EPILOGUE_GATE and STAGES_Q == 1):
+            # ONE Q slot (the union rendering): the slot carries Q(i), then gate(i), then Q(i + 1).  gate(i) goes FIRST -- its wait is
+            # the item's last BMM1 (row 2's commit i) -- and Q(i + 1) below waits epilogue(i)'s release of the gate (row 12's
+            # completion i, inside _tma_issue_item): no two loads ever target the slot at once.  The two-slot order (Q(i + 1) first,
+            # on the wait that is epilogue(i - 1)'s release of the OTHER slot) would land Q(i + 1) and gate(i) in this one slot --
+            # BMM1(i + 1) reading the gate as Q^T and / or epilogue(i) reading Q(i + 1) as the gate: wrong O on a CTA's second item,
+            # no hang.  Row 12 on this arm: n_items completions against n_items waits -- the pre-armed pass before Q(0), epilogue(i)
+            # before Q(i + 1) for i < n_items - 1, the exit drain x STAGES_GATE (= epilogue(n_items - 1)); completion i needs
+            # gate(i), issued after the wait that consumed completion i - 1, so the consumer is never two behind (no exit-path wait).
+            qgi, qgp = _tma_issue_gate(tma_gate, sQ, bars, cur_out_tok, cur_head, cur_out_batch, qg_state.idx, qg_state.phase)
+            qg_state = PipelineState(idx=qgi, phase=qgp)
         if is_valid > cutlass.Int32(0):
             qi, qp, qei, qep, ii, ip, iei, iep, gei, gep = _tma_issue_item(
                 tma_q,
@@ -1141,8 +1169,8 @@ def _tmaldg_warp_group(
             i_state = PipelineState(idx=ii, phase=ip)
             ie_state = PipelineState(idx=iei, phase=iep)
             ge_state = PipelineState(idx=gei, phase=gep)
-        if cutlass.const_expr(CFG.EPILOGUE_GATE):
-            # The gate of the CURRENT item, after the next item's prefetch was queued (the Q / ids prefetch keeps its place
+        if cutlass.const_expr(CFG.EPILOGUE_GATE and STAGES_Q > 1):
+            # TWO Q slots: the gate of the CURRENT item, after the next item's prefetch was queued (the Q / ids prefetch keeps its place
             # under this item's KV loop; the gate's wait is the item's LAST BMM1 -- the late one) and before the next credit
             # (which the softmax warps give only after epilogue(i), later than this issue).
             if is_valid <= cutlass.Int32(0):
@@ -1164,11 +1192,12 @@ def _tmaldg_warp_group(
         bars.mb_ids_empty[ie_state.idx].wait(ie_state.phase)
         ie_state = advance(ie_state, STAGES_IDS)
     if cutlass.const_expr(CFG.EPILOGUE_GATE):
-        # Row 12: n_items completions against n_items waits -- n_items - 1 before Q(1 .. n_items - 1) (Q(1)'s the pre-armed pass,
-        # Q(j)'s = epilogue(j - 2)) plus the exit-path wait taken above BEFORE the last gate (= epilogue(n_items - 2); the pass
-        # itself at n_items = 1) -> exactly STAGES_GATE = 1 unconsumed (epilogue(n_items - 1)) for every n_items >= 1, and the
-        # consumer never two completions behind the single-stage barrier.  Row 2 needs no drain here: every mb_q_empty commit
-        # was consumed by its item's gate load.
+        # Row 12: n_items completions against n_items waits on either arm -- TWO slots: n_items - 1 before Q(1 .. n_items - 1)
+        # (Q(1)'s the pre-armed pass, Q(j)'s = epilogue(j - 2)) plus the exit-path wait taken above BEFORE the last gate (=
+        # epilogue(n_items - 2); the pass itself at n_items = 1); ONE slot: the pre-armed pass before Q(0) plus epilogue(i) before
+        # Q(i + 1) for i < n_items - 1 -> on both exactly STAGES_GATE = 1 unconsumed (epilogue(n_items - 1)) for every n_items >= 1,
+        # and the consumer never two completions behind the single-stage barrier.  Row 2 needs no drain here: every mb_q_empty
+        # commit was consumed by its item's gate load.
         for _ in cutlass.range_constexpr(CFG.STAGES_GATE):
             bars.mb_gate_empty.wait(ge_state.phase)
             ge_state = advance(ge_state, CFG.STAGES_GATE)
@@ -2083,7 +2112,8 @@ def _softmax_warp_group(
 
             # --- the fused epilogue gate (CFG.EPILOGUE_GATE; barrier rows 11 / 12): ONE wait per item (the first pass) on the gate the TMA
             # warp staged into this item's freed Q^T slot after its last BMM1 (it has had the last tile's softmax, BMM2, the column
-            # sums and the LSE to land), the opaque 0.5 hoisted once per item (frost-tile-dsl section 7), the slot = i % 2.
+            # sums and the LSE to land), the opaque 0.5 hoisted once per item (frost-tile-dsl section 7), the slot = i % STAGES_Q (0 on
+            # the union rendering, whose TMA warp issues gate(i) before Q(i + 1)).
             if cutlass.const_expr(CFG.EPILOGUE_GATE and p == 0):
                 half_opaque = gate_half_opaque()
                 bars.mb_gate_full.wait(gf_state.phase)
