@@ -7324,14 +7324,25 @@ class _QuantizedCacheWrite(_Stage):
     (Rule 7).  Three launches where the bf16 write-through runs one -- the fusion into the projection epilogue is a later lane's lever.
     """
 
-    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, dtype: torch.dtype, page_size: int) -> None:
+    def __init__(
+        self,
+        geometry: GatedAttentionBlockGeometry,
+        *,
+        batch: int,
+        seq_len: int,
+        dtype: torch.dtype,
+        page_size: int,
+        index_raw_pool: bool = True,  # appended: the raw-key arm (False under the in-block indexer's decode step: the raw key lives in the RING, as _CacheWrite)
+    ) -> None:
         self.name = "cache_write_e4m3"
         self.geom = geometry
         self.batch = int(batch)
         self.seq_len = int(seq_len)
         self.dtype = dtype  # the activation dtype: the source rows and the indexer pool
         self.page_size = int(page_size)
-        self.index_band = bool(geometry.index_band)
+        # the raw indexer key's pool arm: the band's pool on the caller-list band form; NOT under the decode indexer over the pools, whose raw key
+        # enters the ring (the prepare / the step form) -- the block then hands no index_src / index_cache, as for the bf16 write-through
+        self.index_band = bool(geometry.index_band) and bool(index_raw_pool)
         # ONE per-tensor cast recipe at h_kv heads serves K and V (the same [T, H_kv, D] form); the scale slot is the reciprocal
         self._quant = _Quantize(geometry, batch=batch, seq_len=seq_len, dtype_in=dtype, heads=geometry.h_kv, name="quantize_kv_cache")
         self._recipes = None  # {slot dtype: (K / V bit-copy recipe at D / 2 bf16 pairs, indexer recipe or None)}
@@ -8739,7 +8750,10 @@ class GatedAttentionBlockFwd(APIBase):
         if not self.paged_kv_page_size or self.cache_write_fused or self.cache_write_in_norm_rope:
             self._cache_write = None
         elif self.kv_cache_e4m3:
-            self._cache_write = _QuantizedCacheWrite(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size)
+            # (under the decode indexer over the pools the raw key enters the RING, so the band's raw-key pool arm is not built -- as for _CacheWrite below)
+            self._cache_write = _QuantizedCacheWrite(
+                geometry, batch=self.batch, seq_len=self.seq_len, dtype=act, page_size=self.paged_kv_page_size, index_raw_pool=not self.indexer_decode
+            )
         else:
             # under the decode indexer over the pools the raw key enters the RING (the prepare / the step form), so the band's raw-key
             # pool arm is not built there (index_k_raw refused by name)

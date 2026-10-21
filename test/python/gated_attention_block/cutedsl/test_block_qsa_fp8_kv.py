@@ -1166,7 +1166,7 @@ def test_get_workspace_size_is_honest_and_holds_no_scratch():
     assert blk._sdpa.scratch_workspace_bytes() > 0 and blk.get_workspace_size() >= lay.total_bytes + blk._sdpa.scratch_workspace_bytes()
     assert not hasattr(lay, "kv_gathered") and not hasattr(lay, "kv_len_t") and lay.kv_inv > lay.vc8 > lay.kc8 >= 0
     twin, _ = _declare(GEOM_SMALL, 3, 2, pool_dtype=BF16, kv_cache_dtype=None, fuse_gate=True, decode_split_kv=4, return_lse=True)
-    assert blk.get_workspace_size() - twin.get_workspace_size() == lay.total_bytes - twin._layout().total_bytes  # the three e4m3 slots only
+    assert lay.total_bytes - twin._layout().total_bytes == lay.total_bytes - lay.kc8  # the three e4m3 slots are the whole difference of the carves
     need = blk.get_workspace_size()
     ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
     ws[need:].fill_(0xA5)
@@ -1495,7 +1495,9 @@ def test_indexer_e4m3_first_execute_captures_and_replays_bitwise_over_new_scales
     """The indexer form over e4m3 pools captured on its FIRST execute (no warm-up; ``set_sync_debug_mode("error")``), the replay bitwise a
     fresh eager run; new scales through the captured tensors (a recalibration) replay bitwise the eager run over them -- the scales are
     read in-kernel, never a plan constant."""
-    case = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 300), page=16, seed=221, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    # the 24 / 2 band geometry: its slab (N 13952) rides the small-M route's tile at these row counts, capture-safe from the first execute; the
+    # 8 / 2 band slab (N 5760) takes the GEMM graph route, whose handle is created eagerly (the decode module's indexer capture cell, the same choice)
+    case = _IndexerE4m3Case(GEOM_FLASH_NEXT, 1, (2052, 300), page=16, seed=221, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
     case.prime_prefix()
     case.blk.check_support()
     case.blk.compile()
