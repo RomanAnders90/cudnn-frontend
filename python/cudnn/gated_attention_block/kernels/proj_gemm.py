@@ -1325,6 +1325,9 @@ _SMALL_M_SPLIT_K_MIN_K_TILES = 64  # split K only past this depth (K 4096 at 2 b
 _SMALL_M_MIN_K_TILES_PER_SLICE = 8
 _SMALL_M_K_CLUSTER_MAX = 8  # the K-cluster split's slice cap: the portable cluster size (the compiler's own bound)
 _SMALL_M_K_CLUSTER_TILE_ROWS = 128  # the weight tile the K-cluster form splits into S equal owner slices
+_SMALL_M_CTA_K_BYTES = 128  # the catalog's 128-byte K tile (`_SMALL_M_CTA_K_ELEMS` at 2 bytes)
+_SM100_MATMUL_SMEM_FIXED_RESERVE = 2048  # `sm100_matmul.py`'s fixed SMEM reserve in the kernel registry (pinned by test_proj_gemm.py)
+_SMALL_M_AB_STAGE_CAP = 16  # the A/B pipeline's depth ceiling (`tile_config.smem_ab_stages`; pinned by test_proj_gemm.py)
 
 
 def device_cluster_capacity(device=None) -> dict:
@@ -1342,12 +1345,48 @@ def device_cluster_capacity(device=None) -> dict:
         return {}
 
 
-def _k_cluster_fits(tiles: int, slices: int, cluster_capacity: Mapping[int, int]) -> bool:
-    """Whether the K-cluster split of ``slices`` is admitted for ``tiles`` 128-row weight tiles: every slice CTA of every tile
-    co-resident (ONE tile per CTA: the form's staging plane aliases the drained A ring), the slice count within the
-    portable cluster size and dividing the 128 rows into equal owner slices -- the compiler's own admission, read here so the
-    route names a form the compile admits (a mismatch would be the compile's typed decline, never a silent route change)."""
-    return 2 <= slices <= _SMALL_M_K_CLUSTER_MAX and _SMALL_M_K_CLUSTER_TILE_ROWS % slices == 0 and tiles <= int(cluster_capacity.get(slices, 0) or 0)
+def device_smem_budget(device=None) -> int:
+    """The largest per-CTA shared memory the active device gives a CTA (the GEMM compiler's own budget: the oversized carveout
+    where the part has one, else the opt-in limit), the route's third device fact; ``0`` when no CUDA device is visible or the
+    query cannot answer (admits no K cluster).  Read through FROST's device layer so it follows a ``build_device()`` scope."""
+    try:
+        from cudnn.frost.device import is_available
+        from cudnn.gemm.frost.tile_config import _sm_smem_budget_bytes
+
+        if not is_available():
+            return 0
+        return int(_sm_smem_budget_bytes(device))
+    except Exception:  # noqa: BLE001 -- a query that cannot answer is "no cluster fits", never a failed plan
+        return 0
+
+
+def _k_cluster_smem_fits(tn: int, smem_budget: int) -> bool:
+    """The compiler's SMEM admission of a 128-row K-cluster form at token width ``tn`` (bf16 / f16), mirrored: the RECEIVE plane
+    (its own shared memory, ``128 x (tn + 4)`` fp32 rows: a 16-byte pad per row) leaves at least one A/B stage in the budget, and
+    the STAGING plane (the same size, aliasing the drained A ring) fits that ring at the stage count beside the receive plane.
+    The 128-token forms are the ones that differ by part: `128 x 528 B` = 67.5 KB of plane fits beside 8 stages on the 327-KiB
+    carveout (A ring 128 KB) and not beside the 4 stages of the 227-KiB opt-in limit (A ring 64 KB); every narrower plane fits
+    on both."""
+    rows = _SMALL_M_K_CLUSTER_TILE_ROWS
+    plane_bytes = rows * (tn + 4) * 4
+    per_stage_bytes = (rows + tn) * _SMALL_M_CTA_K_BYTES
+    avail = smem_budget - _SM100_MATMUL_SMEM_FIXED_RESERVE - plane_bytes
+    stages = min(avail // per_stage_bytes, _SMALL_M_AB_STAGE_CAP) if avail >= per_stage_bytes else 0
+    return stages >= 1 and plane_bytes <= stages * rows * _SMALL_M_CTA_K_BYTES
+
+
+def _k_cluster_fits(tiles: int, slices: int, cluster_capacity: Mapping[int, int], tn: int, smem_budget: int) -> bool:
+    """Whether the K-cluster split of ``slices`` is admitted for ``tiles`` 128-row weight tiles at token width ``tn``: every slice
+    CTA of every tile co-resident (ONE tile per CTA: the form's staging plane aliases the drained A ring), the slice count within
+    the portable cluster size and dividing the 128 rows into equal owner slices, and the exchange planes within the part's SMEM
+    budget (:func:`_k_cluster_smem_fits`) -- the compiler's own admission, read here so the route names a form the compile admits
+    (a mismatch would be the compile's typed decline, never a silent route change)."""
+    return (
+        2 <= slices <= _SMALL_M_K_CLUSTER_MAX
+        and _SMALL_M_K_CLUSTER_TILE_ROWS % slices == 0
+        and tiles <= int(cluster_capacity.get(slices, 0) or 0)
+        and _k_cluster_smem_fits(tn, smem_budget)
+    )
 
 
 def launches_of_tile_config(name: Optional[str]) -> int:
@@ -1371,6 +1410,7 @@ def small_m_tile_config(
     alpha: bool = False,
     sm_count: Optional[int] = None,
     cluster_capacity: Optional[Mapping[int, int]] = None,
+    smem_budget: Optional[int] = None,
 ) -> Optional[str]:
     """The catalog config name of the small-M route for a ``[m, k] x [k, n]`` projection, or None when the route does not
     apply (a non-positive extent, ``m > SMALL_M_MAX``, a dtype other than bf16 / f16, a block-scale or fp8 plan, an MN-major
@@ -1378,8 +1418,10 @@ def small_m_tile_config(
     tiles overflow a wave -- the indexer band's 13952-column slab).  ``sm_count`` is the target's SM count (the active device when None); the SAME shape resolves
     to the same name on every part of one SM-count class, so a recorded plan name replays.  ``cluster_capacity`` (appended) is
     the target's ``{cluster size: co-resident clusters}`` table (the active device's when None; ``{}`` admits no K cluster): the
-    second device fact, deciding whether a split is the K-cluster form or the two-kernel form -- so a recorded name replays on
-    the same part class (SM count AND cluster capacity), and a table makes the rule a pure function on any host."""
+    second device fact, deciding whether a split is the K-cluster form or the two-kernel form; ``smem_budget`` (appended) is the
+    target's per-CTA shared-memory budget in bytes (the active device's when None; the third device fact: the 128-token K-cluster
+    form needs the 327-KiB carveout, see :func:`_k_cluster_smem_fits`) -- so a recorded name replays on the same part class (SM
+    count, cluster capacity AND SMEM budget), and a table plus a budget make the rule a pure function on any host."""
     if m <= 0 or n <= 0 or k <= 0:
         # a non-positive extent never reaches the one-wave arithmetic below (``n = 0`` would divide by a zero CTA count, ``m`` or
         # ``k`` at 0 would still spell a tile): the route declines and ``build_proj_gemm``'s own extent check names the extent
@@ -1405,6 +1447,8 @@ def small_m_tile_config(
         sm_count = _sm_count()
     if cluster_capacity is None:
         cluster_capacity = device_cluster_capacity()
+    if smem_budget is None:
+        smem_budget = device_smem_budget()
     tn = 8
     while tn < m:
         tn *= 2
@@ -1430,7 +1474,7 @@ def small_m_tile_config(
         # The split's form: the K-cluster split wherever the target co-schedules every slice CTA of every tile (the reduce
         # inside the GEMM kernel, no reducer launch), else the two-kernel split; past 64 tokens the K-cluster split is
         # preferred over the plain 64x32 tile (the plain tile streams the weight from half the SMs the split uses).
-        k_cluster = slices > 1 and _k_cluster_fits(ctas_128, slices, cluster_capacity)
+        k_cluster = slices > 1 and _k_cluster_fits(ctas_128, slices, cluster_capacity, tn, smem_budget)
         if k_cluster:
             return f"CONFIG_sm100_128x{tn}x128_128x{tn}x32_cluster1x1x{slices}_1ctamma_splitK{slices}_swapAB"
         if m > 64 and (slices == 1 or -(-m // 64) * -(-n // 32) <= sm_count):

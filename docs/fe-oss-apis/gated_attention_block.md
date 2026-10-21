@@ -1102,13 +1102,16 @@ seven-launch chain. The fused kernel the stage runs is a declaration fact:
 
 **The out projection's split-K reduces inside one thread-block cluster** (the small-M route's narrow-weight branch: N `d_model` x K `h_q * D`
 at `T = B x S_q <= 128` rows). The split-K slice count is the one-wave count as before (8 at the 24/2 shard's 20 x 128-row weight tiles); its
-FORM follows the part's cluster capacity, the route's second device fact beside the SM count (`cudnn.frost.occupancy`): where every slice CTA
-of every tile is co-resident (`max_active_clusters(S) >= the tile count`, `S <= 8`, `S` dividing the 128 rows), the split is the K-CLUSTER form
+FORM follows the part's cluster capacity, the route's second device fact beside the SM count (`cudnn.frost.occupancy`), and its per-CTA
+shared-memory budget, the third (the exchange planes -- `128 x (tn + 4)` fp32 rows each, the receive plane its own shared memory off the
+A/B stage budget, the staging plane within the drained A ring -- so the 128-token form needs the 327-KiB carveout; every narrower form fits
+the 227-KiB opt-in limit as well): where every slice CTA of every tile is co-resident (`max_active_clusters(S) >= the tile count`, `S <= 8`,
+`S` dividing the 128 rows) and the planes fit, the split is the K-CLUSTER form
 `CONFIG_sm100_128x{tn}x128_..._cluster1x1x{S}_1ctamma_splitK{S}_swapAB` -- the S slices of one tile are one cluster, the fp32 planes are exchanged
 through distributed shared memory and each CTA sums its rows in the two-kernel reducer's FIXED order, so the GEMM is ONE launch (the kernel
 symbol carries `_kcluster`), no reducer launch, no fp32 partials in the workspace and `out` BITWISE the two-kernel form's; past 64 tokens that
 split replaces the plain `64x32` tile. Elsewhere (a part whose table admits fewer clusters, a slice count that does not divide the tile's
-rows -- the 32/2 shard's `splitK6` --, a shallow K) the two-kernel split runs as before. The chain's launch census is therefore one shorter on
+rows -- the 32/2 shard's `splitK6` --, a 128-token plane on the 227-KiB budget, a shallow K) the two-kernel split runs as before. The chain's launch census is therefore one shorter on
 such a part (the decode step's seven / eight launches read six / seven), `blk._out_proj` names the form through its plan, and
 `proj_tile_configs={"out_proj": <today's splitK name>}` pins the two-kernel form -- the A/B arm (bitwise) and an escape hatch. The slab GEMM is
 unchanged: its 109-tile launch sits at the ceiling of any uniform tile on a 212-SM part.

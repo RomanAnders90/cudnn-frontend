@@ -1219,11 +1219,13 @@ def test_small_m_route_names_the_k_cluster_split_where_the_cluster_capacity_admi
     target's cluster capacity -- the K-cluster form (``cluster1x1x8``: the reduce inside the GEMM, one launch) where 20 clusters of 8 are
     co-resident, the two-kernel form where they are not (19).  Past 64 tokens the K-cluster split replaces the plain ``64x32`` tile."""
     n, k = _OUT
-    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_ADMITS) == expect_admitted
-    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=204, cluster_capacity=_CAP_204) == expect_admitted
-    short = small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_SHORT)
+    kw = dict(dtype=torch.bfloat16, smem_budget=_RUBIN_BUDGET)
+    assert small_m_tile_config(m, n, k, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_ADMITS, **kw) == expect_admitted
+    assert small_m_tile_config(m, n, k, sm_count=204, cluster_capacity=_CAP_204, **kw) == expect_admitted
+    short = small_m_tile_config(m, n, k, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_SHORT, **kw)
     assert short == ("CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma" if m > 64 else _two_kernel_name(min(128, 8 if m <= 8 else m)))
-    assert small_m_tile_config(m, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS, cluster_capacity={}) == short  # no table: no K cluster
+    assert small_m_tile_config(m, n, k, sm_count=_RUBIN_SMS, cluster_capacity={}, **kw) == short  # no table: no K cluster
+    assert small_m_tile_config(m, n, k, sm_count=_RUBIN_SMS, cluster_capacity=_CAP_212_ADMITS, dtype=torch.bfloat16, smem_budget=0) == short  # no budget: none
     from cudnn.gemm.frost.tile_config import by_name
 
     cfg = by_name(expect_admitted)
@@ -1251,11 +1253,72 @@ def test_small_m_route_reads_the_device_cluster_capacity_by_default(monkeypatch)
 
     n, k = _OUT
     monkeypatch.setattr(pg, "device_cluster_capacity", lambda device=None: dict(_CAP_212_ADMITS))
+    monkeypatch.setattr(pg, "device_smem_budget", lambda device=None: _RUBIN_BUDGET)
     assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _k_cluster_name(8)
+    assert small_m_tile_config(128, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _k_cluster_name(128)
+    monkeypatch.setattr(pg, "device_smem_budget", lambda device=None: _SM100_BUDGET)  # the 227-KiB part: the 128-token plane is out
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _k_cluster_name(8)
+    assert small_m_tile_config(128, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
+    monkeypatch.setattr(pg, "device_smem_budget", lambda device=None: 0)  # no device: no plane fits
+    assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _two_kernel_name(8)
+    monkeypatch.setattr(pg, "device_smem_budget", lambda device=None: _RUBIN_BUDGET)
     monkeypatch.setattr(pg, "device_cluster_capacity", lambda device=None: {})
     assert small_m_tile_config(1, n, k, dtype=torch.bfloat16, sm_count=_RUBIN_SMS) == _two_kernel_name(8)
+    monkeypatch.undo()
     if not torch.cuda.is_available():
-        assert pg.device_cluster_capacity() == {}
+        assert pg.device_cluster_capacity() == {} and pg.device_smem_budget() == 0
+    else:
+        from cudnn.gemm.frost.tile_config import _sm_smem_budget_bytes
+
+        assert pg.device_smem_budget() == _sm_smem_budget_bytes() > 0
+
+
+def test_the_k_cluster_route_mirrors_the_compiler_smem_admission(monkeypatch):
+    """The route's SMEM fact on a 148-SM part: a 2048-column weight (16 tiles: narrow there) with a deep K splits 8 ways (`148 // 16`
+    caps at the portable 8), and 18 clusters of 8 are co-resident -- so the route names the K-cluster form up to 64 tokens on EVERY
+    budget, and at 65..128 tokens on the 327-KiB carveout only: the 128-token plane (67.5 KB, its own SMEM) leaves 4 stages on the
+    227-KiB opt-in limit, an A ring (64 KB) narrower than the staging plane that aliases it, where the compiler declines; the route then
+    keeps today's plain ``64x32`` tile.  The compiler agrees cell by cell (the same budget pinned): the route never names a form the
+    compile declines, which on such a part would have been a failed declaration, not a slower one."""
+    from cudnn.gated_attention_block.kernels import proj_gemm as pg
+    from cudnn.gemm.frost.tile_config import by_name
+
+    n, k, sms, cap = 2048, 6144, 148, {8: 18}
+    kw = dict(dtype=torch.bfloat16, sm_count=sms, cluster_capacity=cap)
+    for budget in (_SM100_BUDGET, _RUBIN_BUDGET):
+        assert small_m_tile_config(1, n, k, smem_budget=budget, **kw) == _k_cluster_name(8)
+        assert small_m_tile_config(64, n, k, smem_budget=budget, **kw) == _k_cluster_name(64)
+    assert small_m_tile_config(128, n, k, smem_budget=_RUBIN_BUDGET, **kw) == _k_cluster_name(128)
+    assert small_m_tile_config(128, n, k, smem_budget=_SM100_BUDGET, **kw) == "CONFIG_sm100_64x32x128_64x32x32_cluster1x1_1ctamma"
+    assert pg._k_cluster_smem_fits(128, _RUBIN_BUDGET) and not pg._k_cluster_smem_fits(128, _SM100_BUDGET)
+    assert all(pg._k_cluster_smem_fits(tn, _SM100_BUDGET) for tn in (8, 16, 32, 64)) and not pg._k_cluster_smem_fits(256, _RUBIN_BUDGET)
+    # the compiler's own admission at the same two budgets
+    C100 = _pin_render(monkeypatch, budget=_SM100_BUDGET, capacity=cap)
+    C100._analyze_for_config(_oproj_graph(64, k, n), by_name(_k_cluster_name(64)))
+    with pytest.raises(NotImplementedError, match="must fit the drained A ring it aliases"):
+        C100._analyze_for_config(_oproj_graph(128, k, n), by_name(_k_cluster_name(128)))
+    C100 = _pin_render(monkeypatch, budget=_RUBIN_BUDGET, capacity=cap)
+    C100._analyze_for_config(_oproj_graph(128, k, n), by_name(_k_cluster_name(128)))
+
+
+def test_the_route_pins_the_compiler_constants_it_mirrors(monkeypatch):
+    """The two numbers the SMEM mirror hard-codes are the compiler's: the template's fixed reserve (the kernel registry's entry for
+    ``sm100_matmul.py``) and the A/B pipeline's depth ceiling (``smem_ab_stages`` with an unbounded budget)."""
+    from cudnn.gated_attention_block.kernels import proj_gemm as pg
+    from cudnn.gemm.frost import tile_config as TC
+    from cudnn.gemm.frost.kernel_registry import TEMPLATES
+
+    (tmpl,) = [t for t in TEMPLATES if t.file == "sm100_matmul.py"]
+    assert tmpl.smem_fixed_reserve == pg._SM100_MATMUL_SMEM_FIXED_RESERVE
+    monkeypatch.setattr(TC, "_sm_smem_budget_bytes", lambda device=None: 1 << 40)
+    assert TC.smem_ab_stages(1, smem_fixed_reserve=0) == pg._SMALL_M_AB_STAGE_CAP
+    assert pg._SMALL_M_CTA_K_BYTES == pg._SMALL_M_CTA_K_ELEMS * 2 == by_name_k_bytes()
+
+
+def by_name_k_bytes():
+    from cudnn.gemm.frost.tile_config import by_name
+
+    return by_name(_k_cluster_name(8)).cta_tile_k_bytes
 
 
 def test_launches_of_tile_config_counts_the_reducer_launch():
