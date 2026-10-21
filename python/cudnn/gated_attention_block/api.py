@@ -554,11 +554,6 @@ QSA_INDEX_LIST_FORMS = (None, QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PE
 under caller lists at ``S_q <= 4``, ``"per_row"`` past it and under the in-block indexer over the pools), ``"shared"`` = one list per
 sequence anchored at the step-0 position, ``"per_row"`` = one list per row at the row's own position."""
 """``kv_cache_dtype``: e4m3 pools with per-tensor fp32 ``k_scale`` / ``v_scale`` at execute (the serving stacks' fp8 KV cache)."""
-_UPCAST_ROWS = (
-    2176  # rows per (token, KV head) item of the gathered-cast scratch: 17 x the decode tile's 128-row KV tile (qsa_kv_upcast.ROWS, pinned at check_support)
-)
-_UPCAST_D = 256  # the scratch row width (qsa_kv_upcast.D, pinned at check_support)
-_UPCAST_MAX_S_Q = 4  # the cast serves the SHARED list only: one list per sequence, S_q <= 4 (qsa_kv_upcast.MTP_MAX_S_Q, pinned at check_support)
 SERVING_PAGE_SIZES = (16, 32, 64, 128)
 """The page sizes the serving forms are VALIDATED at (the kernel block sizes the serving stacks allocate); the attribute itself
 takes any positive multiple of :data:`PAGED_KV_PAGE_ALIGN` and the SDPA adapter's own page rule still applies."""
@@ -1982,13 +1977,11 @@ class _Intermediates:
     ix_ids_sorted: int = -1  # [T, top_k] int32: the canonical list the sparse core consumes (ids descending, then -1)
     ix_sort_idx: int = -1  # [min(T, _QSA_SORT_ROWS), top_k] int64: the row sort's index output, reused per row window
     # e4m3 KV cache (``kv_cache_dtype``) only (-1 otherwise): the compact e4m3 K / V rows the quantizing write-through stages into
-    # before the bit copy into the pools, the two fp32 reciprocals of ``k_scale`` / ``v_scale``, and -- on the block-sparse decode mode
-    # -- the gathered-cast bf16 scratch ``[items, 2, 2176, 256]`` + its per-item ``kv_len_t`` (``kernels/qsa_kv_upcast.py``).
+    # before the bit copy into the pools and the two fp32 reciprocals of ``k_scale`` / ``v_scale`` (the sparse core reads the e4m3 pools
+    # in-kernel: no scratch; the gathered-cast scratch of 2026-10-14 is retired).
     kc8: int = -1  # [T, H_kv, D] e4m3
     vc8: int = -1  # [T, H_kv, D] e4m3
     kv_inv: int = -1  # [2] fp32: 1 / k_scale, 1 / v_scale
-    kv_gathered: int = -1  # [B x S_q x H_kv, 2, 2176, 256] bf16
-    kv_len_t: int = -1  # [B x S_q x H_kv] int32
     # fp8 indexer cache (``QsaSpec.index_cache_dtype=torch.float8_e4m3fn``) only (-1 otherwise): the e4m3 indexer queries and compressed
     # keys the scorer's MXFP8 arm reads, cast from ``ix_q`` / ``ix_kbar`` (below the identity bound only ``ix_kbar`` is reserved, as the
     # cache cast's bf16 staging slot).  Appended LAST: every layout without the attribute is byte-identical to before.
@@ -2058,7 +2051,6 @@ def _plan_workspace(
     saved_gate_copy: bool = False,
     thd_num_sequences: int = 0,
     kv_cache_e4m3: bool = False,
-    upcast_items: int = 0,
     decode_q_lens: int = 0,
     qsa_indexer_cand_floats: Optional[int] = None,
     qsa_indexer_e4m3: bool = False,
@@ -2074,12 +2066,11 @@ def _plan_workspace(
     ``qsa_indexer_decode_cache_bytes`` (appended; ``None`` = the activation dtype's size) is the indexer cache dtype's element size: the
     ``ix_q`` slot is carved at it (1 under the e4m3 indexer cache -- the e4m3 queries; every bf16 carve byte-identical).
 
-    ``kv_cache_e4m3`` / ``upcast_items`` (appended; the e4m3 KV cache): the quantizing write-through's compact e4m3 ``kc8`` /
-    ``vc8`` rows (``t * h_kv * d_head`` bytes each) and the two inverse scales ``kv_inv``, and -- ``upcast_items > 0``, the
-    block-sparse decode mode over e4m3 pools -- the gathered-cast bf16 scratch ``kv_gathered`` (``items x 2 x 2176 x 256`` bf16)
-    plus ``kv_len_t`` (``items`` int32), all at the END of the non-fused layout; every layout without the attribute is
-    byte-identical to before.  A form of the bf16 pipeline (``fp8`` with it is a typed ``ValueError`` here, mirroring the
-    declaration).
+    ``kv_cache_e4m3`` (appended; the e4m3 KV cache): the quantizing write-through's compact e4m3 ``kc8`` / ``vc8`` rows
+    (``t * h_kv * d_head`` bytes each) and the two inverse scales ``kv_inv``, at the END of the non-fused layout; every layout
+    without the attribute is byte-identical to before (the block-sparse decode mode over e4m3 pools reads them through the
+    sparse core's in-kernel dequant arm and carves no scratch; the gathered-cast scratch of 2026-10-14 is retired).  A form of
+    the bf16 pipeline (``fp8`` with it is a typed ``ValueError`` here, mirroring the declaration).
 
     ``want_saved`` / ``saved_gate_copy`` (appended): the TRAINING forward
     (``save_for_backward=True``; out of place, on the UNFUSED bf16 / fp16 /
@@ -2186,8 +2177,6 @@ def _plan_workspace(
             "kv_cache_e4m3 (the e4m3 KV cache) is a form of the bf16 pipeline: the quantized pipelines' K / V are e4m3 codes of another "
             "recipe (the per-tensor FP8 / MXFP8 SDPA rows take e4m3 Q / K / V together)"
         )
-    if upcast_items and not kv_cache_e4m3:
-        raise ValueError("upcast_items belongs to the e4m3 KV cache (kv_cache_e4m3=True): the gathered-cast scratch exists only there")
     e = _itemsize(dtype)
     t = b * s
     off = 0
@@ -2307,12 +2296,9 @@ def _plan_workspace(
         # cache is its cast); there is no scorer to feed.
         slots += [("ix_kbar", b * (s // geom.qsa.block_size) * geom.qsa.index_head_dim * e)]
     if kv_cache_e4m3:
-        # e4m3 KV cache (kv_cache_dtype): the quantizing write-through's compact e4m3 K / V rows and the two inverse scales; on the
-        # block-sparse decode mode the gathered-cast scratch + its per-item lengths.  At the END: every layout without the attribute
-        # is byte-identical to before.
+        # e4m3 KV cache (kv_cache_dtype): the quantizing write-through's compact e4m3 K / V rows and the two inverse scales.  At the END:
+        # every layout without the attribute is byte-identical to before.
         slots += [("kc8", t * geom.h_kv * geom.d_head), ("vc8", t * geom.h_kv * geom.d_head), ("kv_inv", 2 * 4)]
-        if upcast_items:
-            slots += [("kv_gathered", int(upcast_items) * 2 * _UPCAST_ROWS * _UPCAST_D * 2), ("kv_len_t", int(upcast_items) * 4)]
     if decode_q_lens:
         # The DECODE form's PREFILL route: the paged THD leg's per-sequence Q lengths ([B] int32, the constant S_q), carved here and
         # filled on the launch stream by every execute (_fill_decode_q_lens).  At the END: every other layout is byte-identical to before.
@@ -2355,8 +2341,6 @@ def _plan_workspace(
         kc8=offsets.get("kc8", -1),
         vc8=offsets.get("vc8", -1),
         kv_inv=offsets.get("kv_inv", -1),
-        kv_gathered=offsets.get("kv_gathered", -1),
-        kv_len_t=offsets.get("kv_len_t", -1),
         ix_q8=offsets.get("ix_q8", -1),
         ix_kbar8=offsets.get("ix_kbar8", -1),
         decode_q_lens=offsets.get("decode_q_lens", -1),
@@ -5890,244 +5874,6 @@ class _SparseSdpa(_Stage):
             seq_kv_lens=seq_lens,
             gate=gate,
             **thd_kw,
-        )
-
-
-class _UpcastSparseSdpa(_Stage):
-    """(4) under ``kv_cache_dtype=torch.float8_e4m3fn`` on the block-sparse DECODE mode (``kv_source="paged"`` on a dense
-    ``[B, S_q <= 4]`` QsaSpec declaration): the e4m3 pools' LISTED rows gathered and cast back to bf16, then the bf16 d256 DECODE
-    tile over the result as a plain padded dense SDPA -- the sparse core untouched by fp8.
-
-    Two launches, no new kernel: (a) ``kernels/qsa_kv_upcast.py`` reads, per (token, KV head) ITEM, the sequence's SHARED list
-    (``block_ids [B, top_k]`` + ``block_lens [B]``, anchored at the step-0 position) and the open tail over ``[0, kv_lens[b])``
-    through ``block_table[b]`` on the bottom-right diagonal, dequantizes each e4m3 row (``bf16(fp32(code) x scale)``; ``k_scale`` /
-    ``v_scale`` read on device) and writes the visible rows COMPACTED in list order into the workspace scratch ``kv_gathered
-    [items, 2, 2176, 256]`` -- every row past the item's count 0.0 (``zero_fill="full"``), so a tile the decode kernel reads past
-    the length is FINITE whatever the workspace held -- plus ``kv_len_t [items]`` (0 = a dead item: a dead entry, or a row at a
-    negative position); (b) the Rubin d256 decode tile (``SdpaFwdDslSm100``; its ``kernel_template`` pinned to ``decode_d256_f16``
-    at compile) over Q as ``[items, G, 1, D]`` (the COMPACT normed Q viewed per item: the G query heads of the item's KV head -- a
-    view of the compact Q only, which is why the mode norms + rotates out of place), K / V ``[items, 1, 2176, D]`` (the scratch's two
-    halves), O as ``[items, G, 1, D]`` (the workspace ``o`` slot: the same bytes as ``[T, H_q, D]``), NO causal mask (the gathered
-    rows ARE the visible set), ``seq_kv_lens = kv_len_t`` on the KV side only (a dead item is the tile's empty-range select: O = 0),
-    the group packed (``pack_gqa``), unsplit.  No LSE, no epilogue gate (stage (5) runs as its own launch), no split: typed
-    declines at the block's declaration.
-
-    Both ``has_block_lens`` artifacts of the cast are compiled at plan time (Rule 4); the cast kernel's DSL / arch gate runs inside
-    ``check_support`` BEFORE its module is imported (Rule 7: the module imports the DSL at import time).  The scratch is the block's
-    workspace (``_plan_workspace(kv_cache_e4m3=True, upcast_items=)``); the decode tile's own scratch (0 unsplit) folds through
-    :meth:`scratch_workspace_bytes` like every other SDPA stage's.  The list contract (``top_k``, the 4-token block, the group of at
-    most 16 heads) is the sparse record's, re-checked here so the stage is honest on its own.
-    """
-
-    name = "sdpa_sparse_e4m3"
-
-    def __init__(
-        self,
-        geometry: GatedAttentionBlockGeometry,
-        *,
-        batch: int,
-        seq_len: int,
-        dtype: torch.dtype,
-        device,
-        page_size: int,
-        k_cache_desc: Optional[TensorDesc],
-        v_cache_desc: Optional[TensorDesc],
-        block_table_desc: Optional[TensorDesc],
-    ) -> None:
-        if geometry.qsa is None:
-            raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the e4m3 read is the block-sparse decode mode's")
-        if dtype != torch.bfloat16:
-            raise NotImplementedError(
-                f"{self.name}: bf16 activations only (the gathered cast writes bf16 rows and the decode tile reads a bf16 Q), got {dtype}"
-            )
-        if not (1 <= int(seq_len) <= _UPCAST_MAX_S_Q):
-            raise NotImplementedError(f"{self.name}: the shared-list form serves 1 <= S_q <= {_UPCAST_MAX_S_Q} rows per sequence, got S_q={seq_len}")
-        if int(page_size) <= 0 or int(page_size) % geometry.qsa.block_size:
-            raise ValueError(f"{self.name}: page_size must be a positive multiple of {geometry.qsa.block_size}, got {page_size}")
-        if k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
-            raise ValueError(f"{self.name}: the k_cache / v_cache / block_table descriptors are required")
-        for nm, dsc in (("k_cache", k_cache_desc), ("v_cache", v_cache_desc)):
-            if dsc.dtype != KV_CACHE_E4M3:
-                raise ValueError(f"{self.name}: sample_{nm} must be torch.float8_e4m3fn (the e4m3 KV cache), got {dsc.dtype}")
-        self.geom = geometry
-        self.batch = int(batch)
-        self.seq_len = int(seq_len)
-        self.dtype = dtype
-        self.device = device
-        self.page_size = int(page_size)
-        self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
-        self.items = self.batch * self.seq_len * int(geometry.h_kv)
-        self.group = int(geometry.gqa_ratio)
-        self._recipes = None  # {has_block_lens: QsaKvUpcastRecipe}
-        self._impl = None
-        self._compiled = False
-
-    def _device_index(self) -> int:
-        dev = torch.device(self.device)
-        return int(dev.index) if dev.index is not None else int(torch.cuda.current_device())
-
-    def _scratch_descs(self):
-        """The decode tile's operands over the scratch, storage-free: Q / O per item ``(items, G, 1, D)`` at the compact strides (the
-        unit S dim at the token stride ``G x D``: ``execute`` binds an exact ``as_strided`` view), K / V ``(items, 1, 2176, D)`` at the
-        scratch's strides ``(2 x 2176 x D, 2176 x D, D, 1)``."""
-        g, d, items, G = self.geom, self.geom.d_head, self.items, self.group
-        kv_shape, kv_stride = (items, 1, _UPCAST_ROWS, d), (2 * _UPCAST_ROWS * d, _UPCAST_ROWS * d, d, 1)
-        order = tuple(i for i, _ in sorted(enumerate(kv_stride), key=lambda x: (x[1], kv_shape[x[0]])))
-        k = TensorDesc(dtype=self.dtype, shape=kv_shape, stride=kv_stride, stride_order=order, device=self.device, name="k")
-        v = TensorDesc(dtype=self.dtype, shape=kv_shape, stride=kv_stride, stride_order=order, device=self.device, name="v")
-        return _bhsd_desc(items, G, 1, d, self.dtype, self.device, "q"), k, v, _bhsd_desc(items, G, 1, d, self.dtype, self.device, "o")
-
-    def check_support(self) -> None:
-        from cudnn.frost.buffers import cutedsl_requirement_error
-
-        too_old = cutedsl_requirement_error("the gated attention block's e4m3 KV-cache decode mode")
-        if too_old is not None:
-            raise NotImplementedError(too_old)
-        g = self.geom
-        _check_qsa_geometry_against_record(g, self.dtype)
-        if g.d_head != _UPCAST_D:
-            raise NotImplementedError(f"{self.name}: the gathered cast serves d_head == {_UPCAST_D}, got {g.d_head}")
-        cc = tuple(torch.cuda.get_device_capability(self.device))
-        if cc != _SM107_CC:
-            raise NotImplementedError(f"gated_attention_block targets Rubin (SM{_SM107_CC[0]}{_SM107_CC[1]}) only for now; found SM{cc[0]}{cc[1]}")
-        from .kernels import qsa_kv_upcast as up  # imports the DSL: after the floor gate above
-
-        if (up.ROWS, up.D, up.MTP_MAX_S_Q) != (_UPCAST_ROWS, _UPCAST_D, _UPCAST_MAX_S_Q):
-            raise RuntimeError(
-                f"{self.name}: the workspace carve's scratch geometry ({_UPCAST_ROWS} x {_UPCAST_D}, S_q <= {_UPCAST_MAX_S_Q}) and kernels/qsa_kv_upcast.py's "
-                f"({up.ROWS} x {up.D}, S_q <= {up.MTP_MAX_S_Q}) disagree -- fix the drift, neither reading is the truth alone"
-            )
-        why = up.dsl_decline_reason(self._device_index())
-        if why is not None:
-            raise NotImplementedError(why)
-        up.validate_params(h_kv=g.h_kv, top_k=g.qsa.top_k, page_size=self.page_size, zero_fill="full")
-        # the pools' DECLARED form against the cast kernel's contract (e4m3, D contiguous, 16-byte strides); the real tensors are held to
-        # it again by run_qsa_kv_upcast at execute
-        for nm, dsc in (("k_cache", self.k_cache_desc), ("v_cache", self.v_cache_desc)):
-            shape, stride = tuple(int(x) for x in dsc.shape), tuple(int(x) for x in dsc.stride)
-            if len(shape) != 4 or shape[1:] != (g.h_kv, self.page_size, g.d_head) or stride[3] != 1 or any(st % 16 for st in stride[:3]):
-                raise ValueError(
-                    f"{self.name}: sample_{nm} must be an e4m3 [num_pages, {g.h_kv}, {self.page_size}, {g.d_head}] pool with D contiguous and every other "
-                    f"stride a multiple of 16 (the cast reads rows in 16-byte vectors), got shape {shape} strides {stride}"
-                )
-        bt = self.block_table_desc
-        if int(bt.stride[1]) != 1 or (int(bt.shape[0]) > 1 and int(bt.stride[0]) != int(bt.shape[1])):
-            raise ValueError(f"{self.name}: sample_block_table must be contiguous (the cast bulk-reads the whole table), got strides {tuple(bt.stride)}")
-        from cudnn.frost.tile_dsl.constants import SCHED_NATURAL
-        from cudnn.sdpa.fwd.api_dsl import SdpaFwdDslSm100
-
-        q, k, v, o = self._scratch_descs()
-        self._impl = SdpaFwdDslSm100(
-            q,
-            k,
-            v,
-            o,
-            None,
-            is_causal=False,
-            causal_bottom_right=False,
-            scale_softmax=g.scale,
-            seq_kv_lens_present=True,
-            sched_policy=SCHED_NATURAL,
-            split_kv=1,
-            pack_gqa=True if self.group > 1 else None,
-        )
-        self._impl.check_support()
-
-    def compile(self) -> None:
-        if self._impl is None:
-            raise RuntimeError(f"{self.name}: call check_support() before compile()")
-        from .kernels import qsa_kv_upcast as up
-
-        g, dev = self.geom, self._device_index()
-        # BOTH block_lens variants at plan time: the caller passes block_lens per call or not, and nothing may compile on the execute
-        # path (Rule 4).
-        self._recipes = {
-            hb: up.compile_qsa_kv_upcast(
-                h_kv=g.h_kv, top_k=g.qsa.top_k, page_size=self.page_size, list_per_sequence=True, has_block_lens=hb, zero_fill="full", device=dev
-            )
-            for hb in (True, False)
-        }
-        self._impl.compile()
-        got = getattr(self._impl, "kernel_template", None)
-        if got != DECODE_TILE:
-            raise RuntimeError(
-                f"{self.name}: the dense core over the gathered scratch must be the Rubin d256 decode tile ({DECODE_TILE}); the adapter compiled {got!r} for "
-                f"Q [{self.items}, {self.group}, 1, {g.d_head}] over K / V [{self.items}, 1, {_UPCAST_ROWS}, {g.d_head}] -- fix the drift"
-            )
-        self._compiled = True
-
-    def scratch_workspace_bytes(self) -> int:
-        """The decode tile's own scratch over the scratch (0 unsplit), folded into the block's workspace like every SDPA stage's."""
-        if self._impl is None:
-            raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
-        return int(self._impl.scratch_workspace_bytes())
-
-    def execute(
-        self,
-        q: torch.Tensor,  # [T, H_q, D] the COMPACT normed Q
-        o: torch.Tensor,  # [T, H_q, D] the O slot, written
-        *,
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        kv_lens: torch.Tensor,
-        block_ids: torch.Tensor,
-        block_lens: Optional[torch.Tensor],
-        k_scale: torch.Tensor,
-        v_scale: torch.Tensor,
-        scratch: torch.Tensor,  # [items, 2, 2176, D] bf16 (the workspace slot)
-        kv_len_t: torch.Tensor,  # [items] int32 (the workspace slot)
-        workspace: Optional[torch.Tensor] = None,
-        current_stream=None,
-    ) -> None:
-        from .kernels import qsa_kv_upcast as up
-
-        if not self._compiled:
-            raise RuntimeError(f"{self.name}: call compile() before execute()")
-        g = self.geom
-        items, G, d, t = self.items, self.group, g.d_head, self.batch * self.seq_len
-        for nm, x in (("q", q), ("o", o)):
-            if tuple(int(s) for s in x.shape) != (t, g.h_q, d) or tuple(int(s) for s in x.stride()) != (g.h_q * d, d, 1):
-                raise ValueError(
-                    f"{self.name}: {nm} must be the compact [{t}, {g.h_q}, {d}] buffer (the per-item view is a view of it alone), got {tuple(x.shape)} / {tuple(x.stride())}"
-                )
-        if tuple(int(s) for s in scratch.shape) != (items, 2, _UPCAST_ROWS, d) or scratch.dtype != self.dtype:
-            raise ValueError(
-                f"{self.name}: scratch must be the [{items}, 2, {_UPCAST_ROWS}, {d}] {self.dtype} workspace slot, got {tuple(scratch.shape)} {scratch.dtype}"
-            )
-        stream = int(current_stream) if current_stream is not None else torch.cuda.current_stream(q.device).cuda_stream
-        # (a) the gathered cast: the artifact of this call's block_lens presence (both compiled at plan time)
-        up.run_qsa_kv_upcast(
-            self._recipes[block_lens is not None],
-            k_pool=k_cache,
-            v_pool=v_cache,
-            block_table=block_table,
-            block_ids=block_ids,
-            block_lens=block_lens,
-            seq_kv_lens=kv_lens,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            out_k=scratch[:, 0],
-            out_v=scratch[:, 1],
-            kv_len_t=kv_len_t,
-            s_q=self.seq_len,
-            stream=stream,
-        )
-        # (b) the decode tile over the scratch: Q / O per item at the DECLARED strides (an exact as_strided view of the compact buffer;
-        # the unit S dim's stride is unobservable), K / V the scratch halves, the lengths bound on the KV side only (every Q row live;
-        # a dead item has zero keys -> the tile's empty-range select -> O = 0)
-        qv = q.as_strided((items, G, 1, d), (G * d, d, G * d, 1), q.storage_offset())
-        ov = o.as_strided((items, G, 1, d), (G * d, d, G * d, 1), o.storage_offset())
-        self._impl.execute(
-            qv,
-            scratch[:, 0].unsqueeze(1),
-            scratch[:, 1].unsqueeze(1),
-            ov,
-            lse_tensor=None,
-            seq_q_lens=None,
-            seq_kv_lens=kv_len_t,
-            workspace=workspace,
-            current_stream=cuda.CUstream(stream),
         )
 
 
@@ -10676,7 +10422,6 @@ class GatedAttentionBlockFwd(APIBase):
             thd_num_sequences=self.num_sequences if self.thd else 0,
             qsa_indexer_cand_floats=self._indexer.cand_floats if (self._indexer is not None and self._indexer.selects) else None,
             kv_cache_e4m3=self.kv_cache_e4m3,
-            upcast_items=0,  # the gathered-cast scratch is retired (the sparse core reads the e4m3 pools in-kernel)
             qsa_indexer_e4m3=(self._indexer is not None and self._indexer.fp8),
             # the prefill route's [B] int32 Q lengths (a declaration fact: the route is read at declaration, so get_workspace_size()
             # before compile() already counts the slot)

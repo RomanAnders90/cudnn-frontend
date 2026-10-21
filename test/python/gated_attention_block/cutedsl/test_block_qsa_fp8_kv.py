@@ -271,7 +271,7 @@ def test_declaration_facts_of_the_e4m3_mode(s_q):
     assert (lay.proj, lay.q, lay.k, lay.v, lay.o) == (lay0.proj, lay0.q, lay0.k, lay0.v, lay0.o) and lay.q == -1 and lay.proj == 0
     assert lay.kc8 == lay0.total_bytes and lay.vc8 > lay.kc8 and lay.kv_inv > lay.vc8 and lay.total_bytes > lay.kv_inv
     assert lay0.kc8 == lay0.vc8 == lay0.kv_inv == -1
-    assert getattr(lay, "kv_gathered", -1) == -1 and getattr(lay, "kv_len_t", -1) == -1
+    assert not hasattr(lay, "kv_gathered") and not hasattr(lay, "kv_len_t")
     assert (
         lay.total_bytes - lay0.total_bytes == lay.total_bytes - lay.kc8
     )  # the three e4m3 slots are the whole difference (the Rubin sentinel cell reads get_workspace_size)
@@ -319,7 +319,7 @@ def test_declaration_facts_of_the_indexer_over_e4m3_pools():
         [] if off.gate_fused else ["sigmoid_gate"]
     ) + ["out_proj"]
     lay, lay0 = off._layout(), twin._layout()
-    assert lay.kc8 >= 0 and lay.vc8 > lay.kc8 and lay.kv_inv > lay.vc8 and lay0.kc8 == -1 and getattr(lay, "kv_gathered", -1) == -1
+    assert lay.kc8 >= 0 and lay.vc8 > lay.kc8 and lay.kv_inv > lay.vc8 and lay0.kc8 == -1 and not hasattr(lay, "kv_gathered")
     # the e4m3 slots sit before the decode indexer's five (which stay at the very END): the indexer slots shift by exactly the e4m3 slots' size
     assert (lay.proj, lay.o) == (lay0.proj, lay0.o) and lay.ix_q > lay.kv_inv and lay.ix_q - lay0.ix_q == lay.total_bytes - lay0.total_bytes
 
@@ -331,7 +331,7 @@ def test_the_carve_without_the_attribute_is_byte_identical_and_the_e4m3_slots_ap
     e4 = _plan_workspace(g, 2, 4, BF16, False, False, True, kv_cache_e4m3=True)
     assert (e4.proj, e4.q, e4.k, e4.v, e4.o) == (base.proj, base.q, base.k, base.v, base.o) and e4.kc8 == base.total_bytes
     assert e4.vc8 - e4.kc8 >= 2 * 4 * g.h_kv * D and e4.kv_inv - e4.vc8 >= 2 * 4 * g.h_kv * D and e4.total_bytes >= e4.kv_inv + 8
-    assert getattr(e4, "kv_gathered", -1) == -1 and getattr(e4, "kv_len_t", -1) == -1  # no gathered-cast scratch: the core reads the pools in-kernel
+    assert not hasattr(e4, "kv_gathered") and not hasattr(e4, "kv_len_t")  # no gathered-cast scratch: the core reads the pools in-kernel
     with pytest.raises(ValueError, match="form of the bf16 pipeline"):
         _plan_workspace(g, 2, 4, BF16, False, False, False, fp8=True, kv_cache_e4m3=True)
 
@@ -1164,7 +1164,7 @@ def test_get_workspace_size_is_honest_and_holds_no_scratch():
     blk = case.blk
     lay = blk._layout()
     assert blk._sdpa.scratch_workspace_bytes() > 0 and blk.get_workspace_size() >= lay.total_bytes + blk._sdpa.scratch_workspace_bytes()
-    assert getattr(lay, "kv_gathered", -1) == -1 and getattr(lay, "kv_len_t", -1) == -1 and lay.kv_inv > lay.vc8 > lay.kc8 >= 0
+    assert not hasattr(lay, "kv_gathered") and not hasattr(lay, "kv_len_t") and lay.kv_inv > lay.vc8 > lay.kc8 >= 0
     twin, _ = _declare(GEOM_SMALL, 3, 2, pool_dtype=BF16, kv_cache_dtype=None, fuse_gate=True, decode_split_kv=4, return_lse=True)
     assert blk.get_workspace_size() - twin.get_workspace_size() == lay.total_bytes - twin._layout().total_bytes  # the three e4m3 slots only
     need = blk.get_workspace_size()
