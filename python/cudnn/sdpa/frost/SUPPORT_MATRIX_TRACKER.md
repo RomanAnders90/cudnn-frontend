@@ -3302,6 +3302,32 @@ rows exact, the pools' step rows BITWISE the slab's K / V bands, the prefix rows
 | indexer workspace sentinel (2026-10-21) | 1 / per row | 3: 4096, 512, 0 | L1 page 16 | 8 | fused / -- ; the unfused prepare | bf16 ✅ (a sentinel past `get_workspace_size()` untouched; the five slots 16-byte aligned) |
 | indexer multi-step (2026-10-21) | 1 then 4 / per row: eight carried steps after a 301-token PREFILL | 1 | L1 page 16 | the fill rule | fused / LSE ; both knob readings | bf16 ✅ (`test_block_qsa_end_to_end.py`: the prefill's `index_k_compressed` rows scattered into the paged cache, the ring primed from the slab's band; a rejected draft re-stepped; after every step the cache rows BITWISE a from-scratch compress of the accepted stream; the completing row sees its own block) |
 | caller-list band + `fuse_prepare` (2026-10-21) | 1 and 4 / per row, `index_source="caller"` | 4: 2052, 300, 0, 4097 | L1 page 16 ; page 64 | 2 | fused / LSE | bf16 ✅ (BITWISE the two-stage form incl. the raw-key pool; one launch fewer) |
+| union route 1 (2026-10-21) | 4 / per row, the in-block indexer's decode step, `sparse_tile_form=None` = the UNION tile (256 per-row items on a 204-SM part), 24 / 2 at `d_model` 2560 | 32: 8192, 4097, 300, 0 (dead), 2051, 77, 1000, 2 (shorter than the step), 8190, 5, 3000, 600, 8191, 130, 4096, 20 (x 2) | L1 HND page 16 | the fill rule on `B x H_kv` = 64 union items (4 on the 204-SM part) | fused (combine) / LSE ; `fuse_prepare` | bf16 ✅ (the two-stage oracle; vs the PER-ROW-PINNED block on the same inputs: the list BITWISE, the gated O within 2 bf16 ulp and `out` within 4 at the row's scale, LSE rel 1e-5; fused == unfused prepare BITWISE under the route; the census: `qsa_list_union` once, the chain one launch longer than the per-row twin at the same split) |
+| union route 2 (2026-10-21) | 4 / per row, caller lists (`index_list_form="per_row"`, shuffled order, per-row `block_lens` given and absent), the union route | the 32 lengths of row 1 | L1 HND page 16 | the fill rule on 64 union items | fused (combine) / LSE | bf16 ✅ (the per-row oracle; vs the per-row-pinned block within the same bounds; the union stage's recipe with / without lens by the call's form) |
+| union route capture (2026-10-21) | 4 / per row, the indexer's decode step under the union route | the 32 lengths of row 1 | L1 HND page 16 | the fill rule | fused (combine) / LSE ; `fuse_prepare` | bf16 ✅ (the first execute captured with no warm-up under `set_sync_debug_mode("error")`, the replay bitwise eager; a sentinel past `get_workspace_size()` untouched; the workspace's `union_ids` / `union_lens` EQUAL the reference union of the kernel's per-row list) |
+| union route declaration (2026-10-21) | the route table, the knob pinned both ways at B 32 / 2 / 4 x `S_q` 4 / 2 / 3, the indexer's step, the shared list (never the route), the envelope (`sparse_tile_forms`, the default, the per-step route at 24 / 2, 32 / 2 and 64 / 2), the split re-read with `B x H_kv` units, the carve's two slots at the END | -- | -- | -- | -- | host ✅ (typed declines `union_tile_rows` / `union_tile_cols` / `union_tile_shared_list` / `union_tile_e4m3_pool` EQUAL the envelope's rows; the vocabulary and the knob off the mode `ValueError`s) |
+
+**Served since 2026-10-21 -- the UNION tile ROUTE of the block-sparse DECODE mode (`GatedAttentionBlockFwd(sparse_tile_form=)`; the
+`union route ...` rows of the table)**: under PER-ROW lists (the indexer's decode step, or a caller's `index_list_form="per_row"`) the
+block lowers the step through the sparse core's UNION rendering (the standalone adapter's union form, the index-list section:
+`union_rows=S_q`) where the per-row work items fill the part -- `sparse_tile_form_choice`: `B x H_kv x S_q >= SMs` with `2 <= S_q <= 4` and
+`G x S_q <= 48` query columns per KV head (24 / 2 at `S_q <= 4`, 32 / 2 at `S_q <= 3`), bf16 / f16 pools -- and keeps the per-row tile
+otherwise (a one-row step, an under-full launch, the shared list form, the e4m3 pools).  The chain gains ONE launch, `qsa_list_union`
+(`_QsaListUnion`, stage name `qsa_list_union`, right before the sparse core): the sequence's `S_q` lists merged into the canonical union
+words `(blk << 4) | mask` + the union count in two workspace slots appended at the END of the carve (`union_ids [B, 2048]`, `union_lens [B]`;
+`get_workspace_size()` holds them), bound by the sparse stage as its `block_ids` / `block_lens` (`_SparseSdpa(union_rows=)`); the split
+rule is re-read with the union item's units `B x H_kv` (`sparse_decode_split_choice(units=)`, appended; every existing reading bitwise), the
+combine unchanged, `block_ids_out` still the per-row lists.  `"per_row"` / `"union"` pin either form; `"union"` where the rendering cannot
+hold the step is a typed decline by row name, the raised text EQUAL to the envelope's row: `union_tile_rows` (`S_q` 1 or > 4),
+`union_tile_cols` (`G x S_q > 48`), `union_tile_e4m3_pool`, `union_tile_shared_list`; the vocabulary and the knob off the mode are
+`ValueError`s.  A PERFORMANCE knob (Rule 9's one graph contract: no caller preparation changes): the SAME FUNCTION under either value --
+row `j` sees exactly its own list plus its own open block -- within fp32 rounding of the per-row tile (never bitwise it; the standalone
+cells measured 1 bf16 ulp at the row's scale), fused and unfused prepare bitwise under the route, the first execute capture-safe.  The
+envelope publishes `decode.sparse_tile_forms` (`("per_row", "union")` where the rendering holds a two-row step of the group,
+`("per_row",)` past it), `decode.sparse_tile_form_default` (`"per_row"`), the per-step route `decode.sparse_tile_form(s_q, batch,
+sm_count)` and the four decline rows under `decode.declines`.  Validated on a Rubin development node (cc 10.7, 204 SMs: the route is
+AUTO = union at B 32 x `S_q` 4 there too; functional cells, no perf claim; `test_block_qsa_decode.py`): the `union route` rows above.  The
+performance claim for the T 128 step (the three B 32 x `S_q` 4 cells of the end-to-end gate) is the gate's, on an exclusive 212-SM part.
 
 **Served since 2026-10-21 -- the in-block indexer's DECODE step over the pools** (`QsaSpec(index_source="indexer", index_band=True)` on the
 block-sparse DECODE mode above; bf16; the `indexer ...` rows of the table): the block derives the step's selection itself from its

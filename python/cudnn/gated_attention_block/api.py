@@ -912,7 +912,7 @@ def decode_split_choice(route: DecodeRoute, *, batch: int, h_kv: int, max_kv_len
     return max(split, 2) if gated else split
 
 
-def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, sm_count: int) -> int:
+def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, sm_count: int, units: Optional[int] = None) -> int:
     """The split-KV the block-sparse DECODE mode lowers with when the declaration leaves ``decode_split_kv=None``: the sparse core
     runs ONE work item per (sequence, KV head, query row) -- ``B x H_kv x S_q`` items of at most ``ceil((top_k + 1) / 32)`` 32-row
     tiles each -- so an under-full launch cuts every item into enough chunks to put one on each SM (``ceil(SMs / items)``), never
@@ -927,11 +927,14 @@ def sparse_decode_split_choice(*, batch: int, h_kv: int, s_q: int, top_k: int, s
     (2.9 us at 4, 12.2 us at 17); the pinned forms moved the knee and the cap moved with the measurement, never ahead of it), 1 for a
     launch that already fills the part and for a non-CUDA reading (``sm_count`` 0, declined at ``check_support`` anyway).  A PERFORMANCE choice only (the fp32 partials ride the workspace, the
     combine is one more launch): the same function under every value, so a caller may pin any split in ``[1, ceil((top_k + 1) / 32)]``
-    (the cap binds the DEFAULT only)."""
+    (the cap binds the DEFAULT only).  ``units`` (appended; None = ``B x H_kv x S_q``, every existing reading bitwise) is the launch's work
+    ITEM count where it is not the per-row one: the UNION tile route (:func:`sparse_tile_form_choice`) runs one item per (sequence, KV head)
+    with the step's rows inside it, so the block hands it ``B x H_kv``; the chunk keeps being sized for the EXPECTED per-row item
+    (``ceil((top_k + 1) / 32)`` tiles: a union of ``S_q`` lists is up to ``S_q`` times longer and simply gets more tiles per chunk)."""
     max_tiles = -(-(int(top_k) + 1) // 32)
     if int(sm_count) <= 0:
         return 1
-    units = max(int(batch) * int(h_kv) * int(s_q), 1)
+    units = max(int(batch) * int(h_kv) * int(s_q), 1) if units is None else max(int(units), 1)
     return max(1, min(max_tiles, SPARSE_DECODE_SPLIT_CAP, -(-int(sm_count) // units)))
 
 
@@ -940,6 +943,34 @@ SPARSE_DECODE_SPLIT_CAP = (
     # the pinned decode-grid combine on a 212-SM cc 10.7 part (the former cap of 8 came from the combine module's own forms, whose cost
     # grew with the partial count); a pinned split may exceed it, up to the item's tile count
 )
+
+SPARSE_TILE_FORM_PER_ROW = "per_row"
+SPARSE_TILE_FORM_UNION = "union"
+SPARSE_TILE_FORMS = (None, SPARSE_TILE_FORM_PER_ROW, SPARSE_TILE_FORM_UNION)
+"""``GatedAttentionBlockFwd(sparse_tile_form=)``: how the block-sparse DECODE mode lowers the step's PER-ROW block lists -- ``None`` the
+route (:func:`sparse_tile_form_choice`), ``"per_row"`` the sparse core's per-row tile (one work item per (query row, KV head, chunk)),
+``"union"`` the UNION tile (the sequence's ``S_q`` lists merged by ``qsa_list_union`` into one list of distinct blocks with a per-row
+membership nibble; one work item per (sequence, KV head, chunk) through the sparse core's ``union_rows`` rendering, the listed KV gathered
+ONCE for all the rows).  A PERFORMANCE knob in ``decode_split_kv``'s sense: the same function under every value -- row ``j`` sees exactly
+its own list plus its own open block -- within fp32 rounding (the online softmax groups a row's keys differently), never bitwise; the
+public ``QsaSpec.index_list_form`` vocabulary is unchanged (the union is a lowering of the per-row function, never a declaration that
+changes which keys a row sees)."""
+
+
+def sparse_tile_form_choice(*, batch: int, h_kv: int, s_q: int, group: int, sm_count: int) -> str:
+    """The tile form the block-sparse DECODE mode lowers per-row lists with when the declaration leaves ``sparse_tile_form=None``
+    (:data:`SPARSE_TILE_FORMS`): the UNION tile where the per-row item count ``B x H_kv x S_q`` fills the part (``>= sm_count``) on a step
+    of ``2 .. index_union_rows_max`` rows per sequence the rendering holds (``group x S_q <= index_union_cols_max`` query columns per KV
+    head: the sparse record's claims), the per-row tile otherwise -- ``sm_count`` 0 (a non-CUDA reading) and a one-row step always the
+    per-row tile.  The regime the route names is the byte-bound one: with every SM busy the per-row items gather a sequence's listed KV
+    ``S_q`` times over, and the union item gathers it once (the sparse record's ``index_union_*`` fields bound the rendering); an under-full
+    launch keeps the per-row items, whose split already fills the part.  A PERFORMANCE choice: the same function under either form, within
+    fp32 rounding (``sparse_tile_form`` pins either; a serving stack reads the route back through ``DecodeEnvelope.sparse_tile_form``)."""
+    rec = _sparse_record()
+    s_q, group = int(s_q), int(group)
+    if int(sm_count) <= 0 or s_q < 2 or s_q > int(rec.index_union_rows_max) or group * s_q > int(rec.index_union_cols_max):
+        return SPARSE_TILE_FORM_PER_ROW
+    return SPARSE_TILE_FORM_UNION if int(batch) * int(h_kv) * s_q >= int(sm_count) else SPARSE_TILE_FORM_PER_ROW
 
 
 @dataclass(frozen=True)
@@ -1022,6 +1053,23 @@ class DecodeEnvelope:
     index_state_rows_extra: int = 0
     index_page_sizes: Tuple[int, ...] = ()
     fuse_prepare_default: bool = False
+    # appended (the tile form, ``GatedAttentionBlockFwd(sparse_tile_form=)``; a QsaSpec geometry only, empty otherwise): the tile forms the
+    # block-sparse decode mode's PER-ROW lists can lower through at this geometry -- ``("per_row", "union")`` where the union rendering
+    # holds a two-row step of this group (``2 x G <= index_union_cols_max``), ``("per_row",)`` otherwise -- and the form ``None`` names on a
+    # step whose per-row items do not fill the part (the per-step reading is :meth:`sparse_tile_form`).
+    sparse_tile_forms: Tuple[str, ...] = ()
+    sparse_tile_form_default: str = ""
+
+    def sparse_tile_form(self, s_q: int, batch: int, sm_count: Optional[int] = None) -> str:
+        """The tile form a ``(batch, s_q)`` step takes at this geometry under ``sparse_tile_form=None`` (:func:`sparse_tile_form_choice` on
+        the geometry's KV heads and group; ``sm_count`` None = the current CUDA device's SM count, 0 without one -> ``"per_row"``); the
+        empty string off a QsaSpec geometry.  A serving stack's dispatch reads this instead of re-spelling the route."""
+        if not self.sparse_tile_forms or self._geometry is None:
+            return ""
+        g = self._geometry
+        if sm_count is None:
+            sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count if torch.cuda.is_available() else 0
+        return sparse_tile_form_choice(batch=int(batch), h_kv=int(g.h_kv), s_q=int(s_q), group=int(g.h_q) // max(int(g.h_kv), 1), sm_count=int(sm_count))
 
 
 @dataclass(frozen=True)
@@ -1948,6 +1996,12 @@ class _Intermediates:
     ix_logits: int = -1  # [T, n_blocks_max] fp32
     ix_counts: int = -1  # [T] int32
     ix_cslot: int = -1  # [B, S_q] int32
+    # the block-sparse decode mode's UNION route (``sparse_tile_form``: the per-row lists lowered through the union tile) only (-1
+    # otherwise), appended at the very END: the union words ``[B, 2048]`` int32 (``(blk << 4) | mask``, strictly descending, -1 past the
+    # count) and the union count ``[B]`` int32 the list-union launch writes and the sparse core's union rendering binds as its list.
+    # Every layout without the route is byte-identical.
+    union_ids: int = -1  # [B, UNION_LIST_WIDTH] int32
+    union_lens: int = -1  # [B] int32
 
 
 _SF_TILE_ROWS = 128  # rows of one F8_128x4 scale-factor atom == the SDPA's Q / KV tile height (keep in step with kernels/quantize_mxfp8.py SF_TILE_ROWS)
@@ -2005,8 +2059,13 @@ def _plan_workspace(
     qsa_indexer_cand_floats: Optional[int] = None,
     qsa_indexer_e4m3: bool = False,
     qsa_indexer_decode: Optional[int] = None,
+    sparse_union_rows: int = 0,
 ) -> _Intermediates:
     """Reserve every intermediate, in stage order, and report the total.
+
+    ``sparse_union_rows`` (appended; 0 = no union route) is the block-sparse decode mode's UNION tile route: ``S_q`` when the step's
+    per-row lists are lowered through the union tile, reserving the union words ``[B, 2048]`` int32 and the union count ``[B]`` int32
+    at the very END of the layout (after the decode indexer's slots), so every layout without the route is byte-identical to before.
 
     ``qsa_indexer_decode`` (appended; ``None`` = no decode indexer) is the in-block indexer's DECODE step over the pools: the
     logits width ``n_blocks_max`` (the main block table's reach in compressed rows, ``max_pages x P / block_size``) -- the five slots
@@ -2260,6 +2319,10 @@ def _plan_workspace(
         # The in-block indexer's DECODE step over the pools: its queries, the scorer's logits and counts, the list, the slot report -- at the
         # very END, so every layout without the form is byte-identical to before.
         slots += _qsa_indexer_decode_slots(geom, b, s, e, int(qsa_indexer_decode))
+    if sparse_union_rows:
+        # The block-sparse decode mode's UNION route: the union words and the union count the list-union launch writes and the sparse
+        # core's union rendering binds -- at the very END, so every layout without the route is byte-identical to before.
+        slots += _qsa_union_slots(b)
     for name, nbytes in slots:
         offsets[name] = off
         off += _align_up(nbytes)
@@ -2302,6 +2365,8 @@ def _plan_workspace(
         ix_logits=offsets.get("ix_logits", -1),
         ix_counts=offsets.get("ix_counts", -1),
         ix_cslot=offsets.get("ix_cslot", -1),
+        union_ids=offsets.get("union_ids", -1),
+        union_lens=offsets.get("union_lens", -1),
     )
 
 
@@ -2366,6 +2431,15 @@ def _qsa_indexer_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int
     if e4m3:
         slots += [("ix_q8", t * q.index_heads * q.index_head_dim), ("ix_kbar8", b * (s // q.block_size) * q.index_head_dim)]
     return slots
+
+
+def _qsa_union_slots(b: int) -> list:
+    """The UNION route's two workspace slots, in the order the list-union launch writes them: the union words ``union_ids`` ``[B, 2048]``
+    int32 (``gated_attention_block.qsa_list_union.UNION_LIST_WIDTH``: the kernel's fixed width, every slot written) and the union count
+    ``union_lens`` ``[B]`` int32 -- the sparse core's ``block_ids`` / ``block_lens`` under ``union_rows``."""
+    from .qsa_list_union import UNION_LIST_WIDTH
+
+    return [("union_ids", int(b) * UNION_LIST_WIDTH * _itemsize(torch.int32)), ("union_lens", int(b) * _itemsize(torch.int32))]
 
 
 def _qsa_indexer_decode_slots(geom: GatedAttentionBlockGeometry, b: int, s: int, e: int, n_blocks_max: int) -> list:
@@ -5321,6 +5395,66 @@ def _check_qsa_geometry_against_record(geom: GatedAttentionBlockGeometry, dtype:
         )
 
 
+class _QsaListUnion(_Stage):
+    """(4u) The UNION of a sequence's per-row block lists (``gated_attention_block/qsa_list_union``: ``kernels/qsa_list_union.py``), built
+    under the block-sparse decode mode's union route (``GatedAttentionBlockFwd.sparse_tile_union``) between the per-row list -- the decode
+    indexer's top-k, or the caller's ``block_ids`` -- and the sparse core: ONE launch over ``[B, S_q, top_k]`` (+ the optional
+    ``[B, S_q]`` lens) into the workspace's ``union_ids [B, 2048]`` / ``union_lens [B]`` slots (the words ``(blk << 4) | mask`` in
+    strictly descending block order, ``-1`` past the count: the canonical form, two launches bitwise), which the sparse stage binds as its
+    ``block_ids`` / ``block_lens`` under ``union_rows``.  Rule 7: the DSL-free facade's version gate runs at ``check_support`` before the
+    kernel module is imported; the recipes are compiled at ``compile`` (the caller-list form both with and without lens -- their presence
+    is per call -- the indexer form without: its ``-1`` padding carries the count), nothing compiles on the execute path (capture-safe); the
+    launch rides the block's stream (Rule 5), no allocation, no host read (Rule 3: a dead sequence's ``-1`` rows give ``union_lens = 0``)."""
+
+    name = "qsa_list_union"
+
+    def __init__(self, geometry: GatedAttentionBlockGeometry, *, batch: int, seq_len: int, device, caller_lens: bool) -> None:
+        if geometry.qsa is None:
+            raise ValueError(f"{self.name}: the geometry declares no QsaSpec")
+        self.geom = geometry
+        self.batch, self.seq_len, self.top_k, self.device = int(batch), int(seq_len), int(geometry.qsa.top_k), device
+        self.caller_lens = bool(caller_lens)  # caller lists: block_lens may come or not per call (two recipes); the indexer's never do
+        self._mod = None
+        self._recipes = {}
+
+    def launches_per_execute(self) -> int:
+        return 1
+
+    def check_support(self) -> None:
+        from .qsa_list_union import UNION_LIST_WIDTH, UNION_MAX_ROWS, UNION_TOP_K_MAX, qsa_list_union_kernel_module
+
+        if not 1 <= self.seq_len <= UNION_MAX_ROWS or not 1 <= self.top_k <= UNION_TOP_K_MAX or self.seq_len * self.top_k > UNION_LIST_WIDTH:
+            raise NotImplementedError(
+                f"{self.name}: the union of S_q={self.seq_len} lists of top_k={self.top_k} ids -- the kernel merges S_q <= {UNION_MAX_ROWS} rows of "
+                f"top_k <= {UNION_TOP_K_MAX} into {UNION_LIST_WIDTH} words"
+            )
+        self._mod = qsa_list_union_kernel_module()  # Rule 7: the gate, then the import
+        self._mod.validate_union_geometry(self.seq_len, self.top_k)
+
+    def compile(self) -> None:
+        if self._mod is None:
+            self.check_support()
+        for has_lens in (False, True) if self.caller_lens else (False,):
+            self._recipes[has_lens] = self._mod.compile_qsa_list_union(s_q=self.seq_len, top_k=self.top_k, has_lens=has_lens)
+
+    def execute(self, block_ids: torch.Tensor, block_lens: Optional[torch.Tensor], out_ids: torch.Tensor, out_lens: torch.Tensor, current_stream=None) -> None:
+        """The per-row list ``[T, top_k]`` / ``[B, S_q, top_k]`` (+ lens ``[T]`` / ``[B, S_q]`` or None) -> the union words + count."""
+        if not self._recipes:
+            raise RuntimeError(f"{self.name}: call compile() before execute()")
+        has_lens = block_lens is not None
+        if has_lens not in self._recipes:
+            raise ValueError(f"{self.name}: block_lens {'given' if has_lens else 'missing'} on a form compiled {'without' if has_lens else 'with'} them")
+        stream = current_stream if current_stream is not None else torch.cuda.current_stream(block_ids.device).cuda_stream
+        self._mod.run_qsa_list_union(
+            self._recipes[has_lens],
+            block_ids.view(self.batch, self.seq_len, self.top_k),
+            None if block_lens is None else block_lens.view(self.batch, self.seq_len),
+            out_ids,
+            out_lens,
+            stream=stream,
+        )
+
+
 class _SparseSdpa(_Stage):
     """(4) under a :class:`QsaSpec`: ``O = softmax(Q K^T * scale + mask) V`` over each query's SELECTED 4-token blocks
     and its open tail block, causal, GQA-broadcast -- the index-list sparse attention core
@@ -5422,6 +5556,10 @@ class _SparseSdpa(_Stage):
         block_table_desc: Optional[TensorDesc] = None,  # kv_source="paged": the (B, max_pages) int32 block table's descriptor (contiguous)
         list_per_sequence: bool = False,  # kv_source="paged": block_ids [B, top_k] shared by the sequence's S_q <= 4 rows (else [T, top_k])
         split_kv: int = 1,  # kv_source="paged": the KV split (fp32 partials in the engine workspace arm + the combine); 1 = unsplit
+        # APPENDED (the UNION tile route, `sparse_tile_form`): S_q = the adapter's union rendering (`union_rows`): block_ids = the union
+        # WORDS [B, 2048] int32 ((blk << 4) | mask, from qsa_list_union) and block_lens = the union count [B] (REQUIRED at execute), one work
+        # item per (sequence, KV head, chunk); 0 = the per-row / shared forms as before.  Per-row lists only (never with list_per_sequence).
+        union_rows: int = 0,
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
@@ -5472,8 +5610,27 @@ class _SparseSdpa(_Stage):
         self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
         self.list_per_sequence = bool(list_per_sequence)
         self.split_kv = int(split_kv)
+        self.union_rows = int(union_rows)
+        self.union_list_width = int(self._record().index_union_list_width)
         if self.paged:
             rec = self._record()
+            if self.union_rows:
+                # the union rendering: the adapter's arm (read off the record), the step's rows exactly, the per-row lists only, the
+                # geometry's group inside the rendering's columns -- each a typed decline by name (the block declined them first; the stage
+                # stays honest on its own)
+                if self.list_per_sequence:
+                    raise ValueError(f"{self.name}: union_rows={self.union_rows} composes with the per-row lists only (list_per_sequence=False)")
+                if self.union_rows != self.seq_len:
+                    raise ValueError(f"{self.name}: union_rows must equal the step's S_q={self.seq_len}, got {self.union_rows}")
+                if not 2 <= self.union_rows <= int(rec.index_union_rows_max):
+                    raise NotImplementedError(
+                        f"{self.name}: union_rows={self.union_rows} -- the sparse adapter's union rendering serves 2 .. {rec.index_union_rows_max} rows per sequence"
+                    )
+                if (geometry.h_q // geometry.h_kv) * self.union_rows > int(rec.index_union_cols_max):
+                    raise NotImplementedError(
+                        f"{self.name}: union_rows={self.union_rows} at group {geometry.h_q // geometry.h_kv}: the union rendering holds G x S_q <= "
+                        f"{rec.index_union_cols_max} query columns per KV head"
+                    )
             if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
                 raise ValueError(f"{self.name}: kv_source='paged' needs paged_page_size > 0 and the k_cache / v_cache / block_table descriptors")
             if self.thd:
@@ -5509,9 +5666,11 @@ class _SparseSdpa(_Stage):
             or block_table_desc is not None
             or self.list_per_sequence
             or self.split_kv != 1
+            or self.union_rows
         ):
             raise ValueError(
-                f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc / list_per_sequence / split_kv belong to kv_source='paged'"
+                f"{self.name}: paged_page_size / k_cache_desc / v_cache_desc / block_table_desc / list_per_sequence / split_kv / union_rows belong to "
+                "kv_source='paged'"
             )
         self._impl = None
         self._ops = None
@@ -5548,8 +5707,12 @@ class _SparseSdpa(_Stage):
             table = SparseOperandDesc((b, int(bt.shape[1])), (int(bt.stride[0]), 1), torch.int32, self.device)
         else:
             k_desc, v_desc, table = bshd(g.h_kv, ts_kv), bshd(g.h_kv, ts_kv), None
-        # the index tensors: one row per query token, or ONE row per sequence under the shared list (the decode mode at S_q <= 4)
+        # the index tensors: one row per query token, or ONE row per sequence under the shared list (the decode mode at S_q <= 4), or --
+        # under the union rendering -- the union WORDS [B, 2048] and the union count [B]
         rows = b if self.list_per_sequence else t
+        ids_shape, ids_stride, lens_shape = (rows, g.qsa.top_k), (g.qsa.top_k, 1), (rows,)
+        if self.union_rows:
+            ids_shape, ids_stride, lens_shape = (b, self.union_list_width), (self.union_list_width, 1), (b,)
         return dict(
             q=bshd(g.h_q, ts_q),
             k=k_desc,
@@ -5557,8 +5720,8 @@ class _SparseSdpa(_Stage):
             o=bshd(g.h_q, g.h_q * d),
             # fuse_gate: GATE in O's shape at the slab's GATE columns (gate_token_stride) or compact -- the adapter's gate operand
             gate=bshd(g.h_q, self.gate_token_stride or g.h_q * d) if self.fuse_gate else None,
-            block_ids=SparseOperandDesc((rows, g.qsa.top_k), (g.qsa.top_k, 1), torch.int32, self.device),
-            block_lens=SparseOperandDesc((rows,), (1,), torch.int32, self.device),
+            block_ids=SparseOperandDesc(ids_shape, ids_stride, torch.int32, self.device),
+            block_lens=SparseOperandDesc(lens_shape, (1,), torch.int32, self.device),
             lse=SparseOperandDesc((b, g.h_q, s), (g.h_q * s, s, 1), torch.float32, self.device) if self.want_lse else None,
             seq_kv_lens=lens if self.thd else (SparseOperandDesc((b,), (1,), torch.int32, self.device) if self.seq_lens_present else None),
             seq_q_lens=lens,
@@ -5605,6 +5768,8 @@ class _SparseSdpa(_Stage):
             block_table=ops["block_table"],
             list_per_sequence=self.list_per_sequence,
             split_kv=self.split_kv,
+            # The UNION rendering (the block's union route): the union words + count as the list (appended; 0 = the forms above).
+            union_rows=self.union_rows,
         )
         self._impl.check_support()
 
@@ -5612,9 +5777,11 @@ class _SparseSdpa(_Stage):
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before compile()")
         # BOTH block_lens variants at plan time: the caller passes block_lens per call or not, and nothing may compile on
-        # the execute path (Rule 4).  One template load, two pointer-ABI artifacts.
+        # the execute path (Rule 4).  One template load, two pointer-ABI artifacts.  The UNION rendering has ONE variant: the union
+        # count is its block_lens (always bound by the chain), so only that artifact exists.
         self._impl.compile(has_block_lens=True)
-        self._impl.compile(has_block_lens=False)
+        if not self.union_rows:
+            self._impl.compile(has_block_lens=False)
         self._compiled = True
 
     def scratch_workspace_bytes(self) -> int:
@@ -5706,6 +5873,13 @@ class _SparseSdpa(_Stage):
                 raise ValueError(f"{self.name}: lse given, but this stage was declared without return_lse (the LSE presence is compiled in)")
             g = self.geom
             rows = self.batch if self.list_per_sequence else self.batch * self.seq_len
+            if self.union_rows:
+                # the union rendering's list: the union words [B, 2048] + the union count [B] (REQUIRED: the rendering's count anchor)
+                if block_lens is None:
+                    raise ValueError(f"{self.name}: union_rows={self.union_rows} needs block_lens at execute (the union count [B] beside the union words)")
+                ids_v, lens_v = block_ids.view(self.batch, self.union_list_width), block_lens.view(self.batch)
+            else:
+                ids_v, lens_v = block_ids.view(rows, g.qsa.top_k), (None if block_lens is None else block_lens.view(rows))
             q, o, gate = self._declared_strides(q, "q"), self._declared_strides(o, "o"), self._declared_strides(gate, "gate")
             self._impl.execute(
                 stream=current_stream,
@@ -5714,8 +5888,8 @@ class _SparseSdpa(_Stage):
                 v=v_cache,
                 o=o,
                 lse=lse,
-                block_ids=block_ids.view(rows, g.qsa.top_k),
-                block_lens=None if block_lens is None else block_lens.view(rows),
+                block_ids=ids_v,
+                block_lens=lens_v,
                 seq_kv_lens=kv_lens,
                 block_table=block_table,
                 gate=gate,
@@ -7635,6 +7809,20 @@ def _device_cc_of(device) -> Optional[Tuple[int, int]]:
     return tuple(int(x) for x in torch.cuda.get_device_capability(dev))
 
 
+def _sm_count_of(device) -> int:
+    """The SM count of a CUDA device (a ``torch.device`` / string / index), 0 for a non-CUDA device or no CUDA -- the part fact the
+    block-sparse decode mode's split rule and tile route read at declaration."""
+    if device is None:
+        return 0
+    try:
+        dev = torch.device(device)
+    except (TypeError, ValueError, RuntimeError):
+        return 0
+    if dev.type != "cuda" or not torch.cuda.is_available():
+        return 0
+    return int(torch.cuda.get_device_properties(dev).multi_processor_count)
+
+
 def _first_serving_decline(decl: _ServingDecl) -> Optional[Tuple[str, type, str]]:
     """The first row of :data:`_EXTEND_DECLINES` whose predicate holds for ``decl`` -- ``(name, exception class, message)`` -- or None."""
     for name, exc, pred, msg in _EXTEND_DECLINES:
@@ -7696,6 +7884,11 @@ _SPARSE_DECODE_REQUIRES = (
     "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
     "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "
     "gathered cast + the d256 decode tile)",
+    "sparse_tile_form=None (the route: the per-row lists lowered through the UNION tile -- the sequence's S_q lists merged by qsa_list_union into one list of distinct "
+    "blocks with a per-row membership nibble, one work item per (sequence, KV head, chunk) through the sparse core's union rendering, the listed KV gathered once -- "
+    "where B x H_kv x S_q >= SMs with 2 <= S_q <= 4 and G x S_q <= 48 under per-row lists in bf16 / f16 pools, the per-row tile otherwise) or 'per_row' / 'union' "
+    "pinned: performance only (the same function within fp32 rounding, never bitwise; 'union' where the rendering cannot hold the step is a typed decline); under the "
+    "union route the split sizes B x H_kv items and block_ids_out keeps the per-row lists",
 )
 
 
@@ -7707,13 +7900,18 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
     ``indexer_f16`` ``needs bf16 activations``; ``indexer_head_dim`` ``packs 128-wide heads``; ``indexer_thd`` ``scores dense [B, S]
     prompts``; ``indexer_query_rows`` ``query rows per sequence (at most 64``; ``indexer_page_size`` ``a power-of-two count of compressed
     rows``; ``indexer_e4m3_cache`` ``e4m3 read arm``; ``indexer_e4m3_pool`` ``in-kernel dequant arm``; ``indexer_shared_list`` ``selects per
-    row``; ``fuse_prepare_rope_tables_unfused`` ``the unfused query norm reads the per-token``.  The host facts come from the DSL-free
+    row``; ``fuse_prepare_rope_tables_unfused`` ``the unfused query norm reads the per-token``; the union tile route's ``union_tile_rows``
+    ``has nothing to merge``, ``union_tile_cols`` ``query columns per KV head``, ``union_tile_shared_list`` ``merges PER-ROW lists``,
+    ``union_tile_e4m3_pool`` ``reads bf16 / f16 pools``.  The host facts come from the DSL-free
     modules (``qsa_select`` / ``qsa_select_paged``) and the sparse record, never from a kernel module."""
     from .qsa_select import INDEXER_SCORER_HEAD_DIM
     from .qsa_select_paged import MAX_QUERY_ROWS, MMA_M, padded_heads
 
     q = geometry.qsa
-    cap = int(_sparse_record().index_shared_list_max_tokens)
+    rec = _sparse_record()
+    cap = int(rec.index_shared_list_max_tokens)
+    union_rows_max, union_cols_max = int(rec.index_union_rows_max), int(rec.index_union_cols_max)
+    group = int(geometry.h_q) // max(int(geometry.h_kv), 1)
     h_i, d_i = int(q.index_heads), int(q.index_head_dim)
     max_s_q = MAX_QUERY_ROWS // padded_heads(h_i)
     return {
@@ -7762,6 +7960,25 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
         "fuse_prepare_rope_tables_unfused": (
             "fuse_prepare=False with rope_position_tables_only=True: the unfused query norm reads the per-token cos / sin (the prefill compress at "
             "pool 1); the position-table arm is the fused launch's -- declare fuse_prepare=True or hand cos / sin"
+        ),
+        # the UNION tile route (sparse_tile_form='union' pinned where the union rendering cannot hold the step; the route itself never
+        # declines -- it names the per-row tile there)
+        "union_tile_rows": (
+            f"sparse_tile_form='union' serves steps of 2 .. {union_rows_max} rows per sequence (the union tile's membership nibble and its one Q slot): a "
+            "one-row step has nothing to merge and a longer step exceeds the nibble -- leave sparse_tile_form=None (the route) or declare 'per_row'"
+        ),
+        "union_tile_cols": (
+            f"sparse_tile_form='union' at group G = {group}: the union tile renders G x S_q <= {union_cols_max} query columns per KV head, so this geometry "
+            f"holds at most {max(union_cols_max // max(group, 1), 0)} rows per sequence -- leave sparse_tile_form=None (the route) or declare 'per_row'"
+        ),
+        "union_tile_shared_list": (
+            "sparse_tile_form='union' with the shared step-0 list (QsaSpec(index_list_form='shared'), or None at S_q <= "
+            f"{cap} under caller lists): that form is ONE list per sequence already (the sparse core's shared-list arm gathers it once); the union tile "
+            "merges PER-ROW lists -- declare index_list_form='per_row', or leave sparse_tile_form=None"
+        ),
+        "union_tile_e4m3_pool": (
+            "sparse_tile_form='union' with kv_cache_dtype=torch.float8_e4m3fn: over e4m3 pools the mode runs the gathered cast + the d256 decode tile on one "
+            "list per sequence; the union tile reads bf16 / f16 pools -- declare bf16 pools, or leave sparse_tile_form=None"
         ),
     }
 
@@ -7892,7 +8109,14 @@ class GatedAttentionBlockFwd(APIBase):
     exactly.  Typed declines: the packed form (the table's ``sparse`` row: the core serves THD and paged pools one at a
     time), a block-table sample that is not contiguous (the core binds the whole table), a split past the item's tile
     count, ``causal_bottom_right`` on the block's own K / V; the envelope says ``decode.sparse_core``.  The list form is
-    ``QsaSpec.index_list_form`` (``None`` = the ``S_q`` rule above; ``"per_row"`` at any ``S_q``).
+    ``QsaSpec.index_list_form`` (``None`` = the ``S_q`` rule above; ``"per_row"`` at any ``S_q``).  The TILE FORM of this mode is the constructor knob ``sparse_tile_form``
+    (appended; performance-only): ``None`` = the route -- the per-row lists lowered through the sparse core's UNION rendering (one work
+    item per (sequence, KV head, chunk) over the union of a sequence's ``S_q`` lists, built by one ``qsa_list_union`` launch right before
+    the core; ``sdpa/fwd/sparse_gqa_sm107``, ``union_rows``) where the per-row items fill the part (``B x H_kv x S_q >= SMs`` with
+    ``2 <= S_q <= 4`` and ``G x S_q <= 48`` under per-row lists in bf16 / f16 pools: :func:`sparse_tile_form_choice`), the per-row tile
+    otherwise --, ``"per_row"`` / ``"union"`` pin either (``"union"`` where the rendering cannot hold the step is a typed decline by row
+    name).  The same function under either value within fp32 rounding, never bitwise; ``block_ids_out`` keeps the per-row lists; the split
+    under the union route sizes ``B x H_kv`` items; ``DecodeEnvelope.sparse_tile_forms`` / ``sparse_tile_form()`` publish the route.
 
     **The in-block indexer's DECODE step over the pools (``QsaSpec(index_source="indexer", index_band=True)`` with
     ``kv_source="paged"``; bf16; 2026-10-21)**: the same pipeline with the step's selection derived IN the block from the band
@@ -8197,6 +8421,20 @@ class GatedAttentionBlockFwd(APIBase):
         index_state_slot_mapping_present: bool = False,
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
+        # APPENDED (the block-sparse DECODE mode's tile form; performance-only): HOW stage (4) lowers the step's PER-ROW lists.  None = the
+        # route (`sparse_tile_form_choice`): the UNION tile -- the sequence's S_q lists merged by `qsa_list_union` into one list of distinct
+        # blocks with a per-row membership nibble, ONE work item per (sequence, KV head, chunk) through the sparse core's union rendering
+        # (the listed KV gathered once for all the rows: `sdpa/fwd/sparse_gqa_sm107`, `union_rows`) -- where the per-row item count
+        # B x H_kv x S_q fills the part (>= its SMs) with 2 <= S_q <= 4 and G x S_q <= 48 under per-row lists in bf16 / f16 pools, the per-row
+        # tile otherwise; "per_row" / "union" pin either ("union" where the rendering cannot hold the step is a typed decline naming the
+        # condition: `union_tile_rows` / `union_tile_cols` / `union_tile_shared_list` / `union_tile_e4m3_pool`, never a silent fallback).
+        # The SAME FUNCTION under either value -- row j sees exactly its own list plus its own open block -- within fp32 rounding (the
+        # online softmax groups a row's keys differently), never bitwise; `block_ids_out` keeps returning the per-row lists (the union is an
+        # internal intermediate in the workspace); under the union route the split sizes B x H_kv items (`sparse_decode_split_choice(units=)`)
+        # and the combine is unchanged.  `sparse_tile_form_requested` keeps the declaration, `sparse_tile_form` the resolved form,
+        # `sparse_tile_union` whether the union stage (`qsa_list_union`, right before the sparse core) is built.  Refused (typed) off the
+        # block-sparse DECODE mode.  Class docstring, "The block-sparse DECODE / extend-with-prefix mode".
+        sparse_tile_form: Optional[str] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -8511,6 +8749,20 @@ class GatedAttentionBlockFwd(APIBase):
             or (list_form is None and not self.indexer_decode and self.seq_len <= _sparse_record().index_shared_list_max_tokens)
         )
         self.qsa_list_form = (QSA_INDEX_LIST_FORM_SHARED if self.qsa_shared_list else QSA_INDEX_LIST_FORM_PER_ROW) if self.sparse_decode else None
+        # The TILE FORM of the block-sparse decode mode (sparse_tile_form): the route or the pin, declined by name where the union rendering
+        # cannot hold the step; under the union route the split is re-read with the union item's units (B x H_kv: the step's rows are
+        # inside the item) -- the SAME rule the declaration ran above, through its appended `units=` (a pinned split stands as checked).
+        self.sparse_tile_form_requested: Optional[str] = sparse_tile_form
+        self.sparse_tile_form, self.sparse_tile_union = self._resolve_sparse_tile_form(sparse_tile_form)
+        if self.sparse_tile_union and decode_split_kv is None:
+            self.decode_split_kv = sparse_decode_split_choice(
+                batch=self.batch,
+                h_kv=geometry.h_kv,
+                s_q=self.seq_len,
+                top_k=self.qsa.top_k,
+                sm_count=_sm_count_of(self.device),
+                units=self.batch * geometry.h_kv,
+            )
         # The e4m3 KV cache OVER THE POOLS: stage (4) is the gathered cast + the dense decode tile (the block-sparse decode mode at
         # S_q <= 4 only); every other paged form over e4m3 pools, the LSE and a split are typed declines, and the mode norms +
         # rotates OUT of place (the tile's per-item Q is a view of the compact Q only), so inplace_qkv / fuse_norm_rope are settled here.
@@ -8745,6 +8997,9 @@ class GatedAttentionBlockFwd(APIBase):
                 block_table_desc=self._descs["block_table"] if self.sparse_decode else None,
                 list_per_sequence=self.qsa_shared_list,
                 split_kv=self.decode_split_kv if self.sparse_decode else 1,
+                # The UNION route: the sparse core's union rendering over the union words the list-union stage writes (0 = the per-row / shared
+                # forms).
+                union_rows=self.seq_len if self.sparse_tile_union else 0,
             )
         else:
             # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
@@ -8930,6 +9185,13 @@ class GatedAttentionBlockFwd(APIBase):
             for st in (self._proj, self._out_proj):
                 if isinstance(st, _Projection) and st.resolves_a_jit_tile():
                     st.capture_safe = True
+        # (4u) The UNION of the per-row lists under the block-sparse decode mode's union route (sparse_tile_form): one launch between the list
+        # -- the decode indexer's top-k, or the caller's block_ids -- and the sparse core, into the workspace's union_ids / union_lens slots.
+        self._list_union = (
+            _QsaListUnion(geometry, batch=self.batch, seq_len=self.seq_len, device=self.device, caller_lens=not self.indexer_decode)
+            if self.sparse_tile_union
+            else None
+        )
         # Stage order == pipeline order.  `_quant_o` is listed only where it is a
         # DISTINCT stage (MXFP8: quantize_o, or quantize_fp4_o under o_fp4); under
         # FP8 it aliases `_quant_q`, listed once.
@@ -8949,6 +9211,7 @@ class GatedAttentionBlockFwd(APIBase):
                 self._indexer,
                 self._indexer_decode,  # the decode step over the pools, in the indexer's slot (one of the two is built, never both)
                 self._cache_write,
+                self._list_union,  # (4u) the per-row lists' union under the union route, right before the sparse core that binds it
                 self._sdpa,
                 self._gate,
                 self._quant_o if quant_o_distinct else None,
@@ -8969,6 +9232,42 @@ class GatedAttentionBlockFwd(APIBase):
         self._ws = None
 
     # -- block-sparse attention (QsaSpec) -----------------------------------
+
+    def _resolve_sparse_tile_form(self, requested: Optional[str]) -> Tuple[Optional[str], bool]:
+        """``sparse_tile_form`` at declaration -> ``(the resolved form, whether the union stage is built)``: the vocabulary
+        (:data:`SPARSE_TILE_FORMS`; ``ValueError``), the mode (a knob of the block-sparse DECODE mode only: refused elsewhere rather than
+        ignored), then ``"union"`` pinned against the union rendering's claims -- the rows ``union_tile_rows`` / ``union_tile_cols`` /
+        ``union_tile_e4m3_pool`` / ``union_tile_shared_list`` of :func:`_qsa_decode_decline_texts` (each the envelope's text, typed), in that order --,
+        ``"per_row"`` pinned, or ``None`` = the route (:func:`sparse_tile_form_choice` on the part's SM count; the shared list and the e4m3
+        pools name the per-row form: one list per sequence already / the gathered cast).  Runs after the list form is settled."""
+        if requested is not None and (not isinstance(requested, str) or requested not in SPARSE_TILE_FORMS):
+            raise ValueError(f"sparse_tile_form must be None (the route), 'per_row' or 'union', got {requested!r}")
+        if not self.sparse_decode:
+            if requested is not None:
+                where = f"with kv_source={self.kv_source!r}" if self.qsa is not None else "without a QsaSpec"
+                raise ValueError(
+                    f"sparse_tile_form={requested!r} is the block-sparse DECODE mode's knob (a QsaSpec geometry with kv_source='paged' on a dense "
+                    f"[B, S_q] declaration); this block was declared {where} -- refused rather than silently ignored"
+                )
+            return None, False
+        g = self.geom
+        rec = _sparse_record()
+        group = int(g.h_q) // max(int(g.h_kv), 1)
+        if requested == SPARSE_TILE_FORM_UNION:
+            texts = _qsa_decode_decline_texts(g, self.dtype)
+            if not 2 <= self.seq_len <= int(rec.index_union_rows_max):
+                raise NotImplementedError(texts["union_tile_rows"])
+            if group * self.seq_len > int(rec.index_union_cols_max):
+                raise NotImplementedError(texts["union_tile_cols"])
+            if self.kv_cache_e4m3:  # before the list form: over e4m3 pools the shared list is the mode's own (the gathered cast)
+                raise NotImplementedError(texts["union_tile_e4m3_pool"])
+            if self.qsa_shared_list:
+                raise NotImplementedError(texts["union_tile_shared_list"])
+            return SPARSE_TILE_FORM_UNION, True
+        if requested == SPARSE_TILE_FORM_PER_ROW or self.qsa_shared_list or self.kv_cache_e4m3:
+            return SPARSE_TILE_FORM_PER_ROW, False
+        form = sparse_tile_form_choice(batch=self.batch, h_kv=g.h_kv, s_q=self.seq_len, group=group, sm_count=_sm_count_of(self.device))
+        return form, form == SPARSE_TILE_FORM_UNION
 
     def _check_qsa_declaration(self, quant, kv_source=KV_SOURCE_SELF, kv_cache_dtype=None, page_size=None) -> None:
         """Every sparse request this block cannot serve, declined at DECLARATION with the feature named: the geometry's
@@ -10235,6 +10534,19 @@ class GatedAttentionBlockFwd(APIBase):
             index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
             index_list_form_default=(QSA_INDEX_LIST_FORM_PER_ROW if indexer else QSA_INDEX_LIST_FORM_SHARED) if sparse else "",
             **cls._indexer_envelope_fields(geometry, dtype, cc, decode_reason is None),
+            # the tile form (sparse_tile_form) at this geometry: the union tile where its columns hold a two-row step of this group, the
+            # per-row tile always; None names the per-row tile on a step whose per-row items do not fill the part (the route per step:
+            # DecodeEnvelope.sparse_tile_form)
+            sparse_tile_forms=(
+                (
+                    (SPARSE_TILE_FORM_PER_ROW, SPARSE_TILE_FORM_UNION)
+                    if has_group and 2 * (int(geometry.h_q) // int(geometry.h_kv)) <= int(_sparse_record().index_union_cols_max)
+                    else (SPARSE_TILE_FORM_PER_ROW,)
+                )
+                if sparse
+                else ()
+            ),
+            sparse_tile_form_default=SPARSE_TILE_FORM_PER_ROW if sparse else "",
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -10480,6 +10792,8 @@ class GatedAttentionBlockFwd(APIBase):
             decode_q_lens=self.batch if (self.decode_route is not None and self.decode_route.prefill_tile) else 0,
             # the decode indexer over the pools: its five slots at the end (the logits width = the main table's reach in compressed rows)
             qsa_indexer_decode=self._indexer_decode.n_blocks_max if self._indexer_decode is not None else None,
+            # the union route: the union words + count at the very end (a declaration fact, counted before compile())
+            sparse_union_rows=self.seq_len if self.sparse_tile_union else 0,
         )
 
     def get_workspace_size(self) -> int:
@@ -11482,6 +11796,16 @@ class GatedAttentionBlockFwd(APIBase):
                 self._cache_write.execute(k_c[:rows], v_c[:rows], k_cache, v_cache, slot_live, **cw_kw)
         # (4) [+ (5) under fuse_gate: the SDPA gates the SUBSTITUTED O inside
         # its epilogue, after the dead-row select, and writes O_gated.]
+        if self._list_union is not None:
+            # (4u) the UNION route: the step's per-row lists (the indexer's, or the caller's [T, top_k] / [B, S_q, top_k] with the optional
+            # lens) merged into the workspace's union words + count, which the sparse core binds in place of the per-row list; block_ids_out
+            # (above) keeps the per-row lists -- the union is an internal intermediate
+            from .qsa_list_union import UNION_LIST_WIDTH
+
+            union_ids = _view(workspace, ws.union_ids, (self.batch, UNION_LIST_WIDTH), torch.int32)
+            union_lens = _view(workspace, ws.union_lens, (self.batch,), torch.int32)
+            self._list_union.execute(block_ids, block_lens, union_ids, union_lens, current_stream=stream)
+            block_ids, block_lens = union_ids, union_lens
         # Under QsaSpec stage (4) is the index-list sparse core: the SAME operands at the SAME strides plus the caller's
         # block list (form-checked at the top of execute; the kernel reads its values on device).
         sparse_kw = dict(block_ids=block_ids, block_lens=block_lens) if self.qsa is not None else {}

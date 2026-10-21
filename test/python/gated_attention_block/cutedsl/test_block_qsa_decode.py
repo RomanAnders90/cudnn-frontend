@@ -657,9 +657,11 @@ class _Case:
         shuffle=True,
         index_list_form=None,
         fuse_prepare=None,
+        sparse_tile_form=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
+        self.sparse_tile_form = sparse_tile_form
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = bool(block_lens), bool(return_lse), bool(fuse_gate), bool(index_band)
         # the list form: the S_q rule (one list per sequence up to the shared-list cap), or QsaSpec.index_list_form as declared
         self.index_list_form = index_list_form
@@ -774,6 +776,8 @@ class _Case:
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -1491,8 +1495,8 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True and d.kv_cache_dtypes == (BF16,)  # the measured part
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `sparse_tile_form_default`)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-14:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1505,6 +1509,8 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "index_state_rows_extra",
             "index_page_sizes",
             "fuse_prepare_default",
+            "sparse_tile_forms",
+            "sparse_tile_form_default",
         ]
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
@@ -1789,10 +1795,12 @@ class _IndexerCase(_Case):
         rope_tables_only=False,
         outputs=True,
         lens_out=True,
+        sparse_tile_form=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
+        self.sparse_tile_form = sparse_tile_form
         self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
         kw_g = dict(geom_kw, causal_bottom_right=True)
         self.geom = GatedAttentionBlockGeometry(**kw_g, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True))
@@ -1915,6 +1923,8 @@ class _IndexerCase(_Case):
             index_state_slot_mapping_present=self.slot_form,
             rope_position_tables_only=self.rope_tables_only,
         )
+        if sparse_tile_form is not None:
+            kw["sparse_tile_form"] = sparse_tile_form
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -2578,3 +2588,360 @@ def test_caller_list_band_block_with_fuse_prepare_is_bitwise_the_two_stage_form(
     assert torch.equal(_bits(on.index_cache), _bits(off.index_cache)), "the raw-key pool differs"
     names_on, names_off = [st.name for st in on.blk._stages], [st.name for st in off.blk._stages]
     assert "qsa_prepare" in names_on and "cache_write" not in names_on and "qk_norm_rope" not in names_on and len(names_on) == len(names_off) - 1
+
+
+# ---------------------------------------------------------------------------
+# The UNION tile route (``sparse_tile_form``): the per-row lists of a step lowered through the union tile where the per-row items fill the part
+
+
+_UNION_DECLINE_TOKENS = {
+    "union_tile_rows": "has nothing to merge",
+    "union_tile_cols": "query columns per KV head",
+    "union_tile_shared_list": "merges PER-ROW lists",
+    "union_tile_e4m3_pool": "reads bf16 / f16 pools",
+}
+# vs the per-row-pinned block, per output element at the ROW's scale (|d| / ulp_dtype(the row's largest magnitude)): the gated O slot
+# within the sparse module's bound (its union cells measured 1.0 on every cell; the pinned 2), `out` -- the out projection of that O,
+# one more rounding -- within the bound measured RED-then-green on the development node (the record), never widened.
+UNION_ROUTE_O_ULP = 2.0
+UNION_ROUTE_OUT_ULP = 4.0
+UNION_ROUTE_LSE_REL = 1e-5
+# B 32 x S_q 4 on the 24 / 2 geometry: 256 per-row items, the union route on every part with <= 256 SMs (the development node's 204, the
+# performance class's 212); lengths with 8K sequences, a dead entry, a sequence shorter than the step, MTP residues
+_UNION_KV_LENS = (8192, 4097, 300, 0, 2051, 77, 1000, 2, 8190, 5, 3000, 600, 8191, 130, 4096, 20) * 2
+
+
+def _ulp_at_row_scale(a: torch.Tensor, b: torch.Tensor, live: torch.Tensor, dtype) -> tuple:
+    """``(max |a - b| in ulps of ``dtype`` at the ROW's scale, max |a - b|)`` over the live rows -- a row is one output vector (the last
+    dim), ``live`` the ``[B, S]`` row mask broadcast over the remaining dims: a one-rounding flip of a small element counts as the fraction
+    of the row's ulp it is."""
+    mant = 7 if dtype == torch.bfloat16 else 10
+    d = (a.float() - b.float()).abs()
+    row_mag = torch.maximum(a.float().abs(), b.float().abs()).amax(dim=-1, keepdim=True).clamp_min(torch.finfo(torch.float32).tiny)
+    ulp = torch.pow(2.0, torch.floor(torch.log2(row_mag)) - mant)
+    m = live
+    while m.dim() < d.dim():
+        m = m.unsqueeze(-1)
+    m = m.expand_as(d)
+    if not bool(m.any()):
+        return 0.0, 0.0
+    return float((d / ulp)[m].max()), float(d[m].max())
+
+
+def test_sparse_tile_form_route_knob_envelope_and_declines():
+    """Host: the route table -- the UNION tile iff the per-row items fill the part (``B x H_kv x S_q >= SMs``) on a step of
+    2 .. 4 rows the rendering holds (``G x S_q <= 48``): (32, 2, 4) at 212 -> union; (32, 2, 1), (4, 2, 4), (16, 2, 4: 128 units) and
+    (32, 2, 4) at group 16 (64 columns) -> per_row --; the knob pins both ways (``"union"`` builds the ``qsa_list_union`` stage right before
+    the sparse core, the core's ``union_rows`` = S_q, the carve's two slots at the END, the split re-read with ``B x H_kv`` units;
+    ``"per_row"`` nothing of it); the shared list form NEVER takes the route; ``"union"`` where the rendering cannot hold the step is a
+    typed decline whose text EQUALS the envelope's row (rows / columns / the shared list / the e4m3 pools); the vocabulary and the mode
+    are ``ValueError``s; the envelope publishes ``sparse_tile_forms`` / ``sparse_tile_form_default`` and the per-step route; the split rule's
+    appended ``units=`` keeps every existing reading bitwise."""
+    import re
+
+    from cudnn.gated_attention_block.api import (
+        SPARSE_TILE_FORMS,
+        _align_up,
+        _itemsize,
+        _qsa_union_slots,
+        _sm_count_of,
+        sparse_decode_split_choice,
+        sparse_tile_form_choice,
+    )
+    from cudnn.gated_attention_block.qsa_list_union import UNION_LIST_WIDTH
+
+    assert SPARSE_TILE_FORMS == (None, "per_row", "union")
+    pick = sparse_tile_form_choice
+    assert pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=212) == "union"  # T 128 on the 24 / 2 geometry: 256 per-row items >= 212 SMs
+    assert pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=204) == "union" and pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=256) == "union"
+    assert pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=257) == "per_row"  # one item short of the part
+    assert pick(batch=32, h_kv=2, s_q=1, group=12, sm_count=212) == "per_row"  # a one-row step has nothing to merge
+    assert pick(batch=4, h_kv=2, s_q=4, group=12, sm_count=212) == "per_row"  # 32 items: the split fills the part
+    assert pick(batch=16, h_kv=2, s_q=4, group=12, sm_count=212) == "per_row"  # 128 items
+    assert pick(batch=32, h_kv=2, s_q=4, group=16, sm_count=212) == "per_row"  # 32 / 2: G x S_q = 64 > 48 columns
+    assert pick(batch=32, h_kv=2, s_q=3, group=16, sm_count=212) == "per_row"  # 32 / 2 at S_q 3 holds the 48 columns, but 192 items are under-full
+    assert pick(batch=36, h_kv=2, s_q=3, group=16, sm_count=212) == "union"  # 216 items on 212 SMs at 48 columns
+    assert pick(batch=32, h_kv=2, s_q=5, group=8, sm_count=212) == "per_row" and pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=0) == "per_row"
+    # the split rule's appended units= -- None = B x H_kv x S_q (every reading above bitwise), the union route's B x H_kv
+    split = sparse_decode_split_choice
+    assert split(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212) == 1 and split(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212, units=None) == 1
+    assert split(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=212, units=64) == 4  # the fill rule at 64 union items: ceil(212 / 64)
+    assert split(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=204, units=64) == 4 and split(batch=36, h_kv=2, s_q=3, top_k=512, sm_count=212, units=72) == 3
+    assert split(batch=32, h_kv=2, s_q=4, top_k=256, sm_count=212, units=64) == 4 and split(batch=2, h_kv=2, s_q=4, top_k=512, sm_count=212, units=4) == 16
+    assert split(batch=32, h_kv=2, s_q=4, top_k=512, sm_count=0, units=64) == 1
+    sm = _sm_count_of(_DEV)
+    with _no_host_sync():
+        for geom_kw, b, s_q in ((GEOM_FLASH_NEXT, 32, 4), (GEOM_FLASH_NEXT, 2, 2), (GEOM_SMALL, 4, 3)):
+            caller = _declare(geom_kw, b, s_q, n_pages=4, index_list_form="per_row")[0]
+            union = _declare(geom_kw, b, s_q, n_pages=4, index_list_form="per_row", sparse_tile_form="union")[0]
+            per_row = _declare(geom_kw, b, s_q, n_pages=4, index_list_form="per_row", sparse_tile_form="per_row")[0]
+            g = caller.geom
+            want = pick(batch=b, h_kv=g.h_kv, s_q=s_q, group=g.h_q // g.h_kv, sm_count=sm)
+            assert caller.sparse_tile_form_requested is None and caller.sparse_tile_form == want and caller.sparse_tile_union is (want == "union")
+            assert union.sparse_tile_form_requested == "union" and union.sparse_tile_form == "union" and union.sparse_tile_union
+            assert per_row.sparse_tile_form_requested == "per_row" and per_row.sparse_tile_form == "per_row" and not per_row.sparse_tile_union
+            names = [st.name for st in union._stages]
+            assert names.index("qsa_list_union") == names.index("sdpa_sparse") - 1 and "qsa_list_union" not in [st.name for st in per_row._stages]
+            assert (
+                union._sdpa.union_rows == s_q
+                and per_row._sdpa.union_rows == 0
+                and union._list_union.caller_lens
+                and union._list_union.launches_per_execute() == 1
+            )
+            # the split under the union route: the fill rule on B x H_kv items (never past the per-row item's tile count / the cap)
+            assert (
+                union.decode_split_kv
+                == sparse_decode_split_choice(batch=b, h_kv=g.h_kv, s_q=s_q, top_k=512, sm_count=sm, units=b * g.h_kv)
+                == union._sdpa.split_kv
+            )
+            assert per_row.decode_split_kv == sparse_decode_split_choice(batch=b, h_kv=g.h_kv, s_q=s_q, top_k=512, sm_count=sm)
+            pinned = _declare(geom_kw, b, s_q, n_pages=4, index_list_form="per_row", sparse_tile_form="union", decode_split_kv=3)[0]
+            assert pinned.decode_split_kv == 3 == pinned._sdpa.split_kv and pinned.sparse_tile_union
+            # the carve: the per-row block's layout + the two union slots at the END (counted before compile())
+            lay, lay_p = union._layout(), per_row._layout()
+            slots = _qsa_union_slots(b)
+            assert [nm for nm, _ in slots] == ["union_ids", "union_lens"] and dict(slots) == {"union_ids": b * UNION_LIST_WIDTH * 4, "union_lens": b * 4}
+            assert lay.union_ids == lay_p.total_bytes and lay.union_lens == lay.union_ids + _align_up(b * UNION_LIST_WIDTH * _itemsize(torch.int32))
+            assert lay.total_bytes == lay.union_lens + _align_up(b * 4) and lay_p.union_ids == -1 and lay_p.union_lens == -1
+            assert lay_p == _declare(geom_kw, b, s_q, n_pages=4, index_list_form="per_row")[0]._layout() or want == "union"
+        # the indexer's decode step takes the route too (its lists never carry lens: one recipe)
+        ix = _declare_indexer(GEOM_FLASH_NEXT, 32, 4, cap=8)
+        assert ix.sparse_tile_form == pick(batch=32, h_kv=2, s_q=4, group=12, sm_count=sm) and ix.sparse_tile_union is (ix.sparse_tile_form == "union")
+        if ix.sparse_tile_union:
+            assert (
+                not ix._list_union.caller_lens
+                and [st.name for st in ix._stages].index("qsa_list_union") == [st.name for st in ix._stages].index("sdpa_sparse") - 1
+            )
+        # the shared list form never takes the route (None at S_q <= 4 under caller lists, or declared): the per-row form is named
+        shared = _declare(GEOM_FLASH_NEXT, 32, 4, n_pages=4)[0]
+        assert shared.qsa_shared_list and shared.sparse_tile_form == "per_row" and not shared.sparse_tile_union and shared._sdpa.union_rows == 0
+        # the envelope: the forms at this geometry, the default, the per-step route; the decline rows
+        env = GatedAttentionBlockFwd.serving_envelope(_geom(GEOM_FLASH_NEXT)[0], BF16, _DEV, device_cc=_SM107).decode
+        assert env.sparse_tile_forms == ("per_row", "union") and env.sparse_tile_form_default == "per_row"
+        assert env.sparse_tile_form(4, 32, 212) == "union" and env.sparse_tile_form(1, 32, 212) == "per_row" and env.sparse_tile_form(4, 4, 212) == "per_row"
+        env32 = GatedAttentionBlockFwd.serving_envelope(
+            _geom(dict(d_model=512, h_q=32, h_kv=2, d_head=D, rope_dim=ROPE))[0], BF16, _DEV, device_cc=_SM107
+        ).decode
+        assert (
+            env32.sparse_tile_forms == ("per_row", "union")
+            and env32.sparse_tile_form(4, 32, 212) == "per_row"
+            and env32.sparse_tile_form(3, 36, 212) == "union"
+        )
+        env64 = GatedAttentionBlockFwd.serving_envelope(
+            _geom(dict(d_model=512, h_q=64, h_kv=2, d_head=D, rope_dim=ROPE))[0], BF16, _DEV, device_cc=_SM107
+        ).decode
+        assert env64.sparse_tile_forms == ("per_row",) and env64.sparse_tile_form(2, 64, 212) == "per_row"  # G 32: two rows exceed the 48 columns
+        dense = GatedAttentionBlockFwd.serving_envelope(
+            GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True), BF16, _DEV, device_cc=_SM107
+        ).decode
+        assert dense.sparse_tile_forms == () and dense.sparse_tile_form_default == "" and dense.sparse_tile_form(4, 32, 212) == ""
+        assert set(_UNION_DECLINE_TOKENS) <= set(env.declines) and all(tok in env.declines[nm] for nm, tok in _UNION_DECLINE_TOKENS.items())
+        # the pin declined: "union" where the rendering cannot hold the step -- each raised text EQUALS the envelope's row
+        kc8, vc8 = (torch.empty(4, 2, 16, D, dtype=torch.float8_e4m3fn, device=_DEV) for _ in range(2))
+        rows = {
+            "union_tile_rows": lambda: _declare(GEOM_FLASH_NEXT, 32, 1, n_pages=4, index_list_form="per_row", sparse_tile_form="union"),
+            "union_tile_cols": lambda: _declare(
+                dict(d_model=512, h_q=32, h_kv=2, d_head=D, rope_dim=ROPE), 32, 4, n_pages=4, index_list_form="per_row", sparse_tile_form="union"
+            ),
+            "union_tile_shared_list": lambda: _declare(GEOM_FLASH_NEXT, 32, 4, n_pages=4, sparse_tile_form="union"),
+            "union_tile_e4m3_pool": lambda: _declare(
+                GEOM_FLASH_NEXT, 32, 4, n_pages=4, sparse_tile_form="union", kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc8, sample_v_cache=vc8
+            ),
+        }
+        for name, decl in rows.items():
+            with pytest.raises(NotImplementedError, match=re.escape(_UNION_DECLINE_TOKENS[name])) as e:
+                decl()
+            assert str(e.value) == env.declines[name] or name == "union_tile_cols", (name, str(e.value))
+        env32_rows = GatedAttentionBlockFwd.serving_envelope(
+            _geom(dict(d_model=512, h_q=32, h_kv=2, d_head=D, rope_dim=ROPE))[0], BF16, _DEV, device_cc=_SM107
+        ).decode
+        with pytest.raises(NotImplementedError) as e:
+            rows["union_tile_cols"]()
+        assert str(e.value) == env32_rows.declines["union_tile_cols"]
+        with pytest.raises(NotImplementedError, match=re.escape("has nothing to merge")):
+            _declare(GEOM_FLASH_NEXT, 2, 5, n_pages=4, index_list_form="per_row", sparse_tile_form="union")  # five rows exceed the nibble
+        with pytest.raises(ValueError, match="sparse_tile_form must be None"):
+            _declare(GEOM_FLASH_NEXT, 2, 4, n_pages=4, index_list_form="per_row", sparse_tile_form="rows")
+        geom_self = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(index_list_form="per_row"))
+        mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+        with pytest.raises(ValueError, match="block-sparse DECODE mode's knob"):
+            GatedAttentionBlockFwd(
+                mk(1, 8, geom_self.d_model),
+                mk(geom_self.n_qkvg, geom_self.d_model),
+                mk(D),
+                mk(D),
+                mk(1, 8, ROPE),
+                mk(1, 8, ROPE),
+                mk(geom_self.d_model, geom_self.h_q * D),
+                mk(1, 8, geom_self.d_model),
+                geom_self,
+                sparse_tile_form="per_row",
+            )
+
+
+def _union_route_pair(kind: str, *, fuse_prepare=True, seed=201, **over):
+    """The union-route block (``sparse_tile_form=None`` at B 32 x S_q 4 on the 24 / 2 geometry: the route resolves to the union tile on every
+    part with <= 256 SMs) and its PER-ROW-PINNED twin on the same inputs -- the indexer's decode step (``kind="indexer"``) or caller lists
+    (``kind="caller"``: shuffled per-row lists with their lens)."""
+    kv_lens = _UNION_KV_LENS
+    if kind == "indexer":
+        mk = lambda form: _IndexerCase(
+            GEOM_FLASH_NEXT, 4, kv_lens, page=16, seed=seed, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, sparse_tile_form=form, **over
+        )  # noqa: E731
+    else:
+        mk = lambda form: _Case(
+            GEOM_FLASH_NEXT, 4, kv_lens, page=16, seed=seed, fuse_gate=True, return_lse=True, index_list_form="per_row", sparse_tile_form=form, **over
+        )  # noqa: E731
+    on, pr = mk(None), mk("per_row")
+    assert on.blk.sparse_tile_union and on.blk.sparse_tile_form == "union" and not pr.blk.sparse_tile_union and pr.blk.sparse_tile_form == "per_row"
+    return on, pr
+
+
+def _assert_union_within_bounds(on, pr, what: str) -> str:
+    """The union-route block against its per-row-pinned twin: ``out`` and the gated O slot within the pinned ulp bounds at the row's scale,
+    the LSE within the relative bound, dead rows exact on both.  Returns the measured line."""
+    live = on.live_rows
+    o_u, o_p = on.slab_views()[4], pr.slab_views()[4]
+    ulp_o, d_o = _ulp_at_row_scale(o_u, o_p, live, on.dtype)
+    ulp_out, d_out = _ulp_at_row_scale(on.out, pr.out, live, on.dtype)
+    lse_live = live[:, None, :].expand_as(on.lse)  # [B, H, S] from the [B, S] row mask
+    lse_rel = float(((on.lse - pr.lse).abs() / pr.lse.abs().clamp_min(1.0))[lse_live].max()) if bool(live.any()) else 0.0
+    line = (
+        f"{what}: vs the per-row-pinned block -- O slot {ulp_o:.3f} ulp (max|d| {d_o:.3e}), out {ulp_out:.3f} ulp (max|d| {d_out:.3e}), LSE rel {lse_rel:.2e}"
+    )
+    assert ulp_o <= UNION_ROUTE_O_ULP, line
+    assert ulp_out <= UNION_ROUTE_OUT_ULP, line
+    assert lse_rel <= UNION_ROUTE_LSE_REL, line
+    dead = ~live
+    if bool(dead.any()):
+        assert bool((on.out[dead] == 0).all()) and bool((pr.out[dead] == 0).all()) and bool(torch.isinf(on.lse.permute(0, 2, 1)[dead]).all())
+    return line
+
+
+@requires_rubin
+def test_union_route_indexer_block_matches_the_per_row_pinned_block_with_the_census():
+    """The in-block indexer's decode step at the T 128 geometry (B 32 x S_q 4, 24 / 2; the route resolves to the UNION tile on this
+    part) against the two-stage oracle (the module's standard cells) and against the PER-ROW-PINNED block on the same inputs: the list
+    (``block_ids_out`` / the counts) BITWISE, the gated O and ``out`` within the pinned ulp bounds, two launches bitwise; fused == unfused
+    prepare under the union route BITWISE (out, LSE, the list); the census by kernel name: ``qsa_list_union`` once on the union chain, never
+    on the per-row one, the union chain one launch longer than its per-row twin at the same split pin, no memset / memcpy."""
+    on, pr = _union_route_pair("indexer")
+    for case in (on, pr):
+        case.compile()
+        _two_launches_indexer(case, f"sparse_tile_form={case.blk.sparse_tile_form}")
+    assert (
+        torch.equal(on.kernel_ids(), pr.kernel_ids())
+        and torch.equal(on.block_lens_out, pr.block_lens_out)
+        and torch.equal(on.kernel_counts(), pr.kernel_counts())
+    )
+    print("\n" + _assert_union_within_bounds(on, pr, f"indexer B 32 x S_q 4 split {on.blk.decode_split_kv} vs per-row split {pr.blk.decode_split_kv}"))
+    off = _union_route_pair("indexer", fuse_prepare=False)[0]
+    off.compile()
+    _two_launches_indexer(off, "sparse_tile_form=union fuse_prepare=False")
+    assert (
+        torch.equal(_bits(on.out), _bits(off.out)) and torch.equal(on.lse, off.lse) and torch.equal(on.kernel_ids(), off.kernel_ids())
+    ), "fuse_prepare changed out under the union route"
+    assert torch.equal(_bits(on.slab_views()[4]), _bits(off.slab_views()[4]))
+    # the census: the same split pin on both arms (the union route's rule picks its own; the per-row twin here pinned to it)
+    pr_same = _IndexerCase(
+        GEOM_FLASH_NEXT,
+        4,
+        _UNION_KV_LENS,
+        page=16,
+        seed=201,
+        fuse_gate=True,
+        return_lse=True,
+        fuse_prepare=True,
+        split=on.blk.decode_split_kv,
+        sparse_tile_form="per_row",
+    )
+    pr_same.compile()
+    pr_same.run()
+    k_on, m_on = _cupti_kernels(lambda: on.execute())
+    k_pr, m_pr = _cupti_kernels(lambda: pr_same.execute())
+    if k_on is None or k_pr is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the numerics cells stand")
+    print(f"union route: {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_on))
+    print(f"per-row pinned at the same split: {len(k_pr)} kernels + {len(m_pr)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_pr))
+    has = lambda names, tok: sum(tok in n for n in names)  # noqa: E731
+    assert not (m_on or m_pr), "a memset / memcpy on the execute path"
+    assert has(k_on, "qsa_list_union") == 1 and has(k_pr, "qsa_list_union") == 0
+    assert has(k_on, "frost_qsa_prepare") == 1 and has(k_on, "qsa_score_paged") == 1 and has(k_on, "qsa_topk_decode") == 1
+    assert len(k_on) == len(k_pr) + 1, (len(k_on), len(k_pr))
+
+
+@requires_rubin
+@pytest.mark.parametrize("block_lens", [True, False], ids=["with-lens", "no-lens"])
+def test_union_route_caller_lists_match_the_per_row_pinned_block(block_lens):
+    """A caller's PER-ROW lists (``index_source="caller"``, ``index_list_form="per_row"``, shuffled order, the per-row ``block_lens`` given
+    or absent) through the union route == the per-row-pinned block within the pinned ulp bounds (the module's oracle on both), two launches
+    bitwise; the union stage's recipe with / without lens is the one the call's form names."""
+    on, pr = _union_route_pair("caller", seed=211 + int(block_lens), block_lens=block_lens)
+    for case in (on, pr):
+        case.compile()
+        _two_launches(case, f"sparse_tile_form={case.blk.sparse_tile_form} lens={block_lens}")
+    assert on.blk._list_union.caller_lens and set(on.blk._list_union._recipes) == {False, True}
+    print(
+        "\n"
+        + _assert_union_within_bounds(
+            on, pr, f"caller lists lens={block_lens} B 32 x S_q 4 split {on.blk.decode_split_kv} vs per-row split {pr.blk.decode_split_kv}"
+        )
+    )
+
+
+@requires_rubin
+def test_union_route_first_execute_captures_replays_bitwise_and_the_workspace_holds_the_union():
+    """The FIRST execute of a fresh union-route declaration (the indexer's decode step, fused prepare) captured on a new stream with no
+    warm-up under ``set_sync_debug_mode("error")`` replays BITWISE a fresh eager run (out, the LSE, the list); the workspace carve holds the
+    union: a sentinel past ``get_workspace_size()`` survives, and the ``union_ids`` / ``union_lens`` slots hold the reference union of the
+    kernel's per-row list (``union_words_reference``: the chain's union IS the canonical one)."""
+    from gated_block_qsa_reference import union_words_reference
+
+    from cudnn.gated_attention_block.api import _view
+    from cudnn.gated_attention_block.qsa_list_union import UNION_LIST_WIDTH
+
+    case = _IndexerCase(GEOM_FLASH_NEXT, 4, _UNION_KV_LENS, page=16, seed=221, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    assert case.blk.sparse_tile_union
+    case.prime_prefix()
+    case.blk.check_support()
+    case.blk.compile()
+    need = case.blk.get_workspace_size()
+    ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
+    ws[need:].fill_(0xA5)
+    ws[:need].fill_(0x7F)
+    case.ws = ws[:need]
+    case.out.fill_(float("nan"))
+    case.lse.fill_(float("nan"))
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()  # the FIRST execute of this declaration, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all(), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        case.oracle_from_list()
+        replayed, replayed_lse, replayed_ids = case.out.clone(), case.lse.clone(), case.kernel_ids().clone()
+        case.check_selection("replay")
+        case.check(replayed, lse=replayed_lse, what="replay under the union route")
+        assert (ws[need:] == 0xA5).all(), "bytes past get_workspace_size() were written"
+        lay = case.blk._ws
+        u_ids = _view(case.ws, lay.union_ids, (len(_UNION_KV_LENS), UNION_LIST_WIDTH), torch.int32)
+        u_lens = _view(case.ws, lay.union_lens, (len(_UNION_KV_LENS),), torch.int32)
+        ref_ids, ref_lens = union_words_reference(replayed_ids, None)
+        assert torch.equal(u_ids, ref_ids) and torch.equal(u_lens, ref_lens), "the chain's union differs from the reference union of the kernel's list"
+        case.out.fill_(float("nan"))
+        case.lse.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(case.lse, replayed_lse) and torch.equal(case.kernel_ids(), replayed_ids)
+        print(f"\nunion route capture: B {len(_UNION_KV_LENS)} x S_q 4, split {case.blk.decode_split_kv}, |U| {u_lens.tolist()[:8]} ...; workspace {need} B")
+    finally:
+        graph.reset()

@@ -413,7 +413,7 @@ is the same paged-READ mode with one list per new row (`[T, top_k]`) at position
 declaration on the `QsaSpec` geometry with `kv_source="paged"` takes `block_ids [B, S_q, top_k]` / `[T, top_k]` (the list form
 is `QsaSpec.index_list_form`: `None` derives it from `S_q` at declaration -- one per sequence up to four rows, one per row past it --,
 `"per_row"` declares one list per row at ANY `S_q`, the step's rows at 1 .. 4 included -- the serving stacks' per-row selection, and the
-form the in-block indexer's decode step over the pools binds --, `"shared"` the step-0 list at `S_q <= 4` by name), at any `S_q`.
+form the in-block indexer's decode step over the pools binds --, `"shared"` the step-0 list at `S_q <= 4` by name), at any `S_q`. How the per-row lists are LOWERED is the constructor knob `sparse_tile_form` (the decode-form section): the per-row tile, or the UNION tile where the step's per-row work items fill the part -- a performance choice, the same function.
 
 **The indexer fields.** `QsaSpec.index_heads`, `index_kv_heads`, `index_head_dim`, `index_norm_eps` size the fifth
 band of `W_qkvg` -- and `index_kv_heads x index_head_dim` the raw indexer key's write-through pool `index_k_raw` (next
@@ -687,6 +687,7 @@ blk = GatedAttentionBlockFwd(
     index_state_slot_mapping_present=False,   # that step: execute(index_state_slot_mapping=) names the ring's write rows (block x cap + pos % cap, -1 dead; slot_mapping's dtype) instead of the rows the kernels derive from the ring table
     index_commit_present=False,  # that step: a per-sequence commit count at execute (a follow-up: True is a typed NotImplementedError)
     rope_position_tables_only=False,   # that step under fuse_prepare=True: cos / sin REFUSED at execute; the fused launch rotates Q / K and the indexer queries from cos_pos / sin_pos at the device-derived position (the unfused twin with it is a typed decline)
+    sparse_tile_form=None,       # the block-sparse DECODE mode: None = the route (the per-row lists lowered through the UNION tile -- one work item per (sequence, KV head, chunk) over the union of a sequence's S_q lists -- where B x H_kv x S_q >= SMs with 2 <= S_q <= 4 and G x S_q <= 48, the per-row tile otherwise); "per_row" / "union" pin either (performance only: the same function within fp32 rounding; "union" where the rendering cannot hold the step is a typed decline) -- "Serving: the decode form"
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -1303,6 +1304,36 @@ position-table forms, the MTP residues, the workspace sentinel, and eight carrie
 re-stepped; the cache rows bitwise a from-scratch compress of the accepted stream after every step).  Functional cells on a
 development node; the fusion's default flipped to True on cc 10.7 after the exclusive-node end-to-end gate measured it (2026-10-21).
 
+**The UNION tile route (`sparse_tile_form`; 2026-10-21).** Under per-row lists -- the indexer's decode step, or a caller's
+`index_list_form="per_row"` lists -- every row of a step is its own sparse-core work item, so at `B x H_kv x S_q` items beyond the part's
+SMs (the 24 / 2 geometry at B 32 x `S_q` 4: 256 items on a 212-SM part) the per-row items run in two waves and gather a sequence's
+listed KV `S_q` times over.  The block then lowers the SAME per-row lists through the UNION tile: `qsa_list_union`
+(`gated_attention_block/qsa_list_union.py`, one launch, one CTA per sequence) merges a sequence's `S_q <= 4` lists into ONE canonical
+list of distinct blocks in strictly descending order, each word carrying the nibble of rows that list it (`(blk << 4) | mask`), into the
+workspace (`union_ids [B, 2048]`, `union_lens [B]`: `get_workspace_size()` holds them), and the sparse core's union rendering
+(`sparse_gqa_sm107`, `union_rows=S_q`) runs ONE work item per (sequence, KV head, chunk) over it -- the listed KV gathered once for all
+the rows, row `j` seeing exactly its own list plus its own open block through a per-row visibility bit per key.  The route
+(`sparse_tile_form=None`, `cudnn.gated_attention_block.api.sparse_tile_form_choice`): the union tile iff `B x H_kv x S_q >= SMs` with
+`2 <= S_q <= 4` and `G x S_q <= 48` query columns per KV head (24 / 2 at `S_q <= 4`, 32 / 2 at `S_q <= 3`) under per-row lists in bf16 /
+f16 pools, the per-row tile otherwise (a one-row step, an under-full launch -- whose split already fills the part --, the shared list form,
+the e4m3 pools); `"per_row"` / `"union"` pin either, and `"union"` where the rendering cannot hold the step is a typed decline naming the
+condition (`union_tile_rows`, `union_tile_cols`, `union_tile_shared_list`, `union_tile_e4m3_pool`, each the envelope's text) -- never a
+silent fallback.  A PERFORMANCE knob in `decode_split_kv`'s sense: the SAME FUNCTION under either value within fp32 rounding (the online
+softmax groups a row's keys differently in the two tiles; measured 1 bf16 ulp at the row's scale on the standalone cells), never bitwise
+the per-row tile; `block_ids_out` keeps returning the per-row lists (the union is an internal intermediate); under the union route the
+split rule sizes `B x H_kv` items (`sparse_decode_split_choice(units=)`) and the combine is unchanged; fused and unfused prepare stay
+bitwise under the route; the first execute captures without a warm-up.  Launches: the chain's plus the one union launch (the T 128 step
+with a split: the slab, the prepare, the scorer, the top-k, the union, the sparse tile, the combine, the out projection and its reducer).
+The envelope publishes `decode.sparse_tile_forms` (`("per_row", "union")` where the rendering holds a two-row step of the geometry's
+group, `("per_row",)` otherwise), `decode.sparse_tile_form_default` (`"per_row"`: what `None` names on a step whose items do not fill the
+part) and the per-step route `decode.sparse_tile_form(s_q, batch, sm_count)`; `blk.sparse_tile_form` / `sparse_tile_form_requested` /
+`sparse_tile_union` read the resolved form back.  Validated on a Rubin development node (functional) against the two-stage oracle and
+against the per-row-pinned block on the same inputs: B 32 x `S_q` 4 on the 24 / 2 geometry with 8K sequences, a dead entry and a
+sequence shorter than the step -- the indexer's step (the list bitwise, the gated O within 2 bf16 ulp and `out` within the pinned bound
+at the row's scale, fused == unfused bitwise, the census one launch longer, `qsa_list_union` once), a caller's shuffled per-row lists with
+and without lens, the first-execute capture replaying bitwise with the workspace's union equal to the reference union of the kernel's
+list.
+
 ### Backward
 
 `GatedAttentionBlockBwd(sample_dy, sample_saved, sample_w_qkvg, sample_w_q_norm, sample_w_k_norm, sample_cos,
@@ -1707,6 +1738,7 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   default), the in-block indexer's DECODE step over the pools served (`index_source="indexer"`: bf16, the per-row list, the paged
   compressed-key cache + the ring + its table as samples; "The in-block indexer's DECODE step over the pools" above); the packed form is
   a typed decline.
+- The union tile route of the block-sparse decode mode (`sparse_tile_form`): `None` = the route (the union tile at `B x H_kv x S_q >= SMs`, `2 <= S_q <= 4`, `G x S_q <= 48`, per-row lists, bf16 / f16 pools), `"per_row"` / `"union"` pinned; `"union"` off those conditions is a typed decline; the knob is refused off the mode.
 - The e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`): bf16 activations with `paged_kv_page_size > 0`; the quantizing write-through
   on the dense prefill forms (QsaSpec or dense) and the block-sparse DECODE mode over e4m3 pools at `S_q <= 4` (the gathered cast + the
   d256 decode tile, out-of-place norm, the gate as its own launch, unsplit, no LSE); `execute(k_scale=, v_scale=)` 1-element fp32 CUDA
