@@ -1456,8 +1456,9 @@ def test_indexer_decode_over_e4m3_pools_matches_the_two_stage_oracle(s_q, kv_len
 def test_fused_prepare_over_e4m3_pools_is_bitwise_the_two_stage_write_through():
     """The indexer form over e4m3 pools with ``fuse_prepare`` ON vs OFF on the same inputs: ``out``, the LSE, the list AND the pools BITWISE
     (the prepare's e4m3 pool arm computes the two-stage write-through's codes op for op); the census by kernel name under
-    ``set_sync_debug_mode("error")``: the fused chain is five launches shorter (the norm + RoPE, the two casts and the bit copy folded
-    into the prepare), no memset / memcpy on either path."""
+    ``set_sync_debug_mode("error")``: the fused chain is SEVEN launches shorter -- the prepare launch replaces the norm + RoPE pass, the
+    pool-1 query norm, the ring + compress step, the two reciprocal writes of the scales (torch kernels on the launch stream), the two
+    per-tensor casts and the bit copy (eight launches) -- 7 vs 14 at a split with the gate in the combine; no memset / memcpy on either path."""
     on = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 8192), page=16, seed=211, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
     off = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 8192), page=16, seed=211, split=4, fuse_gate=True, return_lse=True, fuse_prepare=False)
     on.compile()
@@ -1486,8 +1487,11 @@ def test_fused_prepare_over_e4m3_pools_is_bitwise_the_two_stage_write_through():
         f"\ncensus fused {len(kern_on)}: {[n.split('_tensorptr')[0][:60] for n in kern_on]}\ncensus unfused {len(kern_off)}: {[n.split('_tensorptr')[0][:60] for n in kern_off]}"
     )
     assert not other_on and not other_off, f"memset / memcpy on the execute path: {other_on} {other_off}"
-    assert len(kern_off) - len(kern_on) == 5 and sum("qsa_prepare" in n for n in kern_on) == 1 and not any("qsa_prepare" in n for n in kern_off)
-    assert (len(kern_on), len(kern_off)) == (8, 13), (len(kern_on), len(kern_off))
+    assert len(kern_off) - len(kern_on) == 7 and sum("qsa_prepare" in n for n in kern_on) == 1 and not any("qsa_prepare" in n for n in kern_off)
+    assert (len(kern_on), len(kern_off)) == (7, 14), (len(kern_on), len(kern_off))
+    assert sum("elementwise" in n for n in kern_off) == 2 and not any(
+        "elementwise" in n for n in kern_on
+    ), "the two reciprocal writes belong to the unfused e4m3 chain only"
 
 
 @requires_rubin
