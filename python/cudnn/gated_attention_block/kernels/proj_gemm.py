@@ -1344,7 +1344,7 @@ def device_cluster_capacity(device=None) -> dict:
 
 def _k_cluster_fits(tiles: int, slices: int, cluster_capacity: Mapping[int, int]) -> bool:
     """Whether the K-cluster split of ``slices`` is admitted for ``tiles`` 128-row weight tiles: every slice CTA of every tile
-    co-resident (ONE tile per CTA: the form's exchange planes alias the drained operand rings), the slice count within the
+    co-resident (ONE tile per CTA: the form's staging plane aliases the drained A ring), the slice count within the
     portable cluster size and dividing the 128 rows into equal owner slices -- the compiler's own admission, read here so the
     route names a form the compile admits (a mismatch would be the compile's typed decline, never a silent route change)."""
     return 2 <= slices <= _SMALL_M_K_CLUSTER_MAX and _SMALL_M_K_CLUSTER_TILE_ROWS % slices == 0 and tiles <= int(cluster_capacity.get(slices, 0) or 0)

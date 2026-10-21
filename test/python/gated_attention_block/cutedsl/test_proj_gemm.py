@@ -1375,7 +1375,7 @@ def test_the_k_cluster_split_declines_typed_by_name(monkeypatch, name, shape, ma
 
 
 def test_the_k_cluster_split_declines_more_tiles_than_co_resident_clusters_and_an_exchange_past_the_ring(monkeypatch):
-    """ONE tile per CTA is an ADMISSION rule (the exchange planes alias the drained rings), typed: 20 tiles on a part running 19
+    """ONE tile per CTA is an ADMISSION rule (the staging plane aliases the drained A ring), typed: 20 tiles on a part running 19
     clusters of 8 decline; and a plane larger than a drained ring (the 256-wide token tile on the 227 KiB budget) declines by its bytes."""
     from cudnn.gemm.frost.tile_config import by_name
 
@@ -1384,10 +1384,16 @@ def test_the_k_cluster_split_declines_more_tiles_than_co_resident_clusters_and_a
         C100._analyze_for_config(_oproj_graph(1, 6144, 2560), by_name(_k_cluster_name(8)))
     for budget in (_SM100_BUDGET, _RUBIN_BUDGET):
         C100 = _pin_render(monkeypatch, budget=budget, capacity={8: 64})
-        # a 256-wide token plane (128 x 1040 B) is wider than the A ring at 6 stages on either budget: declined by its bytes
-        with pytest.raises(NotImplementedError, match=r"the exchange plane \(133120 B: 128 rows x 1040 B\) must fit each drained operand ring"):
+        # a 256-wide token plane (128 x 1040 B) beside its own receive plane leaves an A ring narrower than the staging plane on
+        # either budget: declined by its bytes
+        with pytest.raises(NotImplementedError, match=r"the staging plane \(133120 B: 128 rows x 1040 B\) must fit the drained A ring it aliases"):
             C100._analyze_for_config(_oproj_graph(256, 6144, 2560), by_name(_k_cluster_name(256)))
-        # the 128-wide plane (67.5 KB) fits both rings on both budgets: no decline from the admission
+    # the 128-wide plane (67.5 KB): the Rubin budget keeps 8 stages beside the receive plane (A ring 128 KB: admitted); the 227 KiB
+    # budget keeps 4 (A ring 64 KB < the staging plane: declined) -- the route never names S 8 below 160 SMs anyway
+    C100 = _pin_render(monkeypatch, budget=_RUBIN_BUDGET, capacity={8: 64})
+    C100._analyze_for_config(_oproj_graph(128, 6144, 2560), by_name(_k_cluster_name(128)))
+    C100 = _pin_render(monkeypatch, budget=_SM100_BUDGET, capacity={8: 64})
+    with pytest.raises(NotImplementedError, match="must fit the drained A ring it aliases"):
         C100._analyze_for_config(_oproj_graph(128, 6144, 2560), by_name(_k_cluster_name(128)))
 
 
@@ -1469,6 +1475,16 @@ def test_the_k_cluster_rendering_pins_its_barrier_table(monkeypatch, m, name):
     vsize = int(_const(src, "epi_chunk_elems"))
     assert int(_const(src, "xchg_chunks")) == R * tn // vsize and int(_const(src, "xchg_chunk_iters")) == -(-(R * tn // vsize) // 128)
     code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    # the receive plane is its OWN SMEM array (a peer's copy lands at the sender's time, when this CTA's rings may be live); the
+    # staging plane aliases the drained A ring; the rendered stage count (the last `ab_stages =` line is the override) took the
+    # receive plane off the budget, and the staging plane still fits the A ring it aliases
+    assert "xchg_recv = cutlass.Array(cutlass.Float32, xchg_plane_elems, space=cutlass.AddressSpace.smem, alignment=128)" in code
+    assert "xchg_stage = cutlass.Array(base=smem_a_list[0].data_ptr(), shape=xchg_plane_elems, dtype=cutlass.Float32)" in code
+    assert "base=smem_b_list" not in code
+    stages = [int(mm.group(1)) for mm in re.finditer(r"^ab_stages = (\d+)", src, re.M)]
+    plane_bytes = rows * row_bytes
+    assert stages[-1] == cfg.max_ab_stages(smem_fixed_reserve=2048, extra_smem_bytes=plane_bytes) and f"K-cluster receive plane {plane_bytes}B fixed" in src
+    assert plane_bytes <= stages[-1] * rows * 128, "the staging plane must fit the A ring beside the receive plane"
     assert code.count("nvvm.mbarrier_init(red_full_mbar_ptr, 1)") == 1
     assert code.count("nvvm.mbarrier_arrive_expect_tx(red_full_mbar_ptr, xchg_expect_bytes)") == 1
     assert code.count("nvvm.cp_async_bulk_shared_cluster_shared_cta(") == 1 and "for _pi in cutlass.range_constexpr(split_k_slices - 1):" in code

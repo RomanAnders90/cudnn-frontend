@@ -1148,11 +1148,14 @@ def _render_tile_constants(
             cast_extra_per_stage += cfg.cta_tile_m * k_elems * DTYPE_BYTES[chain.mainloop_a_load_dtype]
         if chain.mainloop_b_cast:
             cast_extra_per_stage += smem_n * k_elems * DTYPE_BYTES[chain.mainloop_b_load_dtype]
-    if smem_d_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0:
+    # The K-cluster split's RECEIVE plane is its own SMEM (never a ring alias: a peer's copy lands at the sender's time), a
+    # fixed reserve like the TMA-store staging; `_k_cluster_geometry` sizes the stages the same way for the admission.
+    kcluster_plane_bytes = _k_cluster_geometry(chain, cfg)["plane_bytes"] if cfg.cga_size_k > 1 else 0
+    if smem_d_bytes > 0 or cast_extra_per_stage > 0 or mg_extra_per_stage > 0 or kcluster_plane_bytes > 0:
         try:
             new_ab = cfg.max_ab_stages(
                 smem_fixed_reserve=smem_fixed_reserve,
-                extra_smem_bytes=smem_d_bytes,
+                extra_smem_bytes=smem_d_bytes + kcluster_plane_bytes,
                 extra_per_stage_bytes=cast_extra_per_stage + mg_extra_per_stage,
             )
         except ValueError as exc:
@@ -1161,8 +1164,11 @@ def _render_tile_constants(
                     f"multi-GEMM: {chain.num_a_operands} A + {chain.num_b_operands} B " f"operand tiles per stage exceed SMEM budget at this geometry"
                 ) from exc
             raise
+        # the K-cluster clause only on a K-cluster rendering: every other rendering stays byte-identical (the compiled-plan cache key)
         lines.append(
-            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed" f" + cast LOAD {cast_extra_per_stage}B/stage" f" + multi-GEMM {mg_extra_per_stage}B/stage"
+            f"ab_stages = {new_ab}  # SMEM-D {smem_d_bytes}B fixed"
+            f" + cast LOAD {cast_extra_per_stage}B/stage"
+            f" + multi-GEMM {mg_extra_per_stage}B/stage" + (f" + K-cluster receive plane {kcluster_plane_bytes}B fixed" if kcluster_plane_bytes > 0 else "")
         )
     lines.extend(_quant_device_imports(chain))
     lines.extend(_mixed_cga_constants(cfg, fallback_cluster))
@@ -1443,8 +1449,9 @@ def _mixed_cga_fallback(cfg: TileConfig, template_file: str) -> tuple[int, int, 
 # The K-CLUSTER split-K (``cluster1x1x{S}_..._splitK{S}``, ``cga_size_k == split_k_slices``): the S K slices of one output tile
 # are one cluster and reduce their fp32 planes through distributed shared memory inside ``sm100_matmul.py`` -- no reducer kernel,
 # no partials workspace, ``out`` bitwise the two-kernel reducer's (the shared ``splitk_fixed_order_sum``).  Admitted where it is
-# measured and where its one premise holds: ONE output tile per CTA (the exchange planes alias the drained operand rings), so
-# the tile count must fit the target's co-resident clusters of S.  At most 8 slices: the portable cluster size.
+# measured and where its one premise holds: ONE output tile per CTA (the staging plane aliases the drained A ring; the receive
+# plane is its own SMEM, since a peer's copy lands at the SENDER's time), so the tile count must fit the target's co-resident
+# clusters of S.  At most 8 slices: the portable cluster size.
 _K_CLUSTER_MAX_SLICES = 8
 
 
@@ -1469,7 +1476,13 @@ def _k_cluster_geometry(chain: FusionChain, cfg: TileConfig) -> dict:
     rows_per_cta = cfg.cta_tile_m // slices
     row_elems = tn + 4  # fp32: tn columns + one 16-byte pad -> an ODD count of 16-byte bank groups per row for every tn
     tmpl = select_template(chain, cfg)
-    ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    plane_bytes = cfg.cta_tile_m * row_elems * 4
+    # The RECEIVE plane is its own SMEM (a peer's DSMEM copy lands at the sender's time, when this CTA's rings may still be
+    # live), so it comes off the A/B stage budget exactly as the TMA-store staging does; 0 stages = the plane leaves no room.
+    try:
+        ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve, extra_smem_bytes=plane_bytes)
+    except ValueError:
+        ab_stages = 0
     cta_m, cta_smem_n, cta_k = cfg.cta_smem_tile_mnk(elem_bytes)
     return dict(
         slices=slices,
@@ -1477,7 +1490,7 @@ def _k_cluster_geometry(chain: FusionChain, cfg: TileConfig) -> dict:
         row_elems=row_elems,
         row_bytes=row_elems * 4,
         plane_elems=cfg.cta_tile_m * row_elems,
-        plane_bytes=cfg.cta_tile_m * row_elems * 4,
+        plane_bytes=plane_bytes,
         slice_elems=rows_per_cta * row_elems,
         slice_bytes=rows_per_cta * row_elems * 4,
         expect_bytes=(slices - 1) * rows_per_cta * row_elems * 4,
@@ -1528,14 +1541,18 @@ def _check_k_cluster_supported(chain: FusionChain, cfg: TileConfig) -> None:
     capacity = _k_cluster_capacity(slices)
     if tiles > capacity:
         raise NotImplementedError(
-            f"{what} runs ONE tile per CTA (its exchange planes alias the drained operand rings), so the {tiles} output tile(s) x {slices} "
+            f"{what} runs ONE tile per CTA (its staging plane aliases the drained A ring), so the {tiles} output tile(s) x {slices} "
             f"slices must be co-resident: the target runs {capacity} cluster(s) of {slices} at once"
         )
     geo = _k_cluster_geometry(chain, cfg)
-    if geo["plane_bytes"] > geo["a_ring_bytes"] or geo["plane_bytes"] > geo["b_ring_bytes"]:
+    if geo["ab_stages"] < 1:
         raise NotImplementedError(
-            f"{what}: the exchange plane ({geo['plane_bytes']} B: {cfg.cta_tile_m} rows x {geo['row_bytes']} B) must fit each drained operand ring "
-            f"(A {geo['a_ring_bytes']} B, B {geo['b_ring_bytes']} B at {geo['ab_stages']} stages)"
+            f"{what}: the receive plane ({geo['plane_bytes']} B: {cfg.cta_tile_m} rows x {geo['row_bytes']} B) leaves no room for one A/B stage in the SMEM budget"
+        )
+    if geo["plane_bytes"] > geo["a_ring_bytes"]:
+        raise NotImplementedError(
+            f"{what}: the staging plane ({geo['plane_bytes']} B: {cfg.cta_tile_m} rows x {geo['row_bytes']} B) must fit the drained A ring it aliases "
+            f"(A {geo['a_ring_bytes']} B at {geo['ab_stages']} stages beside the receive plane)"
         )
 
 

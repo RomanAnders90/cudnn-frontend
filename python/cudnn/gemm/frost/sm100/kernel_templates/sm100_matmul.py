@@ -162,10 +162,13 @@ def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, au
 #   CTA waits its own ``red_full`` and sums the S planes of its rows in the reducer's FIXED
 #   order (``splitk_fixed_order_sum``: bitwise the two-kernel form), then runs the chain's own
 #   epilogue (``@@INJECT_KCLUSTER_EPILOGUE@@``) on those rows.
-# * The exchange planes ALIAS the drained operand rings (``xchg_stage`` over the A ring,
-#   ``xchg_recv`` over the B ring) -- legal because the compiler admits the form only where
-#   every CTA runs ONE tile (the tile count fits the co-resident clusters), so after
-#   ``acc_full`` no ring byte is read or written again.
+# * The staging plane ``xchg_stage`` ALIASES the drained A ring -- legal because the compiler
+#   admits the form only where every CTA runs ONE tile (the tile count fits the co-resident
+#   clusters), so after THIS CTA's ``acc_full`` no ring byte of its own is read or written
+#   again, and only its own threads and copies touch the plane.  The receive plane
+#   ``xchg_recv`` is its OWN SMEM (off the stage budget): a peer's copy lands at the SENDER's
+#   time, when the receiver's rings may still be live -- a ring alias there is a cross-CTA WAR
+#   (a peer finishing its slice early overwrites operand stages under the receiver's MMA).
 # * The PDL release moves to the dense placement (after the mainloop: no reducer exists); every
 #   warp's LAST statement is the cluster exit sync (no SMEM is torn down under a pending DSMEM
 #   copy or a peer's relaxed arrive).
@@ -192,7 +195,7 @@ def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, au
 #   xchg_stage   fp32 [cta_tile_m][row_elems]  aliases the A ring (admitted iff it fits)   written by st.shared (lane = row,
 #                16-byte chunks), read by the bulk copies (async proxy; fenced) -- the row stride is an ODD number of 16-byte
 #                bank groups for every cta_tile_n, so 32 lanes' chunk stores land on 32 distinct groups (conflict-free)
-#   xchg_recv    fp32 [S][R][row_elems]        aliases the B ring (admitted iff it fits)   slot s = sender s's R rows of MY
+#   xchg_recv    fp32 [S][R][row_elems]        its OWN plane (the stage budget shrinks by it)  slot s = sender s's R rows of MY
 #                tile rows: slots s != k_rank land by DSMEM copy, slot k_rank by this CTA's own st.shared; read by the sum
 #   red_full     8 B, beside the other mbarriers (NEW)
 from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_fixed_order_sum
@@ -425,11 +428,14 @@ def _kernel(
         for _ in range(num_b_operands)
     ]
     # @@KCLUSTER_ONLY:BEGIN@@
-    # The exchange planes alias the drained operand rings (one tile per CTA by admission: after acc_full no ring byte is
-    # touched again).  xchg_stage = this CTA's whole fp32 tile, lane = row; xchg_recv = slot s holds sender s's R rows of MY
-    # rows (slot k_rank is written by this CTA itself, the others land by DSMEM copy).
+    # xchg_stage = this CTA's whole fp32 tile, lane = row: it ALIASES the drained A ring (one tile per CTA by admission, so after
+    # THIS CTA's acc_full no ring byte of its own is touched again; only this CTA's threads and copies read / write it).
+    # xchg_recv = slot s holds sender s's R rows of MY rows (slot k_rank by this CTA's own st.shared, the others by DSMEM copy): its
+    # OWN plane, never a ring -- a peer's copy lands at the SENDER's time, when this CTA's rings may still be live (a peer that
+    # finished its slice early would overwrite B stages still being read by this CTA's MMA: the cross-CTA WAR the per-CTA
+    # aliasing argument does not cover).  The compiler takes the plane off the A/B stage budget.
     xchg_stage = cutlass.Array(base=smem_a_list[0].data_ptr(), shape=xchg_plane_elems, dtype=cutlass.Float32)
-    xchg_recv = cutlass.Array(base=smem_b_list[0].data_ptr(), shape=xchg_plane_elems, dtype=cutlass.Float32)
+    xchg_recv = cutlass.Array(cutlass.Float32, xchg_plane_elems, space=cutlass.AddressSpace.smem, alignment=128)
     # @@KCLUSTER_ONLY:END@@
 
     # @@TMA_STORE_ONLY:BEGIN@@
