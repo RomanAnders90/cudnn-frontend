@@ -49,6 +49,11 @@ stage of the pipeline in ``api.py``::
                                 in registers, one 4096-bin histogram pass plus an exact rank of the k-th bin's candidates,
                                 the list written in canonical order (ids descending, -1 last); the DSL-free host entry is
                                 ``gated_attention_block/qsa_topk.py`` -- standalone until the decode indexer binds it
+    qsa_list_union.py           the block-sparse decode mode's LIST UNION: a sequence's S_q <= 4 per-row block lists merged
+                                into ONE canonical union list of distinct ids (descending) carrying a per-row membership nibble
+                                per block -- the input contract of the sparse core's UNION rendering (one 1024-thread CTA per
+                                sequence: a bitonic sort of the (id, row) keys, the run heads, a block scan; bitwise); the
+                                DSL-free host entry is ``gated_attention_block/qsa_list_union.py``
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the

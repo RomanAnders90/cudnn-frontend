@@ -370,6 +370,65 @@ def random_block_ids(
 
 
 # ---------------------------------------------------------------------------
+# The UNION list form (the sparse core's union rendering; kernels/qsa_list_union.py) -- the test-side oracle and its inverse
+# ---------------------------------------------------------------------------
+
+UNION_LIST_WIDTH = 2048  # the union list's width in words (4 rows x 512 ids); every slot of a row is written (-1 past the count)
+
+
+def union_words_reference(block_ids: torch.Tensor, block_lens, *, width: int = UNION_LIST_WIDTH) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The union kernel's contract as plain torch: per sequence the DISTINCT non-negative ids over its rows' valid entries (row ``j``'s
+    entries at index ``< clamp(block_lens[b, j], 0, top_k)`` when ``block_lens`` is given, else every entry), in STRICTLY DESCENDING order,
+    each as the word ``(blk << 4) | mask`` with ``mask`` bit ``j`` set iff row ``j`` lists ``blk`` -- a duplicate inside a row sets the bit
+    once --, ``-1`` past the count -> ``(union_ids int32 [B, width], union_lens int32 [B])``."""
+    if block_ids.dim() != 3:
+        raise ValueError(f"block_ids must be [B, S_q, top_k], got {tuple(block_ids.shape)}")
+    B, S_q, top_k = (int(x) for x in block_ids.shape)
+    dev = block_ids.device
+    ids = block_ids.to(torch.long)
+    valid = ids >= 0
+    if block_lens is not None:
+        cnt = block_lens.to(torch.long).reshape(B, S_q).clamp(0, top_k)
+        valid = valid & (torch.arange(top_k, device=dev)[None, None, :] < cnt[:, :, None])
+    words = torch.full((B, width), -1, dtype=torch.long, device=dev)
+    lens = torch.zeros(B, dtype=torch.long, device=dev)
+    for b in range(B):
+        mask_of = {}
+        for j in range(S_q):
+            for blk in ids[b, j][valid[b, j]].tolist():
+                mask_of[blk] = mask_of.get(blk, 0) | (1 << j)
+        blocks = sorted(mask_of, reverse=True)
+        if len(blocks) > width:
+            raise ValueError(f"sequence {b} lists {len(blocks)} distinct blocks, more than the width {width}")
+        lens[b] = len(blocks)
+        if blocks:
+            words[b, : len(blocks)] = torch.tensor([(blk << 4) | mask_of[blk] for blk in blocks], dtype=torch.long, device=dev)
+    return words.to(torch.int32), lens.to(torch.int32)
+
+
+def per_row_from_union(union_ids: torch.Tensor, union_lens: torch.Tensor, s_q: int, top_k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The inverse of :func:`union_words_reference` on a contract-clean list: row ``j``'s list = the blocks whose word carries bit ``j``,
+    DESCENDING, ``-1`` padded to ``top_k`` -> ``(block_ids int32 [B, S_q, top_k], block_lens int32 [B, S_q])``.  ``ValueError`` when a row
+    holds more than ``top_k`` blocks (not a union of ``top_k``-lists)."""
+    B, width = (int(x) for x in union_ids.shape)
+    dev = union_ids.device
+    out = torch.full((B, s_q, top_k), -1, dtype=torch.long, device=dev)
+    lens = torch.zeros(B, s_q, dtype=torch.long, device=dev)
+    for b in range(B):
+        n = int(union_lens[b])
+        w = union_ids[b, :n].to(torch.long)
+        blk, mask = w >> 4, w & 15
+        for j in range(s_q):
+            mine = blk[(mask >> j) & 1 == 1]
+            if mine.numel() > top_k:
+                raise ValueError(f"sequence {b} row {j}: {mine.numel()} blocks carry bit {j}, more than top_k = {top_k}")
+            mine = torch.sort(mine, descending=True).values
+            out[b, j, : mine.numel()] = mine
+            lens[b, j] = mine.numel()
+    return out.to(torch.int32), lens.to(torch.int32)
+
+
+# ---------------------------------------------------------------------------
 # The indexer (selection) reference
 # ---------------------------------------------------------------------------
 
