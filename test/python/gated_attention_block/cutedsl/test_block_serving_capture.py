@@ -231,7 +231,7 @@ def test_forced_refusal_under_capture_safe_is_typed_at_compile_and_never_a_warni
 
     _set_flag(monkeypatch, flag)
 
-    def refused(graph, config=None):
+    def refused(graph, config=None, combine_prologue=None):  # the compile hook's full keyword set (combine_prologue: the combine-in-the-out-projection arm)
         raise RuntimeError("forced refusal for the test")
 
     monkeypatch.setattr(compiler, "jit_from_cudnn_graph", refused)
@@ -255,7 +255,7 @@ def test_dense_plan_without_the_flag_and_a_refused_compile_keeps_the_typed_decli
 
     monkeypatch.delenv(_FLAG, raising=False)
 
-    def refused(graph, config=None):
+    def refused(graph, config=None, combine_prologue=None):  # the compile hook's full keyword set (combine_prologue: the combine-in-the-out-projection arm)
         raise RuntimeError("forced refusal for the test")
 
     monkeypatch.setattr(compiler, "jit_from_cudnn_graph", refused)

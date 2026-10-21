@@ -2004,8 +2004,12 @@ def build_proj_gemm(
         # pinned split refuses the fallback as SplitKPinRefused; an admitted fp8 MN-major triple (FP8_MN_MAJOR_VALIDATED)
         # refuses it with the admission's own NotImplementedError -- the table is validated at the forced tile on the FROST
         # JIT only, and the graph heuristic's tile is not that tile.
+        # The keyword reaches the JIT only under the arm: the plain projection's call keeps the signature every caller -- and every
+        # test stub of `jit_from_cudnn_graph(graph, config=None)` -- knew before the arm existed (the serving-capture suite stubs the
+        # compile to refuse; a keyword it does not take turned its typed refusal into a TypeError).
+        _jit_kw = {"combine_prologue": combine_prologue} if combine_prologue is not None else {}
         try:
-            compiled = jit_from_cudnn_graph(g, config=cfg, combine_prologue=combine_prologue)
+            compiled = jit_from_cudnn_graph(g, config=cfg, **_jit_kw)
         except Exception as exc:
             if combine_prologue is not None and not capture_safe:
                 # The arm has no fallback: the graph heuristic's plan reads a bf16 B operand that never exists under it.  The compiler's own
