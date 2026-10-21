@@ -72,6 +72,13 @@ class GemmKnobs:
         m = _CONFIG_NAME_RE.match(cfg.name)
         if m is None:
             raise ValueError(f"tile config {cfg.name!r} does not spell a canonical CONFIG_<pipeline>_... name")
+        if cfg.cga_size_k != 1:
+            # The K-cluster split-K (``cluster1x1x{S}``) is named by its catalog name alone: the shared knob vocabulary has no
+            # cluster-K axis yet, and a record that dropped the term would replay as the two-kernel split -- a different plan
+            # under the same knobs.  Declined rather than snapped (the engine's own split-K keeps the two-kernel form).
+            raise NotImplementedError(
+                f"tile config {cfg.name!r}: the cluster's K axis (cga_size_k={cfg.cga_size_k}) is not in the knob vocabulary; it is named by catalog name only"
+            )
         pipeline = m.group("pipeline")
         if not pipeline.startswith("sm") or not pipeline[2:].isdigit():
             raise ValueError(f"tile config pipeline {pipeline!r} is not an smNNN family")

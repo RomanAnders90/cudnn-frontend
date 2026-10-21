@@ -7,7 +7,11 @@ A ``TileConfig`` describes ONLY dtype-independent tile geometry (cta tile,
 MMA-inst tile, cluster shape, pipeline). It does NOT carry ``cta_group`` /
 ``ab_stages`` — those are execution strategy chosen by the
 kernel template. K is stored in *bytes*, so one config covers every dtype.
-Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>[_swapAB]``.
+Name: ``CONFIG_<pipeline>_<CTA_M>x<CTA_N>x<K_BYTES>_<MMA_M>x<MMA_N>x<MMA_K_BYTES>_cluster<cgrp_m>x<cgrp_n>[x<cgrp_k>][_swapAB]``.
+The cluster's K term is spelled only where it is an axis: ``cluster1x1x8_..._splitK8`` is the
+K-CLUSTER split-K (the eight K slices of one output tile form one cluster and reduce through
+distributed shared memory in the kernel; ``cga_size_k == split_k_slices``); every name without
+the term is the 1-deep cluster it always was, and a two-kernel split-K keeps spelling none.
 A warp-scoped family (sm120) additionally ALWAYS names its compute-warp grid
 via a ``_warpsMxN`` suffix — no grid is implied by an unsuffixed spelling.
 See ``kernel_registry`` for the template registry and the support funnel.
@@ -196,14 +200,20 @@ class TileConfig:
             if got != want:
                 raise NotImplementedError(f"TileConfig {name!r}: mma_size_{axis}={got} but the tiles say {want}")
 
-        # K is never split across CTAs of a cluster -- an axis reserved for later.
-        if self.cga_size_k != 1:
-            raise NotImplementedError(f"TileConfig {name!r}: cga_size_k={self.cga_size_k} — cross-CTA K reduction is not implemented")
+        # The cluster's K axis exists in ONE form: the K-cluster split-K, where the ``split_k_slices`` K slices of one output
+        # tile are the ``cga_size_k`` CTAs of one cluster and the fp32 partial planes are reduced through distributed shared
+        # memory inside the kernel (the sm100 template's ``cluster1x1x{S}`` mode).  Any other cross-CTA K reduction is not
+        # implemented: a K-deep cluster that does not match the slice count has no kernel.
+        if self.cga_size_k != 1 and self.cga_size_k != self.split_k_slices:
+            raise NotImplementedError(
+                f"TileConfig {name!r}: cga_size_k={self.cga_size_k} with split_k_slices={self.split_k_slices} — the cluster's K axis is admitted "
+                f"only as the split-K slice count (cga_size_k == split_k_slices: the in-cluster reduce); cross-CTA K reduction otherwise is not implemented"
+            )
 
         cga = self.cga_size_m * self.cga_size_n * self.cga_size_k
         if cga > MAX_CLUSTER_SIZE:
             raise NotImplementedError(
-                f"TileConfig {name!r}: cluster {self.cga_size_m}x{self.cga_size_n} is {cga} CTAs — the architecture CGA limit is {MAX_CLUSTER_SIZE}"
+                f"TileConfig {name!r}: cluster {self.cga_size_m}x{self.cga_size_n}x{self.cga_size_k} is {cga} CTAs — the architecture CGA limit is {MAX_CLUSTER_SIZE}"
             )
 
     # -- derived -------------------------------------------------------------
@@ -263,6 +273,8 @@ class TileConfig:
             f"{self.cta_tile_m}x{self.cta_tile_n}x{self.cta_tile_k_bytes}"
             f"_{self.mma_tile_m}x{self.mma_tile_n}x{self.mma_tile_k_bytes}"
             f"_cluster{self.cga_size_m}x{self.cga_size_n}"
+            # The K term only where it is an AXIS (the K-cluster split-K), so every 1-deep name round-trips unchanged.
+            + (f"x{self.cga_size_k}" if self.cga_size_k > 1 else "")
             # Named only where it is an AXIS -- a pipeline without the CTA pair
             # declares no such field, so there is nothing to spell.
             + (f"_{self.cta_group}ctamma" if isinstance(self, CtaPairTileConfig) else "")
@@ -286,8 +298,8 @@ class TileConfig:
 
     @property
     def cga_size_mnk(self) -> tuple[int, int, int]:
-        """cga_size as a cluster_shape-style triple."""
-        return (self.cga_size_m, self.cga_size_n, 1)
+        """cga_size as a cluster_shape-style triple -- the K term is the K-cluster split's slice count, 1 otherwise."""
+        return (self.cga_size_m, self.cga_size_n, self.cga_size_k)
 
     @property
     def cga_tile_mn(self) -> tuple[int, int]:
@@ -768,7 +780,7 @@ _CONFIG_NAME_RE = re.compile(
     r"^CONFIG_(?P<pipeline>sm\d+)_"
     r"(?P<cta_m>\d+)x(?P<cta_n>\d+)x(?P<k_bytes>\d+)_"
     r"(?P<mma_m>\d+)x(?P<mma_n>\d+)x(?P<mma_k_bytes>\d+)_"
-    r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:_(?P<cta_group>\d+)ctamma)?"
+    r"cluster(?P<cga_m>\d+)x(?P<cga_n>\d+)(?:x(?P<cga_k>\d+))?(?:_(?P<cta_group>\d+)ctamma)?"
     r"(?:_warps(?P<warps_m>\d+)x(?P<warps_n>\d+))?(?:_splitK(?P<split_k>\d+))?(?P<swap_ab>_swapAB)?$"
 )
 
@@ -779,7 +791,7 @@ def _synthesize_config(name: str) -> TileConfig:
     are still enforced by ``TileConfig.__post_init__``."""
     m = _CONFIG_NAME_RE.match(name)
     if m is None:
-        raise KeyError(f"unknown tile config {name!r} (not in the catalog and not a " f"canonical CONFIG_<pipeline>_MxNxKB_MxNxKB_clusterMxN name)")
+        raise KeyError(f"unknown tile config {name!r} (not in the catalog and not a " f"canonical CONFIG_<pipeline>_MxNxKB_MxNxKB_clusterMxN[xK] name)")
     pipeline = m.group("pipeline")
     cls = config_class_for_pipeline(pipeline)  # KeyError for unknown pipelines
     cta_m = int(m.group("cta_m"))
@@ -807,7 +819,8 @@ def _synthesize_config(name: str) -> TileConfig:
         mma_size_k=int(m.group("k_bytes")) // int(m.group("mma_k_bytes")),
         cga_size_m=int(m.group("cga_m")),
         cga_size_n=int(m.group("cga_n")),
-        cga_size_k=1,
+        # The K term is the K-cluster split-K's slice count (``__post_init__`` admits it only as such); absent = 1.
+        cga_size_k=int(m.group("cga_k") or 1),
         # Not spelled by the name; a family with its own block size declares it.
         warps_per_cta=getattr(cls, "DEFAULT_WARPS_PER_CTA", _TCGEN05_WARPS_PER_CTA),
         split_k_slices=int(m.group("split_k") or 1),
