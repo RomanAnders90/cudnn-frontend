@@ -20,6 +20,13 @@ planes as follows:
 With PDL enabled, every reducer CTA waits before reading the partial workspace.
 The fixed slice assignment and shuffle tree avoid atomics and make the reduction
 bit-reproducible for a fixed configuration.
+
+The K-CLUSTER split-K of ``sm100_matmul.py`` (``cluster1x1x{S}``: the S slices of
+one tile are one cluster and exchange their fp32 planes through distributed
+shared memory, no reducer kernel) sums the SAME planes in the SAME association
+through :func:`splitk_fixed_order_sum`, so its output is bitwise this kernel's.
+That function is the one spelling of the order; a change to the reducer's lane grouping
+or its tree here is a change there.
 """
 
 from __future__ import annotations
@@ -60,6 +67,40 @@ def _splitk_sum(vals):
     for v in vals[1:]:
         total = total + v
     return total
+
+
+def splitk_fixed_order_sum(vals, split_k_slices: int, zero=None):
+    """The reducer's sum of the ``split_k_slices`` slice values ``vals`` (slice order), in EXACTLY its association.
+
+    Lane group ``g`` of the reducer (``splitk_reduce_slice_groups``) folds slices ``g, g + groups, g + 2 * groups, ...``
+    left to right (``_splitk_sum``); a group without a tail slice adds a ZERO value last so every lane joins the shuffle
+    tree; then the tree folds group ``g + d`` into group ``g`` for ``d = groups / 2, ..., 1`` (``_splitk_group_tree``),
+    so group 0 holds ``(... ) + (...)`` of the group sums in that order.  ``+ 0.0`` is kept where the reducer adds it
+    (``-0.0 + 0.0`` is ``+0.0``: the term is part of the bitwise contract, not a no-op).  Works on anything that adds --
+    the DSL's vectors at trace time (the K-cluster kernel), floats or arrays on the host (the pins).  ``zero`` is required
+    when a group lacks a tail slice (``split_k_slices % groups != 0``).
+    """
+    if len(vals) != split_k_slices:
+        raise ValueError(f"splitk_fixed_order_sum: {len(vals)} values for split_k_slices={split_k_slices}")
+    groups = splitk_reduce_slice_groups(split_k_slices)
+    rounds = split_k_slices // groups
+    tail = split_k_slices - rounds * groups
+    if tail and zero is None:
+        raise ValueError(
+            f"splitk_fixed_order_sum: split_k_slices={split_k_slices} leaves {groups - tail} lane group(s) without a tail slice; pass the zero value the reducer adds"
+        )
+    acc = []
+    for g in range(groups):
+        mine = [vals[g + i * groups] for i in range(rounds)]
+        if tail:
+            mine.append(vals[rounds * groups + g] if g < tail else zero)
+        acc.append(_splitk_sum(mine))
+    d = groups // 2
+    while d >= 1:
+        for g in range(d):
+            acc[g] = acc[g] + acc[g + d]
+        d //= 2
+    return acc[0]
 
 
 def _splitk_group_tree(acc, groups, lanes_per_group):

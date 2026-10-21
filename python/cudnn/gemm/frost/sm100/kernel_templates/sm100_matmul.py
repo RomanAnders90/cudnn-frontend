@@ -140,6 +140,66 @@ def _splitk_epilogue(vec_f32, row, col_j, tile_l, M, N, vsize, taps, strides, au
 
 
 # @@SPLITK_ONLY:END@@
+# @@KCLUSTER_ONLY:BEGIN@@
+# THE K-CLUSTER SPLIT-K (``cluster1x1x{S}_..._splitK{S}``: ``cga_size_k == split_k_slices``)
+# -----------------------------------------------------------------------------------
+# Split-K reduced INSIDE a thread-block cluster: the S K slices of one output tile are the S
+# CTAs of one ``(1, 1, S)`` cluster (grid z = batch * S, consecutive z = the slices of one
+# tile), every CTA streams its K range exactly as the two-kernel form does, and the fp32
+# accumulator planes are exchanged through distributed shared memory -- no reducer kernel, no
+# fp32 partials in the workspace.  The rendering is the ``@@KCLUSTER_ONLY@@`` blocks (the
+# ``@@KCLUSTER_OFF@@`` blocks hold the lines they replace, so a rendering without the axis is
+# byte-identical to the template before the mode existed):
+#
+# * ``k_rank = cta_rank_in_cluster`` (a (1, 1, S) cluster's rank IS its z offset) and ``n_rank``
+#   is zeroed (the cluster has no N axis); ``tile_l = l_idx + k_rank`` wherever a CLC response is
+#   decoded (the response is one per cluster: its z is the cluster's base).
+# * The epilogue drains the tile as the STG arm does, but ``@@INJECT_EPILOGUE@@`` stages every
+#   thread's fp32 row chunk into ``xchg_stage[row][col]`` (and, for the R rows this CTA OWNS,
+#   into its own slot of ``xchg_recv``); then ``fence.proxy.async`` + named barrier 3; warp 0's
+#   elected lane ships each peer p its R-row slice (one ``cp.async.bulk.shared::cluster`` of
+#   ``R * row_bytes`` bytes into ``xchg_recv[k_rank]`` at p, completing p's ``red_full``); every
+#   CTA waits its own ``red_full`` and sums the S planes of its rows in the reducer's FIXED
+#   order (``splitk_fixed_order_sum``: bitwise the two-kernel form), then runs the chain's own
+#   epilogue (``@@INJECT_KCLUSTER_EPILOGUE@@``) on those rows.
+# * The exchange planes ALIAS the drained operand rings (``xchg_stage`` over the A ring,
+#   ``xchg_recv`` over the B ring) -- legal because the compiler admits the form only where
+#   every CTA runs ONE tile (the tile count fits the co-resident clusters), so after
+#   ``acc_full`` no ring byte is read or written again.
+# * The PDL release moves to the dense placement (after the mainloop: no reducer exists); every
+#   warp's LAST statement is the cluster exit sync (no SMEM is torn down under a pending DSMEM
+#   copy or a peer's relaxed arrive).
+#
+# Barrier table of the mode (per CTA; one tile per CTA, so ONE phase of every barrier;
+# ``init == SUM(issuing lanes)`` per phase):
+#
+#   ab_full[s]      init 1    the TMA warp's elected lane, arrive.expect_tx(num_tma_copy_bytes)    (unchanged)
+#   ab_empty[s]     init 1    the MMA warp's elected lane, tcgen05.commit on its OWN barrier         (the arrive mask is
+#                             ``1 << cta_rank_in_cluster``: no operand is multicast along K)        (count unchanged)
+#   acc_full[a]     init 1    the MMA warp's elected lane, tcgen05.commit                           (unchanged)
+#   acc_empty[a]    init 4    one elected lane per epilogue warp                                    (unchanged)
+#   clc_full[c]     init 1    the scheduler warp's elected lane, arrive.expect_tx(16) + the multicast response (unchanged)
+#   clc_empty[c]    init 7 S  the leader's: one elected lane of each of the 7 consumer warps of every CTA (mapa to rank 0)
+#   red_full        init 1    warp 0's elected lane, arrive.expect_tx((S - 1) * R * row_bytes) in the PROLOGUE (before the
+#                             cluster init sync); the tx bytes = the S - 1 peers' bulk copies of R * row_bytes each;
+#                             waited by the 4 epilogue warps at parity 0                             (NEW)
+#   named barrier 2 (TMEM_ALLOC)  5 x 32 (unchanged);  named barrier 3 (KCLUSTER_XCHG)  128 = the 4 epilogue warps (NEW)
+#   cluster INIT sync   every thread of the S CTAs after the elected inits + fence_mbarrier_init (the guard widened to the K cluster)
+#   cluster EXIT sync   every thread of the S CTAs as its last statement (NEW; arrive.release + wait.acquire)
+#
+# SMEM table of the mode (R = cta_tile_m / S, row_bytes = cta_tile_n * 4 + 16):
+#
+#   xchg_stage   fp32 [cta_tile_m][row_elems]  aliases the A ring (admitted iff it fits)   written by st.shared (lane = row,
+#                16-byte chunks), read by the bulk copies (async proxy; fenced) -- the row stride is an ODD number of 16-byte
+#                bank groups for every cta_tile_n, so 32 lanes' chunk stores land on 32 distinct groups (conflict-free)
+#   xchg_recv    fp32 [S][R][row_elems]        aliases the B ring (admitted iff it fits)   slot s = sender s's R rows of MY
+#                tile rows: slots s != k_rank land by DSMEM copy, slot k_rank by this CTA's own st.shared; read by the sum
+#   red_full     8 B, beside the other mbarriers (NEW)
+from cudnn.gemm.frost.kernel_templates.split_k_reduction_epilogue_fusion import splitk_fixed_order_sum
+
+# Named barrier id for the 4-warp epilogue sync around the DSMEM exchange (the K-cluster split-K).
+KCLUSTER_XCHG_BAR_ID = 3
+# @@KCLUSTER_ONLY:END@@
 
 
 def _a_collector_op(g):
@@ -238,6 +298,12 @@ def _kernel(
         if (cluster_m != cluster_shape_mnk[0]) | (cluster_n != cluster_shape_mnk[1]):
             m_rank = cta_rank_in_cluster & (fallback_cluster_shape_mnk[0] - 1)
             n_rank = cta_rank_in_cluster >> _fallback_cluster_m_shift
+    # @@KCLUSTER_ONLY:BEGIN@@
+    # A (1, 1, S) cluster: the CTA's rank IS its K slice, and the cluster has no N axis -- the rank the shift
+    # decomposition read into n_rank is zeroed (the tile's N coordinate and the operand masks must not move with the slice).
+    k_rank = cta_rank_in_cluster
+    n_rank = 0
+    # @@KCLUSTER_ONLY:END@@
 
     if cutlass.const_expr(cta_group == 2):
         pair_member = m_rank % cta_group
@@ -318,6 +384,10 @@ def _kernel(
     if cutlass.const_expr(cta_group == 2):
         tmem_dealloc_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem)
     tmem_ptr_i32 = cutlass.Array(cutlass.Int32, 1, space=cutlass.AddressSpace.smem)
+    # @@KCLUSTER_ONLY:BEGIN@@
+    # The K-cluster exchange barrier: completed by the S - 1 peers' DSMEM copies of this CTA's owner slice.
+    red_full_mbar_ptr = cutlass.Array(cutlass.Int64, 1, space=cutlass.AddressSpace.smem, alignment=8)
+    # @@KCLUSTER_ONLY:END@@
 
     # CLC scheduler SMEM — 2-stage ring.
     _clc_response_raw = cutlass.Array(cutlass.Int128, CLC_SCHED_STAGES, space=cutlass.AddressSpace.smem, alignment=16)
@@ -354,6 +424,13 @@ def _kernel(
         )
         for _ in range(num_b_operands)
     ]
+    # @@KCLUSTER_ONLY:BEGIN@@
+    # The exchange planes alias the drained operand rings (one tile per CTA by admission: after acc_full no ring byte is
+    # touched again).  xchg_stage = this CTA's whole fp32 tile, lane = row; xchg_recv = slot s holds sender s's R rows of MY
+    # rows (slot k_rank is written by this CTA itself, the others land by DSMEM copy).
+    xchg_stage = cutlass.Array(base=smem_a_list[0].data_ptr(), shape=xchg_plane_elems, dtype=cutlass.Float32)
+    xchg_recv = cutlass.Array(base=smem_b_list[0].data_ptr(), shape=xchg_plane_elems, dtype=cutlass.Float32)
+    # @@KCLUSTER_ONLY:END@@
 
     # @@TMA_STORE_ONLY:BEGIN@@
     # One epilogue subtile = one MMA-M block x 32 cols; the M blocks reuse it.
@@ -400,14 +477,30 @@ def _kernel(
                 nvvm.mbarrier_init(clc_full_mbar_ptr.subview(i), 1)
             if elect_one:
                 nvvm.mbarrier_init(clc_empty_mbar_ptr.subview(i), clc_empty_count)
+        # @@KCLUSTER_ONLY:BEGIN@@
+        if elect_one:
+            nvvm.mbarrier_init(red_full_mbar_ptr, 1)
+        # @@KCLUSTER_ONLY:END@@
     nvvm.fence_mbarrier_init()
     if cutlass.const_expr(cta_group == 1):
 
+        # @@KCLUSTER_OFF:BEGIN@@
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             nvvm.barrier_cluster_arrive_relaxed()
             nvvm.barrier_cluster_wait()
         else:
             nvvm.barrier_cta_sync(0)
+        # @@KCLUSTER_OFF:END@@
+        # @@KCLUSTER_ONLY:BEGIN@@
+        # The owner's expectation is posted BEFORE the cluster init sync, so every peer's copy is issued after it (the
+        # mbarrier tolerates either order -- a transiently negative tx count -- but the arrive count pins the phase to the
+        # posted expectation).  The K cluster always syncs: the leader's clc_empty and this CTA's red_full take remote arrives.
+        if warp_idx == 0:
+            if elect_one:
+                nvvm.mbarrier_arrive_expect_tx(red_full_mbar_ptr, xchg_expect_bytes)
+        nvvm.barrier_cluster_arrive_relaxed()
+        nvvm.barrier_cluster_wait()
+        # @@KCLUSTER_ONLY:END@@
     else:
         nvvm.barrier_cluster_arrive_relaxed()
 
@@ -517,6 +610,7 @@ def _kernel(
 
             sched_iter += 1
 
+        # @@KCLUSTER_OFF:BEGIN@@
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             if is_cluster_leader_cta:
                 for _ in range(CLC_SCHED_STAGES):
@@ -530,6 +624,22 @@ def _kernel(
                     ):
                         pass
                     sched_iter += 1
+        # @@KCLUSTER_OFF:END@@
+        # @@KCLUSTER_ONLY:BEGIN@@
+        # The K cluster is never 1-deep: the leader drains the peers' last relaxed arrives before its SMEM may die.
+        if is_cluster_leader_cta:
+            for _ in range(CLC_SCHED_STAGES):
+                stage = sched_iter % CLC_SCHED_STAGES
+                if stage == 0 and sched_iter != 0:
+                    clc_empty_phase = clc_empty_phase ^ 1
+                while not nvvm.mbarrier_try_wait_parity(
+                    clc_empty_mbar_ptr.subview(stage),
+                    clc_empty_phase,
+                    time_limit=10_000_000,
+                ):
+                    pass
+                sched_iter += 1
+        # @@KCLUSTER_ONLY:END@@
 
     if warp_idx == tma_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
@@ -798,7 +908,12 @@ def _kernel(
                 swizzle_w,
                 identity=tile_swizzle_n == 1,
             )
+            # @@KCLUSTER_OFF:BEGIN@@
             tile_l = l_idx
+            # @@KCLUSTER_OFF:END@@
+            # @@KCLUSTER_ONLY:BEGIN@@
+            tile_l = l_idx + k_rank
+            # @@KCLUSTER_ONLY:END@@
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -809,6 +924,7 @@ def _kernel(
         tail_phase = ab_empty_phase_bit
         if tail_stage == 0 and ab_iter != 0:
             tail_phase = tail_phase ^ 1
+        # @@KCLUSTER_OFF:BEGIN@@
         if cutlass.const_expr(cluster_shape_mnk[0] * cluster_shape_mnk[1] > 1):
             for _ in range(ab_stages):
                 while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
@@ -817,6 +933,18 @@ def _kernel(
                 if tail_stage == ab_stages:
                     tail_stage = cutlass.Int32(0)
                     tail_phase = tail_phase ^ 1
+        # @@KCLUSTER_OFF:END@@
+        # @@KCLUSTER_ONLY:BEGIN@@
+        # The ring drain of every clustered launch (the commits are local here, but the drain keeps the clustered form's
+        # shape: no producer leaves before its ring is quiet).
+        for _ in range(ab_stages):
+            while not nvvm.mbarrier_try_wait_parity(ab_empty_mbar_ptr.subview(tail_stage), tail_phase, time_limit=10_000_000):
+                pass
+            tail_stage = tail_stage + 1
+            if tail_stage == ab_stages:
+                tail_stage = cutlass.Int32(0)
+                tail_phase = tail_phase ^ 1
+        # @@KCLUSTER_ONLY:END@@
 
     if cutlass.const_expr(fallback_cluster_shape_mnk is None):
         b_arrive_pattern = (1 << cluster_m) - 1
@@ -830,6 +958,11 @@ def _kernel(
         ab_empty_arrive_mask = cutlass.Int16((1 << cluster_size) - 1)
     else:
         ab_empty_arrive_mask = cutlass.Int16(a_part | b_part)
+    # @@KCLUSTER_ONLY:BEGIN@@
+    # No operand is multicast along K: every slice's commits arrive on its OWN ab_empty (the N-rank mask above would name
+    # rank 0's barrier from every CTA).
+    ab_empty_arrive_mask = cutlass.Int16(1) << cta_rank_in_cluster
+    # @@KCLUSTER_ONLY:END@@
     if cutlass.const_expr(cta_group == 2):
         acc_full_mcast = cutlass.Int16(3) << pair_leader_rank
     else:
@@ -981,18 +1114,31 @@ def _kernel(
                 _m_idx, _n_idx, _l_idx, vld = cute_clc.clc_response(clc_response_ptr_base + consumer_stage)
                 cute.arch.fence_proxy("async.shared", space="cta")
                 is_valid = vld
+                # @@KCLUSTER_OFF:BEGIN@@
                 if cutlass.const_expr(split_k_slices > 1):
                     tile_l = _l_idx
+                # @@KCLUSTER_OFF:END@@
+                # @@KCLUSTER_ONLY:BEGIN@@
+                tile_l = _l_idx + k_rank
+                # @@KCLUSTER_ONLY:END@@
                 nvvm.bar_warp_sync(0xFFFFFFFF)
                 if elect_one:
                     empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
                     nvvm.mbarrier_arrive(empty_remote, scope=nvvm.MemScope.CLUSTER, relaxed=True)
                 tile_iter += 1
 
+            # @@KCLUSTER_OFF:BEGIN@@
             # Dense only: an early-launched reducer would pile its many small CTAs
             # onto the few idle SMs, so split-K leaves the trigger to grid exit.
             if cutlass.const_expr(USE_PDL and split_k_slices == 1):
                 nvvm.griddepcontrol("launch_dependents")
+            # @@KCLUSTER_OFF:END@@
+            # @@KCLUSTER_ONLY:BEGIN@@
+            # The K cluster has no reducer: the release takes the dense placement (after the mainloop, below this CTA's own
+            # tmem_alloc).  Every global read of a predecessor's output sits below the roles' griddepcontrol.wait.
+            if cutlass.const_expr(USE_PDL):
+                nvvm.griddepcontrol("launch_dependents")
+            # @@KCLUSTER_ONLY:END@@
 
             tail_stage = acc_stage
             tail_phase = acc_empty_phase_bit
@@ -1184,6 +1330,51 @@ def _kernel(
                     # @@STG_ONLY:END@@
 
             # @@EPILOGUE_DRAIN:END@@
+            # @@KCLUSTER_ONLY:BEGIN@@
+            # The K-cluster reduce.  Every epilogue thread staged its fp32 row chunks into xchg_stage above (and its own
+            # slot of xchg_recv where it owns the row); publish them to the async proxy and gather the four warps, then warp
+            # 0's elected lane ships each peer the R rows that peer owns, completing the peer's red_full by the slice bytes.
+            cute.arch.fence_view_async_shared()
+            nvvm.barrier_cta_sync(barrier_id=KCLUSTER_XCHG_BAR_ID, thread_count=num_epilogue_warps * 32)
+            if warp_idx == 0:
+                for _pi in cutlass.range_constexpr(split_k_slices - 1):
+                    _peer = (k_rank + _pi + 1) % split_k_slices
+                    if elect_one:
+                        nvvm.cp_async_bulk_shared_cluster_shared_cta(
+                            nvvm.mapa(xchg_recv.subview(k_rank * xchg_slice_elems), _peer),
+                            xchg_stage.subview(_peer * xchg_slice_elems),
+                            nvvm.mapa(red_full_mbar_ptr, _peer),
+                            xchg_slice_bytes,
+                        )
+            # My rows' S - 1 peer planes have landed (one phase: parity 0); slot k_rank is my own plane, ordered by the
+            # named barrier above.
+            while not nvvm.mbarrier_try_wait_parity(red_full_mbar_ptr, 0, time_limit=10_000_000):
+                pass
+            # Grid z carried batch * S: the OUTPUT batch index of this tile.
+            tile_l = tile_l // split_k_slices
+            # Thread t sums chunks t, t + 128, ... of this CTA's R rows x cta_tile_n columns (vsize-wide chunks, the
+            # drain's own width) in the reducer's fixed order, then runs the chain's epilogue on them.
+            for _ci in cutlass.range_constexpr(xchg_chunk_iters):
+                _chunk = tidx + _ci * (num_epilogue_warps * 32)
+                if _chunk < xchg_chunks:
+                    _r_local = _chunk // xchg_chunks_per_row
+                    _c_local = (_chunk - _r_local * xchg_chunks_per_row) * vsize
+                    row = coord_m + k_rank * xchg_rows_per_cta + _r_local
+                    col_j = coord_n_c + _c_local
+                    if row < M:
+                        if col_j + vsize <= N:
+                            _planes = []
+                            for _s in cutlass.range_constexpr(split_k_slices):
+                                _planes.append(
+                                    xchg_recv.data_ptr((_s * xchg_rows_per_cta + _r_local) * xchg_row_elems + _c_local).load(
+                                        count=vsize, alignment=xchg_chunk_align
+                                    )
+                                )
+                            vec_f32 = splitk_fixed_order_sum(_planes, split_k_slices, zero=cutlass.full((vsize,), 0.0, cutlass.Float32))
+                            # @@INJECT_KCLUSTER_AUX_VIEWS@@
+
+                            # @@INJECT_KCLUSTER_EPILOGUE@@
+            # @@KCLUSTER_ONLY:END@@
             consumer_stage = tile_iter % CLC_SCHED_STAGES
             if consumer_stage == 0 and tile_iter != 0:
                 clc_full_phase_epi = clc_full_phase_epi ^ 1
@@ -1214,7 +1405,12 @@ def _kernel(
                 swizzle_w,
                 identity=tile_swizzle_n == 1,
             )
+            # @@KCLUSTER_OFF:BEGIN@@
             tile_l = l_idx
+            # @@KCLUSTER_OFF:END@@
+            # @@KCLUSTER_ONLY:BEGIN@@
+            tile_l = l_idx + k_rank
+            # @@KCLUSTER_ONLY:END@@
             nvvm.bar_warp_sync(0xFFFFFFFF)
             if elect_one:
                 empty_remote = nvvm.mapa(clc_empty_mbar_ptr.subview(consumer_stage), 0)
@@ -1229,6 +1425,13 @@ def _kernel(
 
     if warp_idx == unused_warp_id:
         nvvm.setmaxregister(prod_reg_count, nvvm.SetMaxRegisterAction.DECREASE)
+    # @@KCLUSTER_ONLY:BEGIN@@
+    # Cluster EXIT sync, every thread of every CTA, after its role's last store / wait: a CTA whose red_full completed has
+    # received everything, and this barrier after every CTA's wait proves every copy OUT of this CTA (and every peer's
+    # relaxed arrive onto the leader's clc_empty) landed before any SMEM is torn down.
+    nvvm.barrier_cluster_arrive()
+    nvvm.barrier_cluster_wait()
+    # @@KCLUSTER_ONLY:END@@
 
 
 _kernel.set_name_prefix("cudnn", remove_cutlass_symbol=True)

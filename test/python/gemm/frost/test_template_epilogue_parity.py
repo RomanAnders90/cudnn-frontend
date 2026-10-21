@@ -509,6 +509,10 @@ def _check_preferred_fallback_pair(
     """Validate one source-level preferred/fallback value selection."""
 
     assignments = _assignments_to(kernel, target)
+    # The K-cluster split-K rendering (`cluster1x1x{S}`: a cluster with no N axis) zeroes a rank in its own
+    # `@@KCLUSTER_ONLY@@` block (`n_rank = 0`); the preferred / fallback pair rule is about the shift decomposition, so a
+    # literal-zero assignment is not one of the pair.
+    assignments = [node for node in assignments if ast.dump(node.value, include_attributes=False) != _expr_dump("0")]
     preferred_dump = _expr_dump(preferred)
     fallback_dump = _expr_dump(fallback)
     preferred_assignments = [node for node in assignments if ast.dump(node.value, include_attributes=False) == preferred_dump]

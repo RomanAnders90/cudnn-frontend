@@ -800,8 +800,14 @@ def _epi_vec_bytes(
     return min(vec, _EPI_CHUNK_ELEMS_BY_PIPELINE[config.pipeline] * DTYPE_BYTES[chain.output_dtype])
 
 
+def _two_kernel_splitk(config: TileConfig) -> bool:
+    """The TWO-KERNEL split-K (fp32 partials + the reducer kernel); the K-cluster form reduces in-kernel and renders the
+    chain's own epilogue, so every partials-specific rule below reads the dense answer for it."""
+    return config.split_k_slices > 1 and config.cga_size_k == 1
+
+
 def _epi_store_dtype(chain: FusionChain, config: TileConfig) -> str:
-    return "fp32" if config.split_k_slices > 1 else chain.output_dtype
+    return "fp32" if _two_kernel_splitk(config) else chain.output_dtype
 
 
 def _epi_chunk_elems(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
@@ -824,7 +830,7 @@ def _splitk_reduce_elems(chain: FusionChain) -> int:
 
 def _out_vec_bytes(chain: FusionChain, config: TileConfig, use_tma_store: bool) -> int:
     """The vector width for the output stores."""
-    if config.split_k_slices > 1:
+    if _two_kernel_splitk(config):
         return _splitk_reduce_elems(chain) * DTYPE_BYTES[chain.output_dtype]
     return _epi_chunk_bytes(chain, config, use_tma_store)
 
@@ -1128,6 +1134,8 @@ def _render_tile_constants(
     lines.append(f"epi_dp22 = {_epi_dp22(cfg)}")
     lines.append(f"epi_stage_rows = {_epi_stage_rows(cfg)}")
     lines.append(f"epi_chunk_elems = {_epi_chunk_elems(chain, cfg, use_tma)}")
+    if cfg.cga_size_k > 1:
+        lines.extend(_k_cluster_constants(chain, cfg, _epi_chunk_elems(chain, cfg, use_tma)))
     # Final ab_stages override: account for the TMA-D SMEM buffer (fixed, when
     # TMA-store is active) AND a mixed-input mainloop's narrow LOAD buffer
     # (per-stage). Otherwise leave the plain max.
@@ -1420,12 +1428,152 @@ def _mixed_cga_fallback(cfg: TileConfig, template_file: str) -> tuple[int, int, 
     """
     if os.environ.get("CUDNN_FROST_DISABLE_MIXED_CGA"):
         return None
+    if cfg.cga_size_k > 1:
+        # The K-cluster split-K: a CTA landing in a smaller cluster would wait on exchange copies and arrives that never
+        # come (a hang, not a lost optimization) -- the launch is the fixed (1, 1, S) cluster, always.
+        return None
     if not _mixed_cga_supported():
         return None
     if not _template_reads_fallback_cluster(template_file):
         return None
     fallback = cfg.fallback_cga_size_mnk
     return None if fallback == cfg.cga_size_mnk else fallback
+
+
+# The K-CLUSTER split-K (``cluster1x1x{S}_..._splitK{S}``, ``cga_size_k == split_k_slices``): the S K slices of one output tile
+# are one cluster and reduce their fp32 planes through distributed shared memory inside ``sm100_matmul.py`` -- no reducer kernel,
+# no partials workspace, ``out`` bitwise the two-kernel reducer's (the shared ``splitk_fixed_order_sum``).  Admitted where it is
+# measured and where its one premise holds: ONE output tile per CTA (the exchange planes alias the drained operand rings), so
+# the tile count must fit the target's co-resident clusters of S.  At most 8 slices: the portable cluster size.
+_K_CLUSTER_MAX_SLICES = 8
+
+
+def _k_cluster_capacity(cluster_size: int, device=None) -> int:
+    """Co-resident clusters of ``cluster_size`` CTAs the target runs at once (``cudnn.frost.occupancy``); 0 where none fits,
+    where the probe cannot answer (no device), or below sm_90.  A module function so a host test can pin a table."""
+    from cudnn.frost.occupancy import max_active_clusters
+
+    try:
+        return int(max_active_clusters(cluster_size, device))
+    except (NotImplementedError, RuntimeError, ValueError):
+        return 0
+
+
+def _k_cluster_geometry(chain: FusionChain, cfg: TileConfig) -> dict:
+    """The K-cluster exchange geometry of (chain, cfg): rows per owner, the padded fp32 row, the planes, the ring bytes."""
+    from ..kernel_registry import select_template
+
+    slices = cfg.split_k_slices
+    elem_bytes = DTYPE_BYTES[_mma_a_dtype(chain)]
+    tn = cfg.cta_tile_n
+    rows_per_cta = cfg.cta_tile_m // slices
+    row_elems = tn + 4  # fp32: tn columns + one 16-byte pad -> an ODD count of 16-byte bank groups per row for every tn
+    tmpl = select_template(chain, cfg)
+    ab_stages = cfg.max_ab_stages(smem_fixed_reserve=tmpl.smem_fixed_reserve)
+    cta_m, cta_smem_n, cta_k = cfg.cta_smem_tile_mnk(elem_bytes)
+    return dict(
+        slices=slices,
+        rows_per_cta=rows_per_cta,
+        row_elems=row_elems,
+        row_bytes=row_elems * 4,
+        plane_elems=cfg.cta_tile_m * row_elems,
+        plane_bytes=cfg.cta_tile_m * row_elems * 4,
+        slice_elems=rows_per_cta * row_elems,
+        slice_bytes=rows_per_cta * row_elems * 4,
+        expect_bytes=(slices - 1) * rows_per_cta * row_elems * 4,
+        a_ring_bytes=ab_stages * cta_m * cta_k * elem_bytes,
+        b_ring_bytes=ab_stages * cta_smem_n * cta_k * elem_bytes,
+        ab_stages=ab_stages,
+    )
+
+
+def _check_k_cluster_supported(chain: FusionChain, cfg: TileConfig) -> None:
+    """The K-cluster split-K's admission (every item a typed decline naming the rule); a no-op for ``cga_size_k == 1``.
+    Runs after ``_check_splitk_supported`` (the split's own rules -- fp32 accumulation, grid.z, no MoE / multi-GEMM / quant --
+    hold for both forms)."""
+    if cfg.cga_size_k == 1:
+        return
+    slices = cfg.split_k_slices
+    what = f"config {cfg.name!r}: the K-cluster split-K (cluster1x1x{slices}: the {slices} K slices of a tile reduced through distributed shared memory)"
+    if cfg.cga_size_m != 1 or cfg.cga_size_n != 1:
+        raise NotImplementedError(f"{what} needs a 1x1 cluster along M x N; got {cfg.cga_size_m}x{cfg.cga_size_n}")
+    if cfg.ctas_per_mma != 1:
+        raise NotImplementedError(f"{what} needs the 1-CTA MMA (the 2-CTA pair's TMEM handshake and B split are not combined with a K cluster)")
+    if cfg.mma_size_m != 1:
+        raise NotImplementedError(f"{what} drains ONE MMA-M block per tile; got mma_size_m={cfg.mma_size_m}")
+    if slices > _K_CLUSTER_MAX_SLICES:
+        raise NotImplementedError(f"{what} takes at most {_K_CLUSTER_MAX_SLICES} slices (the portable cluster size)")
+    if cfg.cta_tile_m % slices:
+        raise NotImplementedError(
+            f"{what} splits the {cfg.cta_tile_m}-row tile into {slices} equal owner slices, but {slices} does not divide {cfg.cta_tile_m}"
+        )
+    dense_reasons = []
+    if chain.has_moe:
+        dense_reasons.append("MoE grouped matmul")
+    if chain.has_block_scale:
+        dense_reasons.append("block-scale operands")
+    if chain.is_multi_gemm:
+        dense_reasons.append("multi-GEMM")
+    if chain.has_mainloop_fusion:
+        dense_reasons.append("mainloop fusion")
+    if chain.quants:
+        dense_reasons.append("block-scale quantize")
+    if dense_reasons:
+        raise NotImplementedError(f"{what} is a dense form; not with: {', '.join(dense_reasons)}")
+    mm = chain.matmul
+    k_tiles = -(-mm.K // _cta_k_elems(chain, cfg))
+    if k_tiles < slices:
+        raise NotImplementedError(f"{what}: every slice owns at least one CTA K tile, but K={mm.K} has {k_tiles} tile(s) for {slices} slices")
+    tiles = mm.batch * -(-mm.M // cfg.cta_tile_m) * -(-mm.N // cfg.cta_tile_n)
+    capacity = _k_cluster_capacity(slices)
+    if tiles > capacity:
+        raise NotImplementedError(
+            f"{what} runs ONE tile per CTA (its exchange planes alias the drained operand rings), so the {tiles} output tile(s) x {slices} "
+            f"slices must be co-resident: the target runs {capacity} cluster(s) of {slices} at once"
+        )
+    geo = _k_cluster_geometry(chain, cfg)
+    if geo["plane_bytes"] > geo["a_ring_bytes"] or geo["plane_bytes"] > geo["b_ring_bytes"]:
+        raise NotImplementedError(
+            f"{what}: the exchange plane ({geo['plane_bytes']} B: {cfg.cta_tile_m} rows x {geo['row_bytes']} B) must fit each drained operand ring "
+            f"(A {geo['a_ring_bytes']} B, B {geo['b_ring_bytes']} B at {geo['ab_stages']} stages)"
+        )
+
+
+def _k_cluster_constants(chain: FusionChain, cfg: TileConfig, vsize: int) -> list[str]:
+    """The template constants of the K-cluster rendering (``@@KCLUSTER_ONLY@@`` blocks of ``sm100_matmul.py``)."""
+    geo = _k_cluster_geometry(chain, cfg)
+    tn = cfg.cta_tile_n
+    chunks_per_row = tn // vsize
+    chunks = geo["rows_per_cta"] * chunks_per_row
+    epi_threads = _EPI_WARPS * 32
+    return [
+        f"# K-cluster split-K: {geo['slices']} slices x {geo['rows_per_cta']} owner rows; the exchange row = {tn} fp32 + a 16-byte pad",
+        f"xchg_rows_per_cta = {geo['rows_per_cta']}",
+        f"xchg_row_elems = {geo['row_elems']}",
+        f"xchg_plane_elems = {geo['plane_elems']}",
+        f"xchg_slice_elems = {geo['slice_elems']}",
+        f"xchg_slice_bytes = {geo['slice_bytes']}",
+        f"xchg_expect_bytes = {geo['expect_bytes']}",
+        f"xchg_chunks_per_row = {chunks_per_row}",
+        f"xchg_chunks = {chunks}",
+        f"xchg_chunk_iters = {-(-chunks // epi_threads)}",
+        f"xchg_chunk_align = {min(16, vsize * 4)}",
+    ]
+
+
+def _kcluster_stage_store_snippet(vsize: int) -> str:
+    """The K-cluster rendering's ``@@INJECT_EPILOGUE@@``: stage this thread's fp32 chunk into its row of ``xchg_stage`` (what the
+    peers' owner slices are copied from), and into this CTA's own slot of ``xchg_recv`` where the row is one this CTA owns.
+    Sits inside the drain's ``row < M`` / ``col_j + vsize <= N`` guards, exactly like the dense store it replaces."""
+    align = min(16, vsize * 4)
+    return "\n".join(
+        [
+            "_xchg_off = (row - coord_m) * xchg_row_elems + (col_j - coord_n_c)",
+            f"xchg_stage.data_ptr(_xchg_off).store(vec_f32, alignment={align})",
+            "if (row - coord_m) // xchg_rows_per_cta == k_rank:",
+            f"    xchg_recv.data_ptr(_xchg_off).store(vec_f32, alignment={align})",
+        ]
+    )
 
 
 def _mixed_cga_constants(cfg: TileConfig, fallback_cluster: tuple[int, int, int] | None) -> list[str]:
@@ -2206,12 +2354,19 @@ def _render_template(
     tma_slots = frozenset(i for i, m in enumerate(store_modes) if m == "tma")
     use_tma = _use_tma_store_epi(chain, config)
     src = _resolve_path_blocks(src, use_tma)
-    # Split-K blocks
-    splitk = config.split_k_slices > 1
+    # Split-K blocks.  `splitk` is the TWO-KERNEL form (kernel 1 stores fp32 partials, the reducer kernel runs the epilogue);
+    # the K-CLUSTER form (`cga_size_k == split_k_slices`) keeps the K range split but reduces in-kernel through its own
+    # @@KCLUSTER_ONLY@@ blocks and renders the chain's epilogue itself, so it is a DENSE rendering everywhere else.
+    kcluster = config.cga_size_k > 1
+    splitk = config.split_k_slices > 1 and not kcluster
     if "@@SPLITK_ONLY:BEGIN@@" in src:
         src = _resolve_blocks(src, "SPLITK_ONLY", splitk)
-    elif splitk:
+    elif config.split_k_slices > 1:
         raise NotImplementedError(f"split_k_slices={config.split_k_slices}: template {tmpl.file} has no split-K support")
+    if kcluster and "@@KCLUSTER_ONLY:BEGIN@@" not in src:
+        raise NotImplementedError(f"{config.name!r}: template {tmpl.file} has no K-cluster split-K arm")
+    src = _resolve_blocks(src, "KCLUSTER_ONLY", kcluster)
+    src = _resolve_blocks(src, "KCLUSTER_OFF", not kcluster)
     # For splitK, `snippets` is is kernel 1's partials store. Re-generate epilogue for reduce kernel
     plumb = _splitk_reduce_snippets(chain, config) if splitk else snippets
 
@@ -2329,14 +2484,19 @@ def _render_template(
         "INJECT_COMPILE_TAP_PASS": compile_tap_pass,
         "INJECT_TAP_PTRS": tap_ptr_binds,
         # Under split-K kernel 1 only stores partials: no aux reads, and the
-        # graph's epilogue runs in kernel 2 instead.
-        "INJECT_AUX_VIEWS": "pass" if splitk else snippets.aux_views,
-        "INJECT_EPILOGUE": snippets.epilogue,
+        # graph's epilogue runs in kernel 2 instead.  Under the K cluster the drain
+        # stages the fp32 chunks and the chain's epilogue runs on the owner rows
+        # (the @@INJECT_KCLUSTER_*@@ markers below), aux views included.
+        "INJECT_AUX_VIEWS": "pass" if (splitk or kcluster) else snippets.aux_views,
+        "INJECT_EPILOGUE": _kcluster_stage_store_snippet(_epi_chunk_elems(chain, config, use_tma)) if kcluster else snippets.epilogue,
     }
     if splitk:
         replacements["INJECT_SPLITK_EPILOGUE_BINDINGS"] = _splitk_epilogue_bindings(chain, len(plumb.tap_kernel_params))
         replacements["INJECT_REDUCE_AUX_VIEWS"] = plumb.aux_views
         replacements["INJECT_REDUCE_EPILOGUE"] = plumb.epilogue
+    if kcluster:
+        replacements["INJECT_KCLUSTER_AUX_VIEWS"] = snippets.aux_views
+        replacements["INJECT_KCLUSTER_EPILOGUE"] = snippets.epilogue
     for marker, replacement in (
         ("INJECT_KERNEL_REDUCTION_STRIDE_PARAMS", red_kernel_stride_params),
         ("INJECT_HOST_REDUCTION_STRIDES", red_host_stride_unpack),
@@ -2395,7 +2555,7 @@ def _render_template(
 
     # Tag the kernel fn name with template + geometry so nsys gives each
     # (template, config) a distinct GPU kernel symbol.
-    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}")
+    tag = re.sub(r"[^A-Za-z0-9_]", "_", f"{_template_stem(tmpl.file)}_{config.geometry_name}{_store_mode_tag(store_modes)}{'_kcluster' if kcluster else ''}")
     src = re.sub(r"\b_kernel(?=\(|\.set_name_prefix\b)", f"frost_{tag}", src)
 
     return src
@@ -2958,8 +3118,8 @@ class CompiledFusedGemm:
     workspace_bytes: int = 0
 
     def workspace_bytes_for(self, batch: int, m: int, n: int) -> int:
-        """workspace for a given shape."""
-        if self.config.split_k_slices == 1:
+        """workspace for a given shape (the two-kernel split-K's fp32 partials; 0 for the dense and the K-cluster forms)."""
+        if not _two_kernel_splitk(self.config):
             return 0
         return align_up(self.config.split_k_slices * batch * m * n * 4)
 
@@ -3108,7 +3268,7 @@ class CompiledFusedGemm:
             o.index for o in r.outputs if o.role.startswith("quant_scale_") and self.chain.quants[int(o.role.rsplit("_", 1)[1])].scale_reorder == "F8_128x4"
         )
         mn_view_slots = (frozenset(o.index for o in r.outputs) | frozenset(x.index for x in r.aux)) - packed_scale_slots
-        if needs_workspace:
+        if split_k_slices > 1:
             cta_k_elems = _cta_k_elems(self.chain, self.config)
             reduce_elems = _splitk_reduce_elems(self.chain)
         # Named so a test can assert which rule refused a call, and that a legal
@@ -3232,12 +3392,9 @@ class CompiledFusedGemm:
                     else:
                         apply_fill(ptr, plan, word, stream)
             extra = ()
-            if needs_workspace:
-                if workspace is None:
-                    raise ValueError(
-                        "cudnn.frost gemm: this plan needs a workspace; allocate " "graph.get_workspace_size() bytes and pass the buffer to execute()"
-                    )
-                # Every slice must own at least one whole CTA-K tile.
+            if split_k_slices > 1:
+                # Every slice must own at least one whole CTA-K tile (a slice with no K tile would publish an accumulator no
+                # MMA ever wrote -- the two-kernel and the K-cluster form alike).
                 if (k + cta_k_elems - 1) // cta_k_elems < split_k_slices:
                     raise ValueError(
                         f"cudnn.frost gemm: split_k_slices={split_k_slices} exceeds the "
@@ -3246,6 +3403,11 @@ class CompiledFusedGemm:
                     )
                 if batch * split_k_slices > 65535:
                     raise ValueError(f"cudnn.frost gemm: batch={batch} * split_k_slices={split_k_slices} " f"exceeds the CUDA grid.z limit of 65535")
+            if needs_workspace:
+                if workspace is None:
+                    raise ValueError(
+                        "cudnn.frost gemm: this plan needs a workspace; allocate " "graph.get_workspace_size() bytes and pass the buffer to execute()"
+                    )
                 # The reducer's row chunk was sized for the plan's N.
                 if n % reduce_elems:
                     raise ValueError(
@@ -3854,8 +4016,8 @@ def _use_tma_store_epi(
     takes it -- the renderer deletes one of `@@STG_ONLY@@` / `@@TMA_STORE_ONLY@@`,
     so this is a property of the TEMPLATE, while `_store_modes` is the per-output
     answer the emitters consume."""
-    # use tma for splitK's fp32 partials when N % 4 == 0
-    if cfg.split_k_slices > 1:
+    # use tma for splitK's fp32 partials when N % 4 == 0 (the two-kernel form; the K cluster stores through the STG arm)
+    if _two_kernel_splitk(cfg):
         return not _FORCE_STG_EPI and cfg.pipeline in _TMA_STORE_EPI_PIPELINES and chain.matmul.N % 4 == 0
     return "tma" in _store_modes(chain, cfg)
 
@@ -4048,8 +4210,8 @@ def _cta_k_elems(chain: FusionChain, config: TileConfig) -> int:
 
 
 def _splitk_workspace_bytes(chain: FusionChain, config: TileConfig) -> int:
-    """fp32 partials: split_k_slices * B * M * N * 4B."""
-    if config.split_k_slices == 1:
+    """fp32 partials: split_k_slices * B * M * N * 4B (the two-kernel form; the K cluster exchanges its planes on-chip: 0)."""
+    if not _two_kernel_splitk(config):
         return 0
     return align_up(config.split_k_slices * chain.matmul.batch * chain.matmul.M * chain.matmul.N * 4)
 
@@ -4351,6 +4513,7 @@ def probe_chain(chain: FusionChain, config: TileConfig) -> None:
         raise NotImplementedError(_dtype_reason)
     _check_executable(chain)
     _check_splitk_supported(chain, config)
+    _check_k_cluster_supported(chain, config)
     if chain.is_multi_gemm and not (chain.has_moe or chain.has_block_scale):
         from ..kernel_registry import select_template
 
@@ -4396,6 +4559,64 @@ def _splitk_reject_reason(chain: FusionChain, config: TileConfig) -> "str | None
     return None
 
 
+def _analyze_for_config(graph: cudnn.pygraph, config: TileConfig):
+    """The chain and binding of ``graph`` as ``config`` lowers them (swap-AB applied), past the geometry and split gates every
+    JIT path applies before dispatching on the graph type."""
+    chain, binding = analyze_with_binding(graph)
+    if config.swap_ab:
+        from ..fusion_ir import swap_ab
+
+        chain = swap_ab(chain)
+        binding = swap_ab_binding(binding)
+    _dtype_reason = dtype_arch_reject(chain, _current_arch())
+    if _dtype_reason is not None:
+        raise NotImplementedError(_dtype_reason)
+    _check_cta_group_geometry(config)
+    _check_mma_n_dim(chain, config)
+    _check_splitk_supported(chain, config)
+    _check_k_cluster_supported(chain, config)
+    return chain, binding
+
+
+def _plain_source(chain: FusionChain, config: TileConfig) -> "tuple[str, tuple, bool]":
+    """The plain-matmul kernel SOURCE of (chain, config) -- the gates, the epilogue snippets and the template render, without
+    the import / cute.compile -- plus its store modes and whether the TMA-store arm is rendered."""
+    # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
+    # special-case combos]) gate, then the template family's active-GPU gate.
+    _precheck_plain(chain, config)
+    store_modes = _store_modes(chain, config)
+    use_tma = _use_tma_store_epi(chain, config)
+    # The TWO-KERNEL split renders kernel 1's partials store here and the chain's epilogue in the reducer; the K-cluster form
+    # renders the chain's epilogue in this kernel (on the owner rows), so its snippets are the dense ones.
+    splitk = _two_kernel_splitk(config)
+    snippets = generate(
+        chain,
+        vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
+        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
+        # For splitK, only the partials buffer (slot 0) uses the TMA
+        tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
+        packed_lanes=_epi_packed_lanes(config),
+        split_k_slices=config.split_k_slices if splitk else 1,
+    )
+    return _render_template(chain, snippets, config), store_modes, use_tma
+
+
+def render_source_for_graph(graph: cudnn.pygraph, config: TileConfig) -> str:
+    """The rendered plain-matmul kernel source ``jit_from_cudnn_graph`` would import for (graph, config), with every gate it
+    applies and no compile -- the rendering pins' entry (diff two trees' renderings, read a constant off the source).  The
+    block-scale and MoE graph types render through their own entries and are declined here."""
+    chain, _binding = _analyze_for_config(graph, config)
+    if chain.has_moe or chain.has_block_scale:
+        raise NotImplementedError("render_source_for_graph renders the plain matmul template only (block-scale / MoE graphs take their own JIT entries)")
+    if chain.is_multi_gemm:
+        from ..kernel_registry import select_template
+
+        tmpl = select_template(chain, config)
+        if not tmpl.supports_multi_gemm:
+            raise NotImplementedError(f"multi-GEMM ({chain.num_gemms} parallel GEMMs) is only supported by the 1-CTA-MMA CLC template; got {config.name!r}")
+    return _plain_source(chain, config)[0]
+
+
 def jit_from_cudnn_graph(
     graph: cudnn.pygraph,
     config: TileConfig = DEFAULT_CONFIG,
@@ -4417,18 +4638,7 @@ def jit_from_cudnn_graph(
     fills the SMs a wide fixed cluster leaves idle (:func:`_mixed_cga_fallback`).
     Everywhere else the launch is the plain fixed cluster it always was.
     """
-    chain, binding = analyze_with_binding(graph)
-    if config.swap_ab:
-        from ..fusion_ir import swap_ab
-
-        chain = swap_ab(chain)
-        binding = swap_ab_binding(binding)
-    _dtype_reason = dtype_arch_reject(chain, _current_arch())
-    if _dtype_reason is not None:
-        raise NotImplementedError(_dtype_reason)
-    _check_cta_group_geometry(config)
-    _check_mma_n_dim(chain, config)
-    _check_splitk_supported(chain, config)
+    chain, binding = _analyze_for_config(graph, config)
     # MoE grouped block-scale = both matches at once (dequant + moe_grouped);
     # check BEFORE the single-feature gates.
     if chain.has_moe and chain.has_block_scale:
@@ -4453,22 +4663,7 @@ def jit_from_cudnn_graph(
                 f"by the 1-CTA-MMA CLC template this pass; got {config.name!r}, "
                 f"→ {tmpl.file}. Use cta_group=1."
             )
-    # Plain-matmul (pipeline × input/acc dtype combo [× GPU for the rare
-    # special-case combos]) gate, then the template family's active-GPU gate.
-    _precheck_plain(chain, config)
-    store_modes = _store_modes(chain, config)
-    use_tma = _use_tma_store_epi(chain, config)
-    splitk = config.split_k_slices > 1
-    snippets = generate(
-        chain,
-        vec_bytes_epi=_epi_chunk_bytes(chain, config, use_tma),
-        output_elem_bytes=DTYPE_BYTES[chain.output_dtype],
-        # For splitK, only the partials buffer (slot 0) uses the TMA
-        tma_slots=frozenset({0}) if (splitk and use_tma) else frozenset(i for i, m in enumerate(store_modes) if m == "tma"),
-        packed_lanes=_epi_packed_lanes(config),
-        split_k_slices=config.split_k_slices,
-    )
-    src = _render_template(chain, snippets, config)
+    src, store_modes, use_tma = _plain_source(chain, config)
     mod = _import_kernel(src)
     digest = hashlib.sha256(src.encode("utf-8")).hexdigest()[:16]
     return CompiledFusedGemm(
