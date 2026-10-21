@@ -460,6 +460,14 @@ class TemplateParams:
     # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
     # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
     q_in_tmem: int = 0
+    # APPEND-ONLY (2026-10-21): the index-list sparse kernel's UNION rendering -- 0 = the per-row body (every record so far), 2..4 = the
+    # work item is a whole SEQUENCE's S_q rows x the KV head over the sequence's UNION list (``block_ids`` = int32 words
+    # ``(blk << 4) | mask``, bit j = row j lists the block; ``block_lens`` = the union count, REQUIRED): N = S_q x qh_per_kh <= 48 query
+    # columns, a five-stage half-tile K/V ring, one Q slot, the 8 KiB ids slot, two softmax column groups x three passes; the per-row
+    # FUNCTION exactly (each row sees its own list and its own open block), within fp32 rounding of the per-row rendering, never
+    # bitwise it.  Needs ``bottom_right``; refuses THD, ``qsa_list_per_sequence`` and the pure list.  Every dense template declines a
+    # non-zero value together with the other qsa_* fields.
+    qsa_union_rows: int = 0
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -467,6 +475,7 @@ class TemplateParams:
 # Flavor tags as make_cfg_* / _validate_params spell them ("d192" is the
 # d192x128 kernel, whose K and V pools differ in row width). engines'
 # ``paged_d_shapes`` and the adapter's check_support name the same set.
+
 _PAGED_KV_FLAVORS = frozenset({"d64", "d128", "d192", "d256", "d512"})
 
 # The fused epilogue gate (TemplateParams.epilogue_gate) is a RUBIN feature.  ONE body of this line reads

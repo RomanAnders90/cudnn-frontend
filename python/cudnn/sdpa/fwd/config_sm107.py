@@ -1594,12 +1594,12 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
     # warp's gate load already runs on the THD coordinates; the quantized
     # bodies (per-tensor FP8 on the same flavor string, MXFP8) build the dense
     # gate map and their prepared THD launch carries no gate.
-    if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups:
+    if k.qsa_block_topk or k.qsa_block_size or k.qsa_softmax_groups or getattr(k, "qsa_union_rows", 0):
         # An index-list record (qsa_block_topk != 0, or its softmax-split knob) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
         # template would read K/V densely and silently ignore the block list.  The selection is the FUNCTION -- a decline,
         # never a knob fallback (the sm100 twin's _validate_params / make_cfg_d256_decode decline the same way).
         raise ValueError(
-            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} "
+            f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} / qsa_union_rows={getattr(k, 'qsa_union_rows', 0)} "
             f"select the index-list sparse kernel; the dense templates do not consume them"
         )
     if k.epilogue_gate:
@@ -2869,6 +2869,32 @@ _SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 
 # changed at some sites and not others is a stale S^T slot read from the first reuse, a silent wrong answer).
 _SPARSE_STAGES_S = 2
 _SPARSE_RED_SLOTS = _SPARSE_STAGES_S + 1  # the column-max exchange scratch: one slot per S ring parity + the epilogue's lane sum
+# The UNION rendering (TemplateParams.qsa_union_rows = S_q in 2..4; the kernel header's "UNION ARM" paragraph): ONE work item per
+# (sequence, KV head, split chunk) over the sequence's UNION list -- N_Q = 48 query columns (S_q x G <= 48: the 24/2 geometry at S_q <= 4,
+# 32/2 at S_q <= 3), the list width 2048 words ((blk << 4) | the per-row membership nibble), a FIVE-stage ring of HALF tiles (128 keys x 128
+# d = 32 KiB: the SMEM budget under the standard carveout), one Q slot (24 KiB), one ids slot (8 KiB), the P^T operand as THREE 32-B atoms
+# of 16 columns along N, 192 TMEM columns (allocated as 256), the softmax in PASSES of 8 columns per group (2 groups x 3 passes = the default
+# 20-warp body; 3 groups x 2 passes = the 24-warp knob).  The function is the per-row one (each row sees its own list and its own open
+# block), within fp32 rounding of the per-row rendering -- never bitwise it (the online softmax groups the rows' keys differently).
+_SPARSE_UNION_N_Q = 48
+_SPARSE_UNION_LIST_WIDTH = 2048
+_SPARSE_UNION_STAGES_KV = 5
+_SPARSE_UNION_KV_HALVES = 2
+_SPARSE_UNION_ROWS_MIN, _SPARSE_UNION_ROWS_MAX = 2, 4
+_SPARSE_UNION_SOFTMAX_GROUPS = (2, 3)
+_SPARSE_UNION_PASS_COLS = 8  # one tcgen05_ld (a power of two) and ONE 16-B P^T chunk per pass per lane
+_SPARSE_UNION_TMEM_COLS = (
+    512  # a power of two >= (STAGES_S + 2) x 48 (the S^T slots and O^T) + 2 x 48 (the per-lane running max / sum of every column, TMEM-resident) = 288
+)
+_SPARSE_UNION_TAIL_IDS_MAX = 2  # the per-row tail lanes a union item appends past its count (S_q <= 4 spans at most two open blocks)
+# The union rendering's gather population when the factory is asked for the arm's default (gather_warps=0): 4 = 16 warps at 128 registers
+# flat (the kernel's named fallback population: 8 blocks x 2 boxes = 16 gather4 per warp per half-tile stage; -25 % gather issue rate at
+# B = 1, invisible where DRAM binds -- the only cells the union route takes).  DECIDED by the host sm_107a trace-compile of the 24/2 x S_q 4
+# rendering (2026-10-21): 20 warps / 96 flat (8 gather warps) spill 9 STL / 9 LDL (the running max / sum already TMEM-resident; 94 / 113
+# with them in registers), 24 warps / 80 (three groups) 8 / 8, 16 warps / 128 REG 107 with 0 / 0 -- the pin is STL 0 / LDL 0.  8 renders
+# the 20-warp body for an A/B.
+_SPARSE_UNION_GATHER_WARPS = 4
+_SPARSE_GATHER_WARPS_DEFAULT = 8
 _GATHER4_ROWS = 4  # rows per gather4 issue
 _GATHER4_BOX_BYTES = 128  # one SW128 span per row per issue
 _REG_FILE_PER_CTA = 65536
@@ -2899,7 +2925,10 @@ _REG_FILE_PER_CTA = 65536
 # empty chunk is a dead item (one clamped tile, O = 0 / LSE = -inf = the combine's identity).  SPLIT_KV <= MAX_TILES_PER_ITEM (a
 # larger split has an empty chunk on EVERY item); never with the kernel's own EPILOGUE_GATE (the gate rides the combine) and never
 # under THD (the persistent claim-counter form has no split axis).
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right"})
+# "union_list": the UNION rendering (TemplateParams.qsa_union_rows): one item per (sequence, KV head, chunk) over the sequence's 2048-word
+# union list; composes with paged_kv / bottom_right (REQUIRED) / split_kv / epilogue_gate (unsplit), refuses thd_varlen, list_per_sequence
+# and pure_list (the constants above; the validator below).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right", "union_list"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:
@@ -3041,6 +3070,24 @@ class CfgD256Sparse:
     SOFTMAX_WARPS_PER_GROUP: int = _SPARSE_SOFTMAX_WARPS_PER_GROUP
     COLS_PER_GROUP: int = _SPARSE_N_Q
 
+    # --- the UNION rendering (APPENDED; TemplateParams.qsa_union_rows): 0 = the per-row body above, 2..4 = one work item per (sequence,
+    # KV head, chunk) over the sequence's union list.  KV_HALVES = the K/V stages per operand tile (2: a stage is a HALF tile of 128 keys x
+    # 128 d = two of the four column boxes; 1: the full tile), GATHER_BOXES_PER_STAGE = the column boxes a gather warp fills per stage,
+    # SOFTMAX_PASSES x PASS_COLS = COLS_PER_GROUP (the softmax body runs PASS_COLS columns at a time: one tcgen05_ld, one 16-B P^T chunk),
+    # P_ATOMS = the 32-B swizzle atoms of 16 columns the P^T operand spans along N (LBO = TILE_N x P_SWZ_BYTES between them), Q_BOX_HEADS = the
+    # head extent of the Q^T TMA box (Q_BOX_TOKENS x Q_BOX_HEADS = Q_BOX_ROWS rows).  Every field is inert at UNION_ROWS = 0.
+    UNION_ROWS: int = 0
+    KV_HALVES: int = 1
+    GATHER_BOXES_PER_STAGE: int = 4
+    SOFTMAX_PASSES: int = 1
+    PASS_COLS: int = _SPARSE_N_Q
+    P_ATOMS: int = 1
+    Q_BOX_HEADS: int = 12
+    # The TMEM column where the union rendering keeps every column's RUNNING MAX and SUM per key lane ((STAGES_S + 2) x N_Q = 192: right
+    # after O^T; group g's COLS maxima at ML_OFF + 2 g COLS, its sums COLS further) so the 48-column softmax carries no per-column state in
+    # registers across its passes (the 8-column body's register footprint); 0 = inert (the per-row body keeps the 16 values in registers).
+    ML_OFF: int = 0
+
 
 def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     """The sparse kernel's SMEM byte table as the allocator lays it out: declaration order = address order, the descriptor-read
@@ -3055,7 +3102,7 @@ def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     starts["sP"] = off
     off = _align_slab(off + cfg.STAGES_S * cfg.TILE_N * cfg.N_Q * cfg.BPE)
     starts["sKV"] = off
-    kv_stage = cfg.TILE_N * cfg.TILE_K * cfg.BPE
+    kv_stage = cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.KV_HALVES  # a HALF tile per stage on the union rendering
     starts["sKV_last"] = off + (cfg.STAGES_KV - 1) * kv_stage
     off = _align_slab(off + cfg.STAGES_KV * kv_stage)
     starts["sIds"] = off
@@ -3092,14 +3139,17 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"{flavor}: a block is the four rows of one gather4 and a tile holds 32 of them",
             ),
             (cfg.TILE_K == 256 and cfg.TILE_O == 256, f"{flavor}: d_qk = d_v = 256 only (the gather box count and the 4-subtile Q box are derived for 256)"),
-            (cfg.N_Q == _SPARSE_N_Q, f"{flavor}: N_Q must be 16 (one softmax column group); got {cfg.N_Q}"),
+            (
+                cfg.N_Q == (_SPARSE_UNION_N_Q if cfg.UNION_ROWS else _SPARSE_N_Q),
+                f"{flavor}: N_Q must be {_SPARSE_UNION_N_Q if cfg.UNION_ROWS else _SPARSE_N_Q} on this rendering (16 columns per item on the per-row body, 48 on the union body); got {cfg.N_Q}",
+            ),
             # warp population: role-homogeneous warpgroups
             (
-                cfg.SOFTMAX_GROUPS in _SPARSE_SOFTMAX_GROUPS
+                cfg.SOFTMAX_GROUPS in (_SPARSE_UNION_SOFTMAX_GROUPS if cfg.UNION_ROWS else _SPARSE_SOFTMAX_GROUPS)
                 and cfg.SOFTMAX_WARPS_PER_GROUP == _SPARSE_SOFTMAX_WARPS_PER_GROUP
                 and cfg.SOFTMAX_WARPS == cfg.SOFTMAX_WARPS_PER_GROUP * cfg.SOFTMAX_GROUPS
                 and cfg.AUX_WARPS == _SPARSE_AUX_WARPS,
-                f"{flavor}: 4 softmax warps per column group x SOFTMAX_GROUPS in {{1, 2}} (got SOFTMAX_WARPS={cfg.SOFTMAX_WARPS}, "
+                f"{flavor}: 4 softmax warps per column group x SOFTMAX_GROUPS in {{1, 2}} ({{2, 3}} on the union rendering) (got SOFTMAX_WARPS={cfg.SOFTMAX_WARPS}, "
                 f"SOFTMAX_GROUPS={cfg.SOFTMAX_GROUPS}, SOFTMAX_WARPS_PER_GROUP={cfg.SOFTMAX_WARPS_PER_GROUP}) and the 4-warp MMA / TMA / scheduler / spare group",
             ),
             (
@@ -3159,29 +3209,32 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             (cfg.GATHER_ISSUE_BYTES == _GATHER4_ROWS * _GATHER4_BOX_BYTES, f"{flavor}: one gather4 moves 4 rows x 128 B = 512 B"),
             (
-                cfg.GATHERS_PER_WARP_PER_STAGE == cfg.BLOCKS_PER_WARP * cfg.GATHER_BOXES,
-                f"{flavor}: gathers per warp per stage = blocks per warp x boxes per row",
+                cfg.GATHERS_PER_WARP_PER_STAGE == cfg.BLOCKS_PER_WARP * cfg.GATHER_BOXES_PER_STAGE,
+                f"{flavor}: gathers per warp per stage = blocks per warp x boxes per row (the row's 4 boxes; the half tile's 2 per stage on the union rendering)",
             ),
             (
                 cfg.KV_TX_BYTES_PER_WARP == cfg.GATHERS_PER_WARP_PER_STAGE * cfg.GATHER_ISSUE_BYTES,
                 f"{flavor}: the per-warp expect_tx must equal its gather4 bytes (got {cfg.KV_TX_BYTES_PER_WARP}); a consumer waiting on bytes that never come is a hang",
             ),
             (
-                cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES == cfg.TILE_N * cfg.TILE_K * cfg.BPE,
-                f"{flavor}: the gather warps' expect_tx must sum to the 64 KiB stage ({cfg.KV_TX_BYTES_PER_WARP} x {cfg.GATHER_WARPS} vs {cfg.KV_STAGE_BYTES})",
+                cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES == cfg.TILE_N * cfg.TILE_K * cfg.BPE // cfg.KV_HALVES,
+                f"{flavor}: the gather warps' expect_tx must sum to the 64 KiB stage (32 KiB per half-tile stage on the union rendering): {cfg.KV_TX_BYTES_PER_WARP} x {cfg.GATHER_WARPS} vs {cfg.KV_STAGE_BYTES}",
             ),
             # the Q^T / gate box: one token per item
             (cfg.PACK_GQA == 1, f"{flavor}: the work item IS the token's packed query-head group (PACK_GQA must be 1)"),
             (
-                cfg.Q_BOX_TOKENS == 1,
-                f"{flavor}: one query token per work item (Q_BOX_TOKENS must be 1; got {cfg.Q_BOX_TOKENS}) -- a multi-token item is a different kernel form",
+                cfg.Q_BOX_TOKENS == 1 or cfg.UNION_ROWS == cfg.Q_BOX_TOKENS,
+                f"{flavor}: one query token per work item on the per-row body (Q_BOX_TOKENS must be 1; got {cfg.Q_BOX_TOKENS}); the union rendering's item holds its S_q tokens",
             ),
             (
                 1 <= cfg.QH_PER_KH <= cfg.N_Q,
                 f"{flavor}: the token's query heads must fit the N_Q = {cfg.N_Q} tile (got qh_per_kh={cfg.QH_PER_KH}); above it the adapter declines",
             ),
-            (cfg.Q_BOX_ROWS == cfg.Q_BOX_TOKENS * cfg.QH_PER_KH, f"{flavor}: Q_BOX_ROWS must be Q_BOX_TOKENS x QH_PER_KH (got {cfg.Q_BOX_ROWS})"),
-            (cfg.Q_SLOT_BYTES == cfg.N_Q * cfg.TILE_K * cfg.BPE, f"{flavor}: a Q^T slot is N_Q x TILE_K x BPE = 8 KiB"),
+            (
+                cfg.Q_BOX_ROWS == cfg.Q_BOX_TOKENS * cfg.QH_PER_KH and cfg.Q_BOX_ROWS <= cfg.N_Q,
+                f"{flavor}: Q_BOX_ROWS must be Q_BOX_TOKENS x QH_PER_KH and fit the N_Q tile (got {cfg.Q_BOX_ROWS} vs {cfg.N_Q})",
+            ),
+            (cfg.Q_SLOT_BYTES == cfg.N_Q * cfg.TILE_K * cfg.BPE, f"{flavor}: a Q^T slot is N_Q x TILE_K x BPE (8 KiB at 16 columns, 24 KiB at 48)"),
             (
                 cfg.Q_TX_BYTES == cfg.Q_BOX_ROWS * cfg.TILE_K * cfg.BPE,
                 f"{flavor}: Q_TX_BYTES must be the Q BOX's bytes (Q_BOX_ROWS x TILE_K x BPE = {cfg.Q_BOX_ROWS * cfg.TILE_K * cfg.BPE}, got {cfg.Q_TX_BYTES}); "
@@ -3195,25 +3248,34 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             # swizzles and the k-step
             (cfg.Q_SWZ_BYTES == cfg.K_SWZ_BYTES == cfg.V_SWZ_BYTES == 128, f"{flavor}: Q / K / V operands are SW128 (the gather box is one 128-B span)"),
             (
-                cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE and cfg.P_SWZ_BYTES in (32, 64),
-                f"{flavor}: P^T row bytes must be the 32 B or 64 B swizzle atom (N_Q x BPE); got {cfg.P_SWZ_BYTES}",
+                cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE // cfg.P_ATOMS and cfg.P_SWZ_BYTES in (32, 64),
+                f"{flavor}: P^T row bytes must be the 32 B or 64 B swizzle atom (N_Q x BPE, per atom on the union rendering); got {cfg.P_SWZ_BYTES}",
             ),
             (cfg.TILE_K_HW == 16, f"{flavor}: TILE_K_HW must be 16 (1-chunk f16 on SM10x; 2-chunk is silently wrong)"),
             # the staged list
             (
-                _SPARSE_TOPK_MIN <= cfg.BLOCK_TOPK <= _SPARSE_TOPK_MAX and cfg.BLOCK_TOPK % 4 == 0,
-                f"{flavor}: BLOCK_TOPK must be a multiple of 4 in [{_SPARSE_TOPK_MIN}, {_SPARSE_TOPK_MAX}] (got {cfg.BLOCK_TOPK}); the ids row stride is a bulk-copy length (16-B multiples)",
+                (
+                    (cfg.BLOCK_TOPK == _SPARSE_UNION_LIST_WIDTH)
+                    if cfg.UNION_ROWS
+                    else (_SPARSE_TOPK_MIN <= cfg.BLOCK_TOPK <= _SPARSE_TOPK_MAX and cfg.BLOCK_TOPK % 4 == 0)
+                ),
+                f"{flavor}: BLOCK_TOPK must be a multiple of 4 in [{_SPARSE_TOPK_MIN}, {_SPARSE_TOPK_MAX}] on the per-row body, exactly {_SPARSE_UNION_LIST_WIDTH} words on the "
+                f"union rendering (got {cfg.BLOCK_TOPK}); the ids row stride is a bulk-copy length (16-B multiples)",
             ),
             (cfg.IDS_TX_BYTES == cfg.BLOCK_TOPK * 4 and cfg.IDS_TX_BYTES % 16 == 0, f"{flavor}: IDS_TX_BYTES must be BLOCK_TOPK x 4 (got {cfg.IDS_TX_BYTES})"),
             (
                 cfg.IDS_SLOT_BYTES == cfg.IDS_TX_BYTES + _SPARSE_IDS_SLOT_PAD_BYTES and cfg.IDS_SLOT_BYTES % 16 == 0,
                 f"{flavor}: IDS_SLOT_BYTES must be IDS_TX_BYTES + the 64-B reserve",
             ),
-            (cfg.MAX_TILES_PER_ITEM == -(-(cfg.BLOCK_TOPK + 1) // cfg.BLOCKS_PER_TILE), f"{flavor}: MAX_TILES_PER_ITEM is ceil((BLOCK_TOPK + 1) / 32)"),
+            (
+                cfg.MAX_TILES_PER_ITEM == -(-(cfg.BLOCK_TOPK + (_SPARSE_UNION_TAIL_IDS_MAX if cfg.UNION_ROWS else 1)) // cfg.BLOCKS_PER_TILE),
+                f"{flavor}: MAX_TILES_PER_ITEM is ceil((BLOCK_TOPK + the appended tail ids) / 32): one tail id on the per-row body, {_SPARSE_UNION_TAIL_IDS_MAX} on the union",
+            ),
             (cfg.STAGES_KV >= 2, f"{flavor}: the K/V ring needs at least K(t) and V(t) resident (got {cfg.STAGES_KV})"),
             (
-                cfg.STAGES_Q == 2 and cfg.STAGES_IDS == 2 and cfg.STAGES_GATE == 1 and cfg.SCHEDULER_STAGES == 2,
-                f"{flavor}: Q / ids rings are 2-deep (the one-item-ahead prefetch), the gate single-slot, the scheduler 2-deep",
+                cfg.STAGES_Q == cfg.STAGES_IDS == (1 if cfg.UNION_ROWS else 2) and cfg.STAGES_GATE == 1 and cfg.SCHEDULER_STAGES == 2,
+                f"{flavor}: Q / ids rings are 2-deep (the one-item-ahead prefetch) on the per-row body and single-slot on the union rendering (its 24 KiB Q slot "
+                f"and 8 KiB ids slot fit once beside the five-stage ring), the gate single-slot, the scheduler 2-deep; got STAGES_Q={cfg.STAGES_Q}, STAGES_IDS={cfg.STAGES_IDS}",
             ),
             (
                 cfg.STAGES_S == len(cfg.S_ACC_OFF) == 2,
@@ -3243,14 +3305,28 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
                 f"{flavor}: SMEM {lay['total']} B needs the {lay['carveout'] // 1024} KiB carveout (standard 227 KiB = L1 intact; oversized = L1 to 8 kB), the config claims {cfg.SMEM_CARVEOUT_BYTES // 1024} KiB",
             ),
             (
+                not cfg.UNION_ROWS or lay["carveout"] == SMEM_STANDARD_CARVEOUT_BYTES,
+                f"{flavor}: the union rendering is sized for the standard 227 KiB carveout (sQ 24 KiB + sP 24 KiB + 5 x 32 KiB + ids 8 KiB + red 2.25 KiB + misc); its layout "
+                f"reads {lay['total']} B",
+            ),
+            (
                 cfg.DESC_VERSION == lay["desc_version"],
                 f"{flavor}: the last K/V stage starts at {st['sKV_last']} B, so the tcgen05 descriptor version must be {lay['desc_version']} (got {cfg.DESC_VERSION}); "
                 f"a version-0 descriptor at or past {TCGEN05_V0_ADDR_LIMIT} wraps to offset 0 and the MMA multiplies the bottom of SMEM",
             ),
             # TMEM
             (
-                cfg.TMEM_COLS == 64 and cfg.TMEM_COLS >= (cfg.STAGES_S + len(cfg.O_OFF)) * cfg.N_Q and (cfg.TMEM_COLS & (cfg.TMEM_COLS - 1)) == 0,
-                f"{flavor}: TMEM is (STAGES_S + 2 O^T d-blocks) x N_Q = 4 x N_Q fp32 columns rounded to a power of two = 64",
+                cfg.TMEM_COLS == (_SPARSE_UNION_TMEM_COLS if cfg.UNION_ROWS else 64)
+                and cfg.TMEM_COLS >= (cfg.STAGES_S + len(cfg.O_OFF)) * cfg.N_Q + (2 * cfg.N_Q if cfg.UNION_ROWS else 0)
+                and (cfg.TMEM_COLS & (cfg.TMEM_COLS - 1)) == 0,
+                f"{flavor}: TMEM is (STAGES_S + 2 O^T d-blocks) x N_Q = 4 x N_Q fp32 columns (+ 2 x N_Q for the union rendering's TMEM-resident running max / sum) "
+                f"rounded up to a power of two: 64 at 16 columns, 512 at 48 (288 used)",
+            ),
+            (
+                cfg.ML_OFF == ((cfg.STAGES_S + len(cfg.O_OFF)) * cfg.N_Q if cfg.UNION_ROWS else 0)
+                and cfg.ML_OFF + (2 * cfg.N_Q if cfg.UNION_ROWS else 0) <= cfg.TMEM_COLS,
+                f"{flavor}: the running max / sum columns start right after O^T on the union rendering (ML_OFF = 4 x N_Q = {4 * cfg.N_Q}; 0 on the per-row body) and fit the "
+                f"allocation; got ML_OFF={cfg.ML_OFF}",
             ),
             (
                 cfg.S_ACC_OFF == (0, cfg.N_Q) and cfg.O_OFF == (2 * cfg.N_Q, 3 * cfg.N_Q),
@@ -3331,6 +3407,45 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             ),
             (not cfg.SEQ_Q_LENS_PRESENT or cfg.SEQ_KV_LENS_PRESENT == 1, f"{flavor}: SEQ_Q_LENS_PRESENT requires SEQ_KV_LENS_PRESENT"),
             (cfg.SCHEDULER_POLICY == SCHED_NATURAL, f"{flavor}: the item scheduler is NATURAL in v1 (LPT needs per-item costs)"),
+            # the union arm's own couplings: the rows in 2..4 (1 = the per-row rendering), S_q x G inside the 48 columns, bottom-right only, never
+            # THD / the shared list / the pure list, a half-tile five-stage ring, one Q and one ids slot, the 2048-word list
+            (
+                cfg.UNION_ROWS == 0 or _SPARSE_UNION_ROWS_MIN <= cfg.UNION_ROWS <= _SPARSE_UNION_ROWS_MAX,
+                f"{flavor}: UNION_ROWS must be 0 (the per-row body) or in [{_SPARSE_UNION_ROWS_MIN}, {_SPARSE_UNION_ROWS_MAX}] (got {cfg.UNION_ROWS}); one row IS the per-row rendering",
+            ),
+            (
+                cfg.UNION_ROWS == 0 or (cfg.BOTTOM_RIGHT == 1 and not cfg.THD_VARLEN and not cfg.LIST_PER_SEQUENCE and cfg.INCLUDE_OPEN_BLOCK == 1),
+                f"{flavor}: the union rendering needs BOTTOM_RIGHT (the rows sit at the end of the sequence) and composes with neither THD, the shared list "
+                f"nor the pure list (got BOTTOM_RIGHT={cfg.BOTTOM_RIGHT}, THD_VARLEN={cfg.THD_VARLEN}, LIST_PER_SEQUENCE={cfg.LIST_PER_SEQUENCE}, INCLUDE_OPEN_BLOCK={cfg.INCLUDE_OPEN_BLOCK})",
+            ),
+            (
+                cfg.KV_HALVES == (_SPARSE_UNION_KV_HALVES if cfg.UNION_ROWS else 1) and cfg.GATHER_BOXES_PER_STAGE == cfg.GATHER_BOXES // cfg.KV_HALVES,
+                f"{flavor}: a K/V stage is a half tile (KV_HALVES 2, {4 // _SPARSE_UNION_KV_HALVES} column boxes) on the union rendering and the full tile "
+                f"(1, 4 boxes) on the per-row body; got KV_HALVES={cfg.KV_HALVES}, GATHER_BOXES_PER_STAGE={cfg.GATHER_BOXES_PER_STAGE}",
+            ),
+            (
+                cfg.UNION_ROWS == 0 or cfg.STAGES_KV == _SPARSE_UNION_STAGES_KV,
+                f"{flavor}: the union rendering's half-tile ring is {_SPARSE_UNION_STAGES_KV} deep (128 KiB in flight, the per-row body's); got {cfg.STAGES_KV}",
+            ),
+            (
+                cfg.Q_BOX_TOKENS == (cfg.UNION_ROWS if cfg.UNION_ROWS else 1) and cfg.Q_BOX_HEADS == cfg.QH_PER_KH,
+                f"{flavor}: the Q^T box is (tokens, heads) = (1, G) on the per-row body and (S_q, G) on the union rendering; got ({cfg.Q_BOX_TOKENS}, {cfg.Q_BOX_HEADS})",
+            ),
+            (
+                cfg.COLS_PER_GROUP % cfg.PASS_COLS == 0
+                and cfg.SOFTMAX_PASSES == cfg.COLS_PER_GROUP // cfg.PASS_COLS
+                and (cfg.PASS_COLS & (cfg.PASS_COLS - 1)) == 0
+                and cfg.PASS_COLS * cfg.BPE >= 16
+                and (cfg.UNION_ROWS == 0) == (cfg.SOFTMAX_PASSES == 1 and cfg.PASS_COLS == cfg.COLS_PER_GROUP),
+                f"{flavor}: the softmax runs COLS_PER_GROUP in SOFTMAX_PASSES passes of PASS_COLS columns (a power of two, one tcgen05_ld, at least one "
+                f"16-B P^T chunk; one pass of every column on the per-row body); got {cfg.COLS_PER_GROUP} / {cfg.SOFTMAX_PASSES} / {cfg.PASS_COLS}",
+            ),
+            (
+                cfg.P_ATOMS * cfg.P_SWZ_BYTES == cfg.N_Q * cfg.BPE
+                and (cfg.P_ATOMS == 1 or (cfg.P_SWZ_BYTES == 32 and cfg.PASS_COLS * cfg.BPE == cfg.P_SWZ_BYTES // 2)),
+                f"{flavor}: the P^T operand spans P_ATOMS swizzle atoms of P_SWZ_BYTES along N (P_ATOMS x P_SWZ_BYTES = N_Q x BPE); several atoms are 32-B "
+                f"ones written one 16-B pass chunk at a time (got P_ATOMS={cfg.P_ATOMS}, P_SWZ_BYTES={cfg.P_SWZ_BYTES}, PASS_COLS={cfg.PASS_COLS})",
+            ),
         ]
     )
 
@@ -3353,13 +3468,16 @@ def _sparse_arms_requested(params: TemplateParams) -> Tuple[str, ...]:
         arms.append("pure_list")
     if params.seq_q_lens_present:
         arms.append("seq_q_lens")
+    if getattr(params, "qsa_union_rows", 0):
+        arms.append("union_list")
     return tuple(arms)
 
 
-def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softmax_groups: int = 0) -> Tuple[CfgD256Sparse, TmaIters]:
+def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 0, softmax_groups: int = 0) -> Tuple[CfgD256Sparse, TmaIters]:
     """Config for sm107/sparse_d256_f16.py from the adapter's TemplateParams (``qsa_block_topk`` = the list width, ``qh_per_kh`` =
-    the token's query heads on the N axis).  ``gather_warps`` selects the gather population: 8 (the default) or 4 (the named
-    fallback; -25 % gather issue rate).  The warp total is 4 x groups softmax + gather + 4 auxiliary warps, the entry register count
+    the token's query heads on the N axis).  ``gather_warps`` selects the gather population: 8 (the per-row body's default) or 4 (the named
+    fallback; -25 % gather issue rate); 0 (appended default) = the arm's own default -- ``_SPARSE_GATHER_WARPS_DEFAULT`` on the per-row body,
+    ``_SPARSE_UNION_GATHER_WARPS`` on the union rendering.  The warp total is 4 x groups softmax + gather + 4 auxiliary warps, the entry register count
     the register file over it rounded down to the 8-register granule: 20 warps / 96 at the default (8 gather, two groups), 16 / 128
     at one group with 8 gather warps or two groups with 4, 12 / 168 at one group with 4.
     ``softmax_groups`` (appended) selects the softmax SPLIT: 0 = the record's ``qsa_softmax_groups`` (itself 0 = the flavor default,
@@ -3421,34 +3539,75 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         raise ValueError(
             f"{flavor}: the kernel body does not carry the {', '.join(missing)} arm(s) yet (wired: {sorted(SPARSE_D256_WIRED_ARMS) or 'none'}); the adapter declines them"
         )
+    # The UNION rendering (TemplateParams.qsa_union_rows = S_q in 2..4; the module constants above): its own typed declines first, so a
+    # mis-declared record names the condition rather than failing a validator predicate downstream.
+    union_rows = int(getattr(params, "qsa_union_rows", 0) or 0)
+    if not gather_warps:
+        gather_warps = _SPARSE_UNION_GATHER_WARPS if union_rows else _SPARSE_GATHER_WARPS_DEFAULT
     if gather_warps not in (4, 8):
-        raise ValueError(f"{flavor}: gather_warps must be 8 (the default) or 4 (the named fallback); got {gather_warps}")
+        raise ValueError(f"{flavor}: gather_warps must be 8 (the default), 4 (the named fallback) or 0 (the arm's default); got {gather_warps}")
+    if union_rows:
+        if union_rows == 1:
+            raise ValueError(f"{flavor}: qsa_union_rows=1 is the per-row rendering -- declare qsa_union_rows=0 (one row needs no union)")
+        if not _SPARSE_UNION_ROWS_MIN <= union_rows <= _SPARSE_UNION_ROWS_MAX:
+            raise ValueError(f"{flavor}: qsa_union_rows must be in [{_SPARSE_UNION_ROWS_MIN}, {_SPARSE_UNION_ROWS_MAX}] (the mask nibble); got {union_rows}")
+        if union_rows * params.qh_per_kh > _SPARSE_UNION_N_Q:
+            raise ValueError(
+                f"{flavor}: the union item's S_q x G = {union_rows} x {params.qh_per_kh} = {union_rows * params.qh_per_kh} query columns exceed the "
+                f"{_SPARSE_UNION_N_Q}-column tile; the per-row rendering serves this geometry"
+            )
+        if not params.bottom_right:
+            raise ValueError(f"{flavor}: the union rendering needs bottom_right=True (the sequence's S_q rows sit at its end)")
+        if params.thd_varlen or params.qsa_list_per_sequence or not params.qsa_include_open_block:
+            raise ValueError(
+                f"{flavor}: the union rendering composes with neither THD, the shared per-sequence list nor the pure list (qsa_include_open_block=False)"
+            )
+        if params.qsa_block_topk != _SPARSE_UNION_LIST_WIDTH:
+            raise ValueError(
+                f"{flavor}: the union rendering's list is {_SPARSE_UNION_LIST_WIDTH} words wide (qsa_block_topk={_SPARSE_UNION_LIST_WIDTH}: 4 rows x 512 ids); got {params.qsa_block_topk}"
+            )
     # 0 = the record's value, itself 0 = the flavor default: TWO column groups since the A/B/A on a 212-SM Rubin GPU (the split +20..+29 %
-    # over the one-group body, bitwise); softmax_groups=1 renders the one-group body (the measured base, 16 warps).
+    # over the one-group body, bitwise); softmax_groups=1 renders the one-group body (the measured base, 16 warps).  On the union rendering
+    # 2 = two groups x three 8-column passes (the default, 20 warps / 96 registers flat) or 3 = three groups x two passes (24 warps / 80).
     groups = int(softmax_groups) or int(getattr(params, "qsa_softmax_groups", 0) or 0) or 2
-    if groups not in _SPARSE_SOFTMAX_GROUPS:
+    admitted_groups = _SPARSE_UNION_SOFTMAX_GROUPS if union_rows else _SPARSE_SOFTMAX_GROUPS
+    if groups not in admitted_groups:
+        if union_rows:
+            raise ValueError(f"{flavor}: softmax_groups on the union rendering must be 2 (three 8-column passes) or 3 (two passes); got {groups}")
         raise ValueError(
             f"{flavor}: softmax_groups must be 1 (one 4-warp column group of 16 columns) or 2 (two 4-warp groups of 8 columns, the softmax split); got {groups}"
         )
 
     b = bpe(params.dtype_qkv)
-    tile_n, tile_k, tile_o, n_q = 128, 256, 256, _SPARSE_N_Q
+    tile_n, tile_k, tile_o = 128, 256, 256
+    n_q = _SPARSE_UNION_N_Q if union_rows else _SPARSE_N_Q
+    kv_halves = _SPARSE_UNION_KV_HALVES if union_rows else 1
     softmax_warps, aux_warps = _SPARSE_SOFTMAX_WARPS_PER_GROUP * groups, _SPARSE_AUX_WARPS
     total_warps = softmax_warps + gather_warps + aux_warps
     blocks_per_tile = tile_n // _SPARSE_BLOCK_SIZE
     blocks_per_warp = blocks_per_tile // gather_warps
     gather_boxes = (tile_k * b) // _GATHER4_BOX_BYTES
-    gathers_per_warp = blocks_per_warp * gather_boxes
+    boxes_per_stage = gather_boxes // kv_halves
+    gathers_per_warp = blocks_per_warp * boxes_per_stage
     issue_bytes = _GATHER4_ROWS * _GATHER4_BOX_BYTES
-    q_box_tokens = 1
+    q_box_tokens = union_rows if union_rows else 1
     q_box_rows = q_box_tokens * params.qh_per_kh
     ids_tx = params.qsa_block_topk * 4
+    cols = n_q // groups
+    pass_cols = _SPARSE_UNION_PASS_COLS if union_rows else cols
+    p_atoms = (n_q * b) // 32 if union_rows else 1  # three 32-B atoms of 16 columns at N 48; one atom of N_Q x BPE bytes on the per-row body
     entry = sparse_entry_regs(total_warps)
     # The split for when .maxnreg lands: softmax 240 and gather 96 on both one-group populations; at two column groups (half the
     # per-warp softmax state) 136 / 72 on the 20-warp pool (96 x 20 = 1920) and 160 / 96 on the 16-warp fallback (128 x 16 = 2048);
-    # the aux group takes the remainder of the ENTRY pool so SUM(role regs x warps) == entry x warps by construction
-    # (80 at 16 warps, 168 at 12; 64 at 20; 96 on the two-group 16-warp fallback).
-    softmax_regs, gather_regs = (240, 96) if groups == 1 else ((136, 72) if gather_warps == 8 else (160, 96))
+    # at three groups (the union rendering's 24-warp knob) 104 / 72 on the 24-warp pool (80 x 24 = 1920) and 120 / 72 on its 20-warp
+    # 4-gather-warp twin; the aux group takes the remainder of the ENTRY pool so SUM(role regs x warps) == entry x warps by construction
+    # (80 at 16 warps, 168 at 12; 64 at 20; 96 on the two-group 16-warp fallback; 24 / 48 on the three-group populations).
+    if groups == 1:
+        softmax_regs, gather_regs = 240, 96
+    elif groups == 2:
+        softmax_regs, gather_regs = (136, 72) if gather_warps == 8 else (160, 96)
+    else:
+        softmax_regs, gather_regs = (104, 72) if gather_warps == 8 else (120, 72)
     aux_regs = (entry * total_warps - softmax_warps * softmax_regs - gather_warps * gather_regs) // aux_warps
     probe = CfgD256Sparse(
         TILE_N=tile_n,
@@ -3458,7 +3617,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         BLOCK_SIZE=_SPARSE_BLOCK_SIZE,
         BLOCKS_PER_TILE=blocks_per_tile,
         BLOCK_TOPK=params.qsa_block_topk,
-        MAX_TILES_PER_ITEM=-(-(params.qsa_block_topk + 1) // blocks_per_tile),
+        MAX_TILES_PER_ITEM=-(-(params.qsa_block_topk + (_SPARSE_UNION_TAIL_IDS_MAX if union_rows else 1)) // blocks_per_tile),
         DTYPE_QKV=params.dtype_qkv,
         DTYPE_O=dtype_o,
         BPE=b,
@@ -3467,12 +3626,12 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         Q_SWZ_BYTES=q_swz_bytes(tile_k, b),
         K_SWZ_BYTES=q_swz_bytes(tile_k, b),
         V_SWZ_BYTES=v_swz_bytes(tile_o, 1, b),
-        P_SWZ_BYTES=n_q * b,
+        P_SWZ_BYTES=(n_q * b) // p_atoms,
         TILE_K_HW=tile_k_hw(params.dtype_qkv),
-        STAGES_KV=3,
+        STAGES_KV=_SPARSE_UNION_STAGES_KV if union_rows else 3,
         STAGES_S=_SPARSE_STAGES_S,
-        STAGES_Q=2,
-        STAGES_IDS=2,
+        STAGES_Q=1 if union_rows else 2,
+        STAGES_IDS=1 if union_rows else 2,
         STAGES_GATE=1,
         SCHEDULER_STAGES=2,
         SOFTMAX_WARPS=softmax_warps,
@@ -3499,7 +3658,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         GATHER_ISSUE_BYTES=issue_bytes,
         GATHERS_PER_WARP_PER_STAGE=gathers_per_warp,
         KV_TX_BYTES_PER_WARP=gathers_per_warp * issue_bytes,
-        KV_STAGE_BYTES=tile_n * tile_k * b,
+        KV_STAGE_BYTES=tile_n * tile_k * b // kv_halves,
         Q_BOX_TOKENS=q_box_tokens,
         Q_BOX_ROWS=q_box_rows,
         Q_SLOT_BYTES=n_q * tile_k * b,
@@ -3507,7 +3666,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         GATE_TX_BYTES=q_box_rows * tile_o * 2,
         IDS_TX_BYTES=ids_tx,
         IDS_SLOT_BYTES=ids_tx + _SPARSE_IDS_SLOT_PAD_BYTES,
-        TMEM_COLS=64,
+        TMEM_COLS=_SPARSE_UNION_TMEM_COLS if union_rows else 64,
         S_ACC_OFF=tuple(i * n_q for i in range(_SPARSE_STAGES_S)),  # one N_Q-column S^T slot per ring parity
         O_OFF=tuple((_SPARSE_STAGES_S + i) * n_q for i in range(2)),  # the two O^T d-blocks after them
         ENTRY_REGS=entry,
@@ -3528,7 +3687,15 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         LIST_PER_SEQUENCE=int(params.qsa_list_per_sequence),
         SOFTMAX_GROUPS=groups,
         SOFTMAX_WARPS_PER_GROUP=_SPARSE_SOFTMAX_WARPS_PER_GROUP,
-        COLS_PER_GROUP=n_q // groups,
+        COLS_PER_GROUP=cols,
+        UNION_ROWS=union_rows,
+        KV_HALVES=kv_halves,
+        GATHER_BOXES_PER_STAGE=boxes_per_stage,
+        SOFTMAX_PASSES=cols // pass_cols,
+        PASS_COLS=pass_cols,
+        P_ATOMS=p_atoms,
+        Q_BOX_HEADS=int(params.qh_per_kh),
+        ML_OFF=(_SPARSE_STAGES_S + 2) * n_q if union_rows else 0,
         PACK_GQA=1,
         QH_PER_KH=int(params.qh_per_kh),
         SEQ_KV_LENS_PRESENT=1 if (params.thd_varlen or params.paged_kv) else int(params.seq_kv_lens_present),

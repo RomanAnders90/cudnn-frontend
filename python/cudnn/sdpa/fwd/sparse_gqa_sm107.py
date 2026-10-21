@@ -67,6 +67,19 @@ record declines ``True`` by name on this tree (:meth:`SparseGqaFwdDslSm107.check
 ``griddepcontrol`` site yet), while the flag already reaches the combine's entry (``compile_ptr(use_pdl=)``) so the commit that lands
 the sites lifts the decline alone.
 
+THE UNION FORM (``union_rows=S_q`` in 2..4, appended 2026-10-21; the kernel's UNION ARM): ONE work item per (sequence, KV head, split
+chunk) over the sequence's UNION list -- ``block_ids`` int32 ``[B, 2048]`` WORDS ``(blk << 4) | mask`` (bit ``j`` of the nibble = row ``j``
+lists the block; ``-1`` past the count; strictly descending, distinct -- the ``gated_attention_block.qsa_list_union`` kernel's output) and
+``block_lens`` int32 ``[B]`` = the union count, REQUIRED -- gathering a sequence's listed KV ONCE for all its rows (N = S_q x G <= 48 query
+columns per item) where the per-row form gathers it once per row.  The FUNCTION is the per-row one exactly (row ``j`` sees its own
+list plus its own open block: the per-row visibility bit per lane), computed within fp32 rounding of the per-row rendering -- the online
+softmax groups the rows' keys differently -- never bitwise it; two launches of the union form are bitwise.  Needs ``bottom_right=True``
+(the step's rows at the end of the sequence), ``S_q == union_rows``, ``G x union_rows <= 48`` (the 24/2 geometry at ``S_q <= 4``, 32/2 at
+``S_q <= 3``); composes with the paged read, the split (bounded by the rendering's 65 tiles; the combine unchanged) and the gate (unsplit);
+refuses THD, ``list_per_sequence``, ``include_open_block=False``, ``union_rows=1`` (the per-row form: declare ``union_rows=0``).  ``top_k``
+keeps the per-row list width (the split rule's EXPECTED item of ceil((top_k + 1) / 32) tiles); the staged list is the 2048-word union.
+A duplicate INSIDE a row (a list contract violation) is attended twice by the per-row form and once here.
+
 The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
 conversion, no allocation, the caller's stream.  The kernel needs NO GMEM scratch unless split or THD
@@ -162,6 +175,12 @@ class SparseCapabilities:
     )
     index_shared_list_max_tokens: int = 4  # S_q cap under list_per_sequence: the shared list's tail covers at most two blocks for S_q <= 4 (the MTP cap)
     cutedsl_min_version: Tuple[int, int, int] = (4, 8, 0)
+    # APPENDED 2026-10-21: the UNION form (union_rows = S_q in 2..index_union_rows_max over the sequence's 2048-word union list; the per-row
+    # function within fp32 rounding, one gather per sequence) -- a graph's eligibility reads it (the block's union route), so the tracker row
+    # moves with it (Rule S2).  0 would retire the arm.
+    index_union_rows_max: int = 4
+    index_union_list_width: int = 2048  # the union list's words per sequence (4 rows x 512 ids), the staged-list width of the union rendering
+    index_union_cols_max: int = 48  # S_q x G of a union item must fit the rendering's 48 query columns
 
 
 SPARSE_CAPABILITIES = SparseCapabilities()
@@ -365,8 +384,14 @@ class SparseGqaFwdDslSm107:
         workspace=None,
         softmax_groups: int = 0,
         use_pdl: bool = False,
+        union_rows: int = 0,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
+        # THE UNION FORM (appended 2026-10-21; the module docstring): 0 = the per-row rendering; S_q in 2..4 = one work item per (sequence, KV
+        # head, chunk) over the sequence's 2048-word union list (block_ids [B, 2048] words, block_lens [B] = the union count, REQUIRED) -- the
+        # per-row function within fp32 rounding, never bitwise the per-row rendering.  Validated in check_support, compiled in as
+        # TemplateParams.qsa_union_rows (the module-cache key: the two renderings never share a compiled artifact).
+        self.union_rows = int(union_rows)
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
         # the launch attribute plus the griddepcontrol pair in every kernel it reaches.  The flag is threaded to the split combine's entry
         # (compile_ptr(use_pdl=), whose every form carries the pair); the sparse core itself carries no site on this tree, so check_support
@@ -512,7 +537,31 @@ class SparseGqaFwdDslSm107:
                 "sparse d256 forward (sm107): list_per_sequence=True needs bottom_right=True -- the shared list is anchored at the step-0 position "
                 "kv_len - S_q (the decode / MTP form); a top-left per-sequence list has no serving meaning"
             )
+        # THE UNION FORM's own rows, by name, before any shape is read: the row count, the diagonal, the arms it does not compose with
+        rec = SPARSE_CAPABILITIES
+        if self.union_rows:
+            if self.union_rows == 1:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): union_rows=1 is the per-row form -- declare union_rows=0 (one row per sequence needs no union list)"
+                )
+            if self.union_rows < 0 or self.union_rows > rec.index_union_rows_max:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): union_rows must be in [2, {rec.index_union_rows_max}] (the union word's row nibble); got {self.union_rows}"
+                )
+            if not self.bottom_right:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): the union form needs bottom_right=True -- the sequence's S_q rows sit at its end (the decode step); declare bottom_right=True"
+                )
+            for name, requested in (("thd", self.thd), ("list_per_sequence", self.list_per_sequence), ("include_open_block=False", self.unserved["pure_list"])):
+                if requested:
+                    raise NotImplementedError(
+                        f"sparse d256 forward (sm107): the union form (union_rows={self.union_rows}) does not compose with {name} -- the union item is a dense "
+                        "BSHD or paged sequence whose rows each see their own list and their own open block"
+                    )
         max_tiles = -(-(self.top_k + 1) // 32) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
+        if self.union_rows:
+            # the rendering's bound: a 2048-word union plus two tail ids is 65 tiles; the fill rule keeps sizing the EXPECTED item (top_k)
+            max_tiles = -(-(rec.index_union_list_width + 2) // 32) if _TOPK_MIN <= self.top_k <= _TOPK_MAX else 0
 
         # the index list's FORM (the kernel's staging is sized by it)
         if self.block_size != _BLOCK_SIZE:
@@ -523,7 +572,7 @@ class SparseGqaFwdDslSm107:
             raise NotImplementedError(f"sparse d256 forward (sm107): top_k must be a multiple of 4 in [{_TOPK_MIN}, {_TOPK_MAX}]; got {self.top_k}")
         if self.split_kv > max_tiles:
             raise NotImplementedError(
-                f"sparse d256 forward (sm107): split_kv={self.split_kv} exceeds the item's maximum tile count ceil((top_k + 1) / 32) = {max_tiles} at "
+                f"sparse d256 forward (sm107): split_kv={self.split_kv} exceeds the item's maximum tile count {'ceil((2048 + 2) / 32)' if self.union_rows else 'ceil((top_k + 1) / 32)'} = {max_tiles} at "
                 f"top_k={self.top_k} -- a larger split has an empty chunk (a dead work item) on every item"
             )
 
@@ -635,6 +684,21 @@ class SparseGqaFwdDslSm107:
         if H % KH != 0:
             raise ValueError(f"sparse d256 forward (sm107): H_q = {H} must be a multiple of H_kv = {KH}")
         G = H // KH
+        if self.union_rows:
+            if SQ != self.union_rows:
+                raise ValueError(
+                    f"sparse d256 forward (sm107): the union form's union_rows={self.union_rows} must equal the step's S_q (the item holds every row of the "
+                    f"sequence); Q has S_q = {SQ}"
+                )
+            if G * self.union_rows > rec.index_union_cols_max:
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): the union item's S_q x G = {self.union_rows} x {G} = {G * self.union_rows} query columns exceed the rendering's "
+                    f"{rec.index_union_cols_max}; the per-row form serves this geometry (declare union_rows=0)"
+                )
+            if self.block_lens is None:
+                raise ValueError(
+                    "sparse d256 forward (sm107): the union form needs block_lens (int32 [B]: the union count per sequence, the qsa_list_union kernel's union_lens)"
+                )
         if not (SPARSE_CAPABILITIES.index_gqa_group_min <= G <= SPARSE_CAPABILITIES.index_gqa_group_max):
             raise NotImplementedError(
                 f"sparse d256 forward (sm107): the query-head group H_q / H_kv = {G} must be in [1, {_GQA_GROUP_MAX}] (one 16-row tile per token)"
@@ -675,11 +739,17 @@ class SparseGqaFwdDslSm107:
                         f"sparse d256 forward (sm107): {name} batch stride must be S_kv x the token stride ({SKV} x {ss}) for the 2-D gather map; got {bs}"
                     )
 
-        # the index list's tensors: one row per query token, or ONE row per sequence under list_per_sequence
+        # the index list's tensors: one row per query token, or ONE row per sequence under list_per_sequence / the union form
         ids = self.block_ids
         if str(ids.dtype) != "torch.int32":
             raise ValueError(f"sparse d256 forward (sm107): block_ids must be int32; got {ids.dtype}")
-        if self.list_per_sequence:
+        if self.union_rows:
+            if _shape(ids) != (B, rec.index_union_list_width):
+                raise ValueError(
+                    f"sparse d256 forward (sm107): the union form needs block_ids [B, {rec.index_union_list_width}] = {(B, rec.index_union_list_width)} (the "
+                    f"sequence's union words (blk << 4) | mask, -1 past block_lens[b]); got {_shape(ids)}"
+                )
+        elif self.list_per_sequence:
             if _shape(ids) != (B, self.top_k):
                 raise ValueError(
                     f"sparse d256 forward (sm107): list_per_sequence needs block_ids [B, top_k] = {(B, self.top_k)} (one list per sequence); got {_shape(ids)}"
@@ -689,7 +759,7 @@ class SparseGqaFwdDslSm107:
         if not ids.is_contiguous():
             raise ValueError("sparse d256 forward (sm107): block_ids must be contiguous (its row stride is the bulk-copy length)")
         if self.block_lens is not None:
-            self._check_block_lens_form(self.block_lens, B, SQ, self.list_per_sequence)
+            self._check_block_lens_form(self.block_lens, B, SQ, self.list_per_sequence or bool(self.union_rows))
         if self.seq_kv_lens is not None and not self.thd:
             kl = self.seq_kv_lens
             if str(kl.dtype) != "torch.int32" or _shape(kl) != (B,) or not kl.is_contiguous():
@@ -801,7 +871,8 @@ class SparseGqaFwdDslSm107:
             cta_mma=1,
             pack_gqa=True,
             qh_per_kh=self._G,
-            qsa_block_topk=self.top_k,
+            # the union rendering stages the 2048-word union list; the per-row form the caller's top_k-wide list
+            qsa_block_topk=SPARSE_CAPABILITIES.index_union_list_width if self.union_rows else self.top_k,
             qsa_block_size=self.block_size,
             seq_kv_lens_present=self.seq_kv_lens is not None or self.thd,
             stats_log2=self.stats_log2,
@@ -814,6 +885,7 @@ class SparseGqaFwdDslSm107:
             bottom_right=self.bottom_right,
             qsa_list_per_sequence=self.list_per_sequence,
             qsa_softmax_groups=self.softmax_groups,
+            qsa_union_rows=self.union_rows,
         )
 
     def combine_form(self) -> int:
@@ -838,6 +910,10 @@ class SparseGqaFwdDslSm107:
         if has_block_lens is None:
             has_block_lens = self.block_lens is not None
         has_block_lens = bool(has_block_lens)
+        if self.union_rows and not has_block_lens:
+            raise ValueError(
+                "sparse d256 forward (sm107): the union form compiles the block_lens variant only (the union count is a device fact the kernel reads)"
+            )
         fn = self._fns.get(has_block_lens)
         if fn is not None:
             return fn
@@ -975,12 +1051,14 @@ class SparseGqaFwdDslSm107:
             if self._combine is None:
                 raise RuntimeError("sparse d256 forward (sm107): call compile() before execute() -- the split combine is not compiled (plan-time keys only)")
         if block_lens is not None:
-            self._check_block_lens_form(block_lens, self._B, self._SQ, self.list_per_sequence)
+            self._check_block_lens_form(block_lens, self._B, self._SQ, self.list_per_sequence or bool(self.union_rows))
             lens = block_lens
         elif self.block_lens is not None and not isinstance(self.block_lens, SparseOperandDesc):
             lens = self.block_lens
         else:
             lens = None  # declared as a descriptor (or not at all) and not handed over: the derived default count
+        if self.union_rows and lens is None:
+            raise ValueError("sparse d256 forward (sm107): the union form needs block_lens at execute (int32 [B]: the union count per sequence)")
         # Check declared and rebound operands alike, including every optional pointer, before any launch or pointer lowering.
         device = _require_cuda_device("q", q, self._device_index)
         for name, t in (

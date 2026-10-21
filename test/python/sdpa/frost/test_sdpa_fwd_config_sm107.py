@@ -177,9 +177,11 @@ def test_sparse_fallback_config_is_twelve_warps():
     assert cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == 65536
     assert (cfg.SOFTMAX_REGS, cfg.GATHER_REGS, cfg.AUX_REGS) == (240, 96, 168) and 4 * 240 + 4 * 96 + 4 * 168 == 2016 == 168 * 12
     assert cfg.SMEM_TOTAL_BYTES == 226688 and cfg.DESC_VERSION == 0
-    for bad in (2, 6, 16, 0):
+    for bad in (2, 6, 16):
         with pytest.raises(ValueError, match="gather_warps must be 8"):
             make_cfg_d256_sparse(_sparse(), gather_warps=bad)
+    # 0 (the appended default) = the arm's own default: 8 on the per-row body
+    assert make_cfg_d256_sparse(_sparse(), gather_warps=0)[0] == make_cfg_d256_sparse(_sparse())[0] == make_cfg_d256_sparse(_sparse(), gather_warps=8)[0]
 
 
 def test_sparse_entry_regs_is_the_launch_pool():
@@ -539,7 +541,49 @@ _TRIPWIRES = (
     "must fit the aliased slot",  # Q_TX / GATE_TX <= Q_SLOT: implied by Q_BOX_ROWS == QH_PER_KH <= N_Q, and the box-bytes rules report first
     "must start 1024-B aligned",  # d256_sparse_smem_layout aligns every slab start by construction (_align_slab)
     "sIds must start 16-B aligned",  # idem (_align16)
+    # the union rendering's couplings that an earlier predicate always pre-empts (the per-warp gather bytes, the stage bytes, the P^T row bytes,
+    # the SMEM total) -- each still a raising predicate naming its failure's look
+    "a K/V stage is a half tile",
+    "the P^T operand spans P_ATOMS swizzle atoms",
+    "sized for the standard 227 KiB carveout",
 )
+
+# The UNION record (TemplateParams.qsa_union_rows=4 at 24/2, the 2048-word list) and its RED rows: the predicates the per-row record can
+# never reach (they are guarded by UNION_ROWS) -- each row makes its predicate the FIRST failure on the union record.
+_UNION_BASE = dict(qsa_block_topk=2048, bottom_right=True, qsa_union_rows=4)
+
+
+def _union_cfg():
+    return make_cfg_d256_sparse(_sparse(**_UNION_BASE))[0]
+
+
+def _union_layout_total(**over):
+    return d256_sparse_smem_layout(dataclasses.replace(_union_cfg(), **over))["total"]
+
+
+_UNION_RED_ROWS = [
+    (dict(UNION_ROWS=1, Q_BOX_TOKENS=1, Q_BOX_ROWS=12, Q_TX_BYTES=6144, GATE_TX_BYTES=6144), "UNION_ROWS must be 0 .* or in"),
+    (dict(BOTTOM_RIGHT=0), "needs BOTTOM_RIGHT"),
+    (dict(STAGES_KV=3, SMEM_TOTAL_BYTES=_union_layout_total(STAGES_KV=3)), "half-tile ring is 5 deep"),
+    (dict(Q_BOX_HEADS=16), r"the Q\^T box is \(tokens, heads\)"),
+    (dict(SOFTMAX_PASSES=2), "SOFTMAX_PASSES passes of PASS_COLS"),
+    (dict(ML_OFF=0), "running max / sum columns start right after"),
+    (dict(MAX_TILES_PER_ITEM=17), "MAX_TILES_PER_ITEM is ceil"),
+    (dict(STAGES_Q=2), "single-slot on the union rendering"),
+    (
+        dict(BLOCK_TOPK=512, IDS_TX_BYTES=2048, IDS_SLOT_BYTES=2112, MAX_TILES_PER_ITEM=17, SMEM_TOTAL_BYTES=_union_layout_total(IDS_SLOT_BYTES=2112)),
+        "exactly 2048 words",
+    ),
+    (dict(TMEM_COLS=256), "512 at 48"),
+    (dict(N_Q=16, COLS_PER_GROUP=8, PASS_COLS=8, SOFTMAX_PASSES=1), "N_Q must be 48"),
+]
+
+
+@pytest.mark.parametrize("bad, pattern", _UNION_RED_ROWS)
+def test_union_validator_raises_on_each_union_claim(bad, pattern):
+    """RED side of the union rendering's predicates on the union record."""
+    with pytest.raises(ValueError, match=pattern):
+        _validate_cfg_d256_sparse(dataclasses.replace(_union_cfg(), **bad))
 
 
 def test_every_validator_predicate_is_reached_by_a_red_row_or_is_an_enumerated_tripwire(monkeypatch):
@@ -548,15 +592,18 @@ def test_every_validator_predicate_is_reached_by_a_red_row_or_is_an_enumerated_t
     every tripwire is indeed unreached (a tripwire a row reaches must leave the list).  A new predicate without a row, or a row an
     earlier predicate pre-empts, fails here -- the counts never have to be quoted by hand."""
     cfg, _ = make_cfg_d256_sparse(_sparse())
+    ucfg = _union_cfg()  # BEFORE the first predicate table: the patched _check would otherwise extend that table's list
     table = _predicate_table(monkeypatch, cfg)
     assert table and all(ok for ok, _ in table), "the factory's record must be green on every predicate"
     reached = {}
-    for bad, pattern in _RED_ROWS:
-        row = _predicate_table(monkeypatch, dataclasses.replace(cfg, **bad))
-        first = next((i for i, (ok, _) in enumerate(row) if not ok), None)
-        assert first is not None, f"{bad}: no predicate fails"
-        assert re.search(pattern, row[first][1]), f"{bad}: the first failing predicate says {row[first][1]!r}, the row expects {pattern!r}"
-        reached.setdefault(first, []).append(bad)
+    assert all(ok for ok, _ in _predicate_table(monkeypatch, ucfg)), "the union record must be green on every predicate"
+    for base, rows in ((cfg, _RED_ROWS), (ucfg, _UNION_RED_ROWS)):
+        for bad, pattern in rows:
+            row = _predicate_table(monkeypatch, dataclasses.replace(base, **bad))
+            first = next((i for i, (ok, _) in enumerate(row) if not ok), None)
+            assert first is not None, f"{bad}: no predicate fails"
+            assert re.search(pattern, row[first][1]), f"{bad}: the first failing predicate says {row[first][1]!r}, the row expects {pattern!r}"
+            reached.setdefault(first, []).append(bad)
     tripwires = {i for i, (_, msg) in enumerate(table) if any(t in msg for t in _TRIPWIRES)}
     assert len(tripwires) == len(_TRIPWIRES), "every enumerated tripwire names exactly one predicate"
     unreached = set(range(len(table))) - set(reached)
@@ -631,10 +678,12 @@ def test_index_list_fields_are_appended_with_inert_defaults():
         "softmax_wgs",
         "s_slots",
         "q_in_tmem",
+        "qsa_union_rows",  # appended 2026-10-21: the sparse kernel's union rendering (0 = inert)
     ], names[start:]
     assert TemplateParams() == TemplateParams(
-        qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0
+        qsa_block_topk=0, qsa_block_size=0, qsa_include_open_block=True, qsa_list_per_sequence=False, qsa_softmax_groups=0, qsa_union_rows=0
     )
+    assert TemplateParams().qsa_union_rows == 0
     d = TemplateParams()
     assert (d.qsa_block_topk, d.qsa_block_size, d.qsa_include_open_block, d.qsa_list_per_sequence, d.qsa_softmax_groups) == (0, 0, True, False, 0)
 
@@ -748,9 +797,10 @@ def test_item_bounds_is_the_only_n_tiles_source_in_the_kernel():
 
 
 def test_sparse_factory_signature_is_append_only():
-    """``make_cfg_d256_sparse(params, *, gather_warps=8)``: the positional record first, the warp-population switch keyword-only."""
+    """``make_cfg_d256_sparse(params, *, gather_warps=0)``: the positional record first, the warp-population switch keyword-only (its default 0
+    = the arm's own default since the union rendering landed: 8 gather warps on the per-row body, 4 on the union body)."""
     sig = inspect.signature(make_cfg_d256_sparse)
     params = list(sig.parameters.values())
     assert params[0].name == "params" and params[0].kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
-    assert params[1].name == "gather_warps" and params[1].kind is inspect.Parameter.KEYWORD_ONLY and params[1].default == 8
+    assert params[1].name == "gather_warps" and params[1].kind is inspect.Parameter.KEYWORD_ONLY and params[1].default == 0
     assert params[2].name == "softmax_groups" and params[2].kind is inspect.Parameter.KEYWORD_ONLY and params[2].default == 0, "appended after gather_warps"

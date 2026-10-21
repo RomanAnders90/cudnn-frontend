@@ -65,12 +65,16 @@ import hashlib
 import math
 import os
 import re
+import subprocess
 import sys
+import textwrap
+
+from typing import Tuple
 
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_rubin
+from frost_test_utils import arch_known_to_the_dsl, assert_no_new_spills, nvdisasm_candidates, requires_dsl, requires_rubin
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -124,6 +128,7 @@ def test_claims_record_agrees_with_the_config_wired_arms():
         "bottom_right": C.bottom_right,
         "list_per_sequence": C.index_list_per_sequence,
         "seq_q_lens": C.padded,
+        "union_list": C.index_union_rows_max > 0,
     }
     for arm, claimed in pairs.items():
         assert claimed == (arm in SPARSE_D256_WIRED_ARMS), f"{arm}: record {claimed}, wired {arm in SPARSE_D256_WIRED_ARMS}"
@@ -132,6 +137,8 @@ def test_claims_record_agrees_with_the_config_wired_arms():
     # the decode form: the shared list (bottom-right anchored, S_q <= 4) and the split are the record's decode claim
     assert C.decode == (C.index_list_per_sequence and C.bottom_right and C.split_kv) and C.index_shared_list_max_tokens == 4
     assert C.cutedsl_min_version == (4, 8, 0) and (C.sm_lo, C.sm_hi) == (107, 119)
+    # the union form: the rows the nibble carries, the 2048-word list, the 48-column item (the kernel header's UNION ARM)
+    assert (C.index_union_rows_max, C.index_union_list_width, C.index_union_cols_max) == (4, 2048, 48)
 
 
 class _T:
@@ -801,10 +808,11 @@ def test_sparse_kernel_source_pins():
     code = _code(src)
     assert "desc_version=DESC_VERSION" in code and "desc_version=0" not in code and "desc_version=1" not in code
     assert code.count("SmemTile(") == code.count("desc_version=DESC_VERSION") == 4, "every SmemTile takes the module descriptor version"
-    # The per-TILE ring waits (the gather warps' kv_empty x 3; the MMA warp's kv_full x 3, s_empty x 2, p_full x 1; the softmax
-    # warps' s_full and the in-loop bmm2_done) take the module constant; the per-ITEM waits (q_full, ids_full / ids_empty, the
-    # epilogue's bmm2_done) and the exit drains keep the default form.
-    assert code.count("spin=SPIN_RING_WAITS") == 11, "every per-tile ring wait takes the module constant, nothing else"
+    # The per-TILE ring waits (the gather warps' kv_empty in the ONE issue helper; the MMA warp's kv_full in the BMM1 helper, s_empty there,
+    # kv_full + p_full before BMM2 and the union rendering's second V half; the softmax warps' s_full and the in-loop bmm2_done) take the
+    # module constant -- 8 sites; the per-ITEM waits (q_full, ids_full / ids_empty, the epilogue's bmm2_done) and the exit drains keep the
+    # default form.
+    assert code.count("spin=SPIN_RING_WAITS") == 8, "every per-tile ring wait takes the module constant, nothing else"
     assert "SPIN_RING_WAITS: bool = False" in code
     # the LOAD wait orders the s_empty arrive after the S^T read (frost-kernels.md section 3)
     i_ld = code.index('s_raw = nvvm.tcgen05_ld("32x32b"')
@@ -881,7 +889,7 @@ def test_sparse_kernel_empty_row_guard_floor_mask_and_hygiene_pins():
     assert code.count("cutlass.Float32(1e-30)") == 1 and "TINY = cutlass.Float32(1e-30)" in code, "one floor constant, defined once"
     assert code.count("cute.math.max(l_tot, TINY)") == 2, "the floor on the log and the reciprocal only"
     assert code.count("_select_f32(row_dead, NEG_INF, lse_j)") == 1 and code.count("_select_f32(row_dead, ZERO, inv_j)") == 1
-    assert "_select_f32(dead_cols[j], ZERO, cutlass.Float32(o_vals[j]) * inv_cols[j])" in code, "O's empty case is a SELECT, not residue * 0"
+    assert "_select_f32(dead_cols[jj], ZERO, cutlass.Float32(o_vals[jj]) * inv_cols[jj])" in code, "O's empty case is a SELECT, not residue * 0"
     assert "atomic" not in code.lower()
     assert "valid = (blk >= cutlass.Int32(0)) & (key_abs <= pos) & (key_abs < eff_seqlen_kv)" in code
     assert "apply_mask_chunk" not in code, "the mask is per lane (one predicate, 16 selects), not the per-column bit-word form"
@@ -903,7 +911,8 @@ def test_sparse_kernel_decode_form_source_pins():
     for name in ("SPLIT_KV = CFG.SPLIT_KV", "LIST_PER_SEQUENCE = CFG.LIST_PER_SEQUENCE", "BOTTOM_RIGHT = CFG.BOTTOM_RIGHT"):
         assert name in code, name
     assert code.count("cutlass.const_expr(SPLIT_KV > 1)") >= 5, "the split arm folds at the decode, the bounds, both list-read sites and the store"
-    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 4 and code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 3
+    assert code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1)") >= 2 and code.count("cutlass.const_expr(LIST_PER_SEQUENCE == 1 or UNION_ROWS > 0)") == 3
+    assert code.count("cutlass.const_expr(BOTTOM_RIGHT == 1)") == 3
     assert "live_row = tok < eff_seqlen_q" in code, "under the bottom-right diagonal the store predicate is the Q row's liveness"
     # the prefill form keeps its own tail spelling (one tail id at most) so the dense rendering traces the same program as before
     assert (
@@ -931,15 +940,15 @@ def test_sparse_kernel_decode_form_source_pins():
     assert "t_next = tile0 + t_next" in code and "t_abs = tile0 + i" in code
     assert "part_batch = out_batch + split * n_batch" in code
     # All four gated/ungated store arms widen BEFORE forming an address; a narrow row subview can wrap a legal O stride.
-    assert code.count("cutlass.Int64(part_batch)") == 4 and "oo[part_batch" not in code
-    assert "lse_arr[part_batch, head_base + col, out_tok] = lse_cols[j]" in code  # col = the group's head row (j at one column group)
+    assert len(re.findall(r"cutlass\.Int64\(\s*part_batch\s*\)", code)) == 6 and "oo[part_batch" not in code  # the four per-row store arms + the two union ones
+    assert "lse_arr[part_batch, head_base + col, out_tok] = lse_cols[jj]" in code  # col = the group's head row (j at one column group)
     # the host: the grid, the partial slabs, the per-sequence list rows, the fp32 pointer + the LSE requirement
     assert "grid_shape = (SQ * SPLIT_KV, KH, B)" in code and "n_o_batches = B * SPLIT_KV" in code
-    assert "n_list_rows = B if cutlass.const_expr(LIST_PER_SEQUENCE == 1) else n_q_batches * SQ" in code
+    assert "n_list_rows = B if cutlass.const_expr(LIST_PER_SEQUENCE == 1 or UNION_ROWS > 0) else n_q_batches * SQ" in code
     assert "P(cutlass.Float32) if SPLIT_KV > 1 else P(STORAGE_DTYPE)" in code
     assert 'raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True' in code
     # no new ring, tile or wait
-    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 11
+    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 8
 
 
 # ============================================================================ the reference (torch; any device)
@@ -2249,9 +2258,9 @@ def test_sparse_kernel_gate_arm_source_pins():
     assert code.count("bars.mb_gate_empty.arrive()") == 1
     assert code.count("tma_load_tile(sQ[qg_idx], tma_gate(") == 1, "the gate lands in the item's own Q^T slot"
     assert "sGate" not in code and code.count("SmemTile(") == 4
-    assert code.count("spin=SPIN_RING_WAITS") == 11, "the gate waits are per-item waits on the default form"
+    assert code.count("spin=SPIN_RING_WAITS") == 8, "the gate waits are per-item waits on the default form"
     assert code.count("gate_epilogue_pairs(") == 1 and "gate_inv_sum(inv_j)" in code and code.count("gate_half_opaque()") == 1
-    assert "_select_f32(dead_cols[j], ZERO, gated[j])" in code, "the dead-column SELECT per element, AFTER the gate fma"
+    assert "_select_f32(dead_cols[jj], ZERO, gated[jj])" in code, "the dead-column SELECT per element, AFTER the gate fma"
     assert "GATE_TX_BYTES = CFG.GATE_TX_BYTES" in code and "n_bytes=Q_SLOT_BYTES" not in code and "n_bytes=6144" not in code
     i_sig = code.index("def _kernel(")
     sig = code[i_sig : code.index(") -> None:", i_sig)]
@@ -2827,7 +2836,7 @@ def test_sparse_kernel_softmax_split_source_pins():
     assert code.count("for w in cutlass.range_constexpr(SOFTMAX_WARPS_PER_GROUP):") == 2, "a column max / sum combines ONE group's four warps"
     assert "for w in cutlass.range_constexpr(SOFTMAX_WARPS):" not in code
     assert "n_live_cols = (cutlass.Int32(Q_BOX_ROWS) - col0) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(Q_BOX_ROWS)" in code
-    assert code.count("spin=SPIN_RING_WAITS") == 11 and code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3 and code.count("SmemTile(") == 4
+    assert code.count("spin=SPIN_RING_WAITS") == 8 and code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3 and code.count("SmemTile(") == 4
     assert (
         code.count("bars.mb_s_empty[par].arrive()") == 1
         and code.count("bars.mb_p_full[par].arrive()") == 1
@@ -3335,3 +3344,805 @@ def test_decode_form_combine_launches_the_pinned_kernel(B, S_q, split, gate, wit
     others = {k for f, ks in _FORM_KERNEL.items() if f != form for k in ks}
     assert not any(next(iter(names)).startswith(w) for w in others), (form, names)
     print(f"\npinned combine form {form} B={B} S_q={S_q} split={split}: the profiler saw {sorted(names)}")
+
+
+# ============================================================================ the UNION form (union_rows = S_q over the sequence's union list)
+# The kernel's UNION ARM: one work item per (sequence, KV head, split chunk) over the 2048-word union of the sequence's S_q per-row lists
+# (the words (blk << 4) | mask of gated_attention_block.qsa_list_union), the per-row FUNCTION exactly (row j sees its own list and its own
+# open block) within fp32 rounding of the per-row tile -- NEVER bitwise it: the two renderings group a row's keys differently in the online
+# softmax.  Oracle O1: the fp32 per-row reference within the module's budget (ATOL, never widened) AND the per-row tile within the bound
+# below, MEASURED RED-then-green on the development node before it was asserted (the rule: the bound is the measured one, pinned;
+# the module budget stays the hard gate).  Bitwise claims: two launches of the union form, the captured graph's replay, the paged read vs
+# the dense read.
+UNION_W = 2048
+# vs the per-row tile, per output element at the ROW's scale (|dO| / ulp_dtype(max over the row's elements of max(|a|, |b|)); the
+# element-scale count reads hundreds for a one-rounding flip of a near-zero element and says nothing about the row), and the LSE relative
+# bound.  The two renderings share the fp32 scores, the exp2 of each key and the half-rounded P; they differ in WHERE the running max
+# moves (a row's keys fall into different 128-key tiles once the other rows' blocks interleave) and so in the fp32 summation grouping of l
+# and of the PV accumulation -- an fp32-rounding difference rounded once to the output dtype.  Measured 2026-10-21 (Rubin cc 10.7
+# development node, the U1 / U5 / U6 cells, both unsplit): the record's table; the bound is the specified 2 ulp, above every measured cell.
+UNION_VS_PERROW_O_ULP = 2.0
+UNION_VS_PERROW_LSE_REL = 1e-5
+
+
+def _perrow_decode_lists(B, S_q, top_k, kv_lens, g, *, agreement=None, shuffle=True):
+    """Per-row lists ``[B, S_q, top_k]`` (+ ``block_lens [B, S_q]``) at the bottom-right positions ``kv_len - S_q + j``.  ``agreement=None``:
+    an independent random subset per row (the oracle's ``random_block_ids``); a float in (0, 1]: every row starts from ONE shared random subset of
+    the blocks complete for row 0 and replaces ``round((1 - agreement) x n)`` of its entries with other complete blocks of its own (the gate's
+    statistic: the rows of a step agree on ~99.5 % of their ids); ``0.0``: DISJOINT rows (row ``j`` lists the blocks congruent to ``j`` mod
+    ``S_q``, |union| = the sum of the rows).  Every row stays contract-clean (complete blocks of its own range, no duplicate)."""
+    oracle = _oracle()
+    dev = torch.device("cuda")
+    kvl = torch.tensor(kv_lens, device=dev, dtype=torch.long)
+    pos = (kvl[:, None] - S_q) + torch.arange(S_q, device=dev)[None, :]
+    if agreement is None:
+        ids, lens = oracle.random_block_ids(pos, top_k, BS, generator=g, kv_lens=kvl[:, None], shuffle=shuffle)
+        return ids.contiguous(), lens.contiguous()
+    ids = torch.full((B, S_q, top_k), -1, dtype=torch.int32, device=dev)
+    lens = torch.zeros(B, S_q, dtype=torch.int32, device=dev)
+    for b in range(B):
+        n_complete = [max(int(pos[b, j]) + 1, 0) // BS for j in range(S_q)]
+        if agreement == 0.0:
+            for j in range(S_q):
+                mine = torch.arange(n_complete[j], device=dev)
+                mine = mine[(mine % S_q) == j]
+                mine = mine[torch.randperm(mine.numel(), generator=g, device=dev)][:top_k]
+                ids[b, j, : mine.numel()] = mine.to(torch.int32)
+                lens[b, j] = mine.numel()
+            continue
+        n0 = n_complete[0]
+        n_sel = min(top_k, n0)
+        shared = torch.randperm(max(n0, 1), generator=g, device=dev)[:n_sel]
+        for j in range(S_q):
+            n_rep = int(round((1.0 - agreement) * n_sel))
+            row = shared.clone()
+            if n_rep and n_complete[j] > n_sel:
+                others = torch.arange(n_complete[j], device=dev)
+                keep = torch.ones(n_complete[j], dtype=torch.bool, device=dev)
+                keep[shared] = False
+                others = others[keep]
+                others = others[torch.randperm(others.numel(), generator=g, device=dev)][:n_rep]
+                slots = torch.randperm(n_sel, generator=g, device=dev)[: others.numel()]
+                row[slots] = others
+            if shuffle:
+                row = row[torch.randperm(row.numel(), generator=g, device=dev)]
+            ids[b, j, : row.numel()] = row.to(torch.int32)
+            lens[b, j] = row.numel()
+    return ids.contiguous(), lens.contiguous()
+
+
+def _union_of(ids, lens):
+    """The union words of the per-row lists (the test-side oracle of ``qsa_list_union``): ``(union_ids int32 [B, 2048], union_lens int32 [B])``."""
+    oracle = _oracle()
+    u, n = oracle.union_words_reference(ids, lens, width=UNION_W)
+    return u.contiguous(), n.contiguous()
+
+
+def _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k):
+    """The fp32 oracle of the per-row decode form: row ``j`` of sequence ``b`` at ``pos_j = L_b - S_q + j`` sees ITS list (``qsa_visible_mask`` at
+    the row's own position: the listed complete blocks plus its own open block); natural-log LSE; a row with ``pos_j < 0`` is dead.  Returns
+    ``(O, LSE, sum_j p_j |v_j|)`` like :func:`_reference_decode`."""
+    oracle = _oracle()
+    B, S, H, _ = q.shape
+    SKV, KH = k.shape[1], k.shape[2]
+    G = H // KH
+    dev = q.device
+    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
+    pv_abs = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    for b in range(B):
+        L = int(kv_lens[b])
+        pos = torch.arange(S, device=dev) + (L - S)
+        allowed = oracle.qsa_visible_mask(ids[b], None if lens is None else lens[b], pos, L, SKV, BS, top_k=top_k)
+        for h in range(H):
+            kk = k[b, :, h // G].float()
+            vv = v[b, :, h // G].float()
+            sc = (q[b, :, h].float() @ kk.t()) * scale
+            sc = sc.masked_fill(~allowed, float("-inf"))
+            rmax = sc.amax(dim=-1)
+            dead = torch.isinf(rmax) & (rmax < 0)
+            safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+            p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
+            den = p.sum(dim=-1)
+            den_safe = torch.where(dead, torch.ones_like(den), den)
+            oc = (p @ vv) / den_safe[:, None]
+            ref_o[b, :, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+            ref_lse[b, h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+            pv_abs[b, :, h] = (p @ vv.abs()) / den_safe[:, None]
+    return ref_o, ref_lse, pv_abs
+
+
+def _union_adapter(q, kv, union_ids, union_lens, kv_lens, top_k, scale, *, union_rows, o, lse, split=1, gate=None, softmax_groups=0):
+    """The adapter declared on the UNION form (``union_rows=S_q``, ``bottom_right=True``, the union words as ``block_ids`` and their count as
+    ``block_lens``); ``kv`` = ``(k, v)`` dense or ``(k_pool, v_pool, table, P)`` paged."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    kw = dict(paged_kv=True, page_size=kv[3], block_table=kv[2]) if len(kv) == 4 else {}
+    a = SparseGqaFwdDslSm107(
+        q=q,
+        k=kv[0],
+        v=kv[1],
+        o=o,
+        lse=lse,
+        block_ids=union_ids,
+        block_lens=union_lens,
+        seq_kv_lens=seq_kv,
+        top_k=top_k,
+        scale=scale,
+        bottom_right=True,
+        split_kv=split,
+        epilogue_gate=gate,
+        softmax_groups=softmax_groups,
+        union_rows=union_rows,
+        **kw,
+    )
+    return a
+
+
+def _launch_union(q, kv, union_ids, union_lens, kv_lens, top_k, scale, *, union_rows, split=1, launches=2, gate=None, with_lse=True, softmax_groups=0):
+    """Sentinel-filled O / LSE per launch through the adapter's UNION form; a split's workspace is sentinel-filled too."""
+    dev = q.device
+    B, S, H, _ = q.shape
+    sent = _sentinel(q.dtype)
+    outs = []
+    for _ in range(launches):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32) if with_lse else None
+        a = _union_adapter(
+            q, kv, union_ids, union_lens, kv_lens, top_k, scale, union_rows=union_rows, o=o, lse=lse, split=split, gate=gate, softmax_groups=softmax_groups
+        )
+        assert a.check_support()
+        a.compile()
+        ws = None
+        if split > 1:
+            ws = torch.full((a.scratch_workspace_bytes() // 4,), 1.5e30, device=dev, dtype=torch.float32)
+        a.execute(stream=_stream(), workspace=ws)
+        torch.cuda.synchronize()
+        outs.append((o, lse, ws))
+    return outs
+
+
+def _launch_perrow_decode(q, kv, ids, lens, kv_lens, top_k, scale, *, split=1, launches=1, gate=None):
+    """The PER-ROW tile on the same per-row lists (``bottom_right=True``, ``block_ids [B, S_q, top_k]``): the kernel of record the union form is
+    measured against."""
+    return _launch_decode(q, kv, ids, lens, kv_lens, top_k, scale, split=split, launches=launches, gate=gate, list_per_sequence=False)
+
+
+def _ulp_dist(a: torch.Tensor, b: torch.Tensor, dtype, live) -> Tuple[float, float]:
+    """``(max |a - b| in ulps of dtype at the ROW's scale, max |a - b|)`` over the live rows (``live`` = ``[B, S, H]`` bool): the ulp of a row
+    (one (sequence, token, head) output vector) is the dtype's ulp at the row's largest magnitude, so a one-rounding flip of a small element
+    counts as the fraction of the row's ulp it is -- the specified "per element at the row's scale" bound (an element-scale ulp count reads
+    hundreds for a 1e-4 flip of a 1e-5 element and says nothing about the row)."""
+    d = (a.float() - b.float()).abs()
+    row_mag = torch.maximum(a.float().abs(), b.float().abs()).amax(dim=-1, keepdim=True)
+    ulps = d.cpu() / _ulp_of(row_mag.expand_as(d), dtype)
+    m = live[:, :, :, None].expand_as(d).cpu()
+    return float(ulps[m].max()), float(d.cpu()[m].max())
+
+
+def _union_cell(*, B, SKV, kv_lens, S_q, H=24, KH=2, dtype=torch.bfloat16, top_k=512, agreement=None, split=1, seed=0, softmax_groups=0, paged=None):
+    """One union cell: the union form on the union of random per-row lists vs the fp32 per-row oracle (the module's budget, two launches
+    bitwise, dead rows exact) AND vs the per-row tile on the same lists (the ulp bound); under a split the unsplit union item within the
+    derived two-term budget; the paged read bitwise the dense read.  Returns the magnitudes."""
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, seed, SKV=SKV)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=agreement)
+    u_ids, u_lens = _union_of(ids, lens)
+    scale = 1.0 / math.sqrt(D)
+    ref_o, ref_lse, pv_abs = _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    outs = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=split, softmax_groups=softmax_groups)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    o_u, lse_u = outs[0][0], outs[0][1]
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)  # [B, S, H]
+    res = dict(max_o=max_o, max_lse=max_lse, dead=int(torch.isinf(ref_lse).sum()), union_lens=u_lens.tolist())
+    # the UNSPLIT union item (the split one is measured against it below) vs the per-row tile UNSPLIT on the same lists -- the kernel of
+    # record, whose own split bound is ceil((top_k + 1) / 32) = 17 at top_k 512 while the union item splits to 65: both tiles see the same
+    # keys in the same descending order, so the two differ only in where the online-softmax rescale points fall (the union tile's 128-key
+    # tiles interleave the other rows' blocks) -- the measured ulp bound at the row's scale, pinned RED-then-green
+    o_u1, lse_u1 = o_u, lse_u
+    if split > 1:
+        un = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=1, launches=1, softmax_groups=softmax_groups)
+        _check([(un[0][0], un[0][1])], ref_o, ref_lse)
+        o_u1, lse_u1 = un[0][0], un[0][1]
+        d_sp, ratio = _split_vs_unsplit(o_u.float(), o_u1.float(), dtype, pv_abs, live)
+        lse_d = float((lse_u - lse_u1)[~torch.isinf(ref_lse)].abs().max()) if live.any() else 0.0
+        assert ratio <= 1.0 and lse_d <= ATOL, f"union split {split} vs unsplit: {ratio:.3f} of the derived budget (max|dO| {d_sp:.3e}), |dLSE| {lse_d:.2e}"
+        res.update(split_ratio=ratio, split_d=d_sp, split_lse_d=lse_d)
+    pr = _launch_perrow_decode(q, (k, v), ids, lens, kv_lens, top_k, scale, split=1)
+    _check([(pr[0][0], pr[0][1])], ref_o, ref_lse)
+    ulp, d = _ulp_dist(o_u1, pr[0][0], dtype, live)
+    lse_rel = float(((lse_u1 - pr[0][1]).abs() / pr[0][1].abs().clamp_min(1.0))[~torch.isinf(ref_lse)].max()) if live.any() else 0.0
+    res.update(perrow_ulp=ulp, perrow_d=d, perrow_lse_rel=lse_rel)
+    assert ulp <= UNION_VS_PERROW_O_ULP, f"union vs per-row tile: {ulp:.3f} ulp at the row's scale (max|d| {d:.3e}) > the pinned bound {UNION_VS_PERROW_O_ULP}"
+    assert lse_rel <= UNION_VS_PERROW_LSE_REL, f"union vs per-row tile LSE: rel {lse_rel:.3e} > {UNION_VS_PERROW_LSE_REL}"
+    if paged is not None:
+        P, hnd, fill = paged
+        kp, vp, table = _paginate(k, v, kv_lens, P, hnd, fill, g)
+        pg = _launch_union(q, (kp, vp, table, P), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=split, launches=1, softmax_groups=softmax_groups)
+        _check([(pg[0][0], pg[0][1])], ref_o, ref_lse)
+        _assert_bitwise((pg[0][0], pg[0][1]), (o_u, lse_u), f"union paged page {P} {'HND' if hnd else 'NHD'} fill {fill} split {split}")
+    return res
+
+
+@requires_rubin
+@pytest.mark.parametrize("agreement", [0.995, 0.0], ids=["agree-99.5pct", "disjoint"])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "f16"])
+@pytest.mark.parametrize(
+    "S_q, H, KH",
+    [
+        pytest.param(2, 24, 2, id="Sq2-24/2"),
+        pytest.param(3, 24, 2, id="Sq3-24/2"),
+        pytest.param(4, 24, 2, id="Sq4-24/2"),
+        pytest.param(3, 16, 1, id="Sq3-16/1-G16"),
+    ],
+)
+def test_union_form_matches_the_per_row_oracle_and_the_per_row_tile(S_q, H, KH, dtype, agreement):
+    """U1: the union form at ``union_rows`` 2 / 3 / 4 on the 24/2 geometry and at G 16 (16/1, S_q 3 = 48 columns), bf16 and f16, B 2 x 8K with a
+    saturated and a near-identity-bound sequence, the rows' lists at 99.5 % agreement (the gate's statistic) and disjoint: within the module
+    budget of the fp32 per-row oracle, within the pinned ulp bound of the per-row tile (O) and the relative bound (LSE), two launches
+    bitwise, dead rows exact, no sentinel on a live row."""
+    r = _union_cell(B=2, SKV=8192, kv_lens=[8192, 2048 + 7], S_q=S_q, H=H, KH=KH, dtype=dtype, agreement=agreement)
+    print(
+        f"\nunion S_q={S_q} {H}/{KH} {dtype} agreement={agreement}: |U| {r['union_lens']}; vs oracle max|dO| {r['max_o']:.5f} max|dLSE| {r['max_lse']:.6f}; "
+        f"vs per-row tile {r['perrow_ulp']:.3f} ulp (max|d| {r['perrow_d']:.3e}), LSE rel {r['perrow_lse_rel']:.2e}; dead rows {r['dead']}"
+    )
+
+
+def _one_hot_probe_inputs(B, S_q, kv_lens, H, KH, g):
+    """The key-count probe's operands: K = 0 (every score 0: a uniform softmax over the visible set), V[t] = e_(t mod D) (exactly representable),
+    Q random -- so per row LSE = log |V_j| EXACTLY (the attended key COUNT) and O[d] x |V_j| = the number of visible keys congruent to d mod D
+    (the attended SET modulo D): a double-counted or a missing key moves both."""
+    SKV = max(kv_lens)
+    dev = torch.device("cuda")
+    q = torch.randn(B, S_q, H, D, device=dev, dtype=torch.float32, generator=g).to(torch.bfloat16)
+    k = torch.zeros(B, SKV, KH, D, device=dev, dtype=torch.bfloat16)
+    v = torch.zeros(B, SKV, KH, D, device=dev, dtype=torch.bfloat16)
+    t = torch.arange(SKV, device=dev)
+    v[:, t, :, t % D] = 1.0
+    return q, k, v
+
+
+def _probe_expectations(ids, lens, kv_lens, S_q, top_k):
+    """Per (b, j) the visible set's size and its histogram modulo D from the oracle's visible mask at the row's own position."""
+    oracle = _oracle()
+    dev = ids.device
+    B = ids.shape[0]
+    counts = torch.zeros(B, S_q, dtype=torch.long, device=dev)
+    hist = torch.zeros(B, S_q, D, dtype=torch.float32, device=dev)
+    masks = []
+    for b in range(B):
+        L = int(kv_lens[b])
+        SKV = max(kv_lens)
+        pos = torch.arange(S_q, device=dev) + (L - S_q)
+        vis = oracle.qsa_visible_mask(ids[b], lens[b], pos, L, SKV, BS, top_k=top_k)
+        masks.append(vis)
+        counts[b] = vis.sum(-1)
+        t = torch.arange(SKV, device=dev)
+        for j in range(S_q):
+            hist[b, j] = torch.bincount((t % D)[vis[j]], minlength=D).float()
+    return counts, hist, masks
+
+
+@requires_rubin
+@pytest.mark.parametrize("S_q", [2, 3, 4], ids=lambda s: f"Sq{s}")
+@pytest.mark.parametrize("r", [0, 1, 2, 3], ids=lambda r: f"pos0-mod4-{r}")
+def test_union_form_tail_matrix_key_count_probe(S_q, r):
+    """U2 (the per-row tail rule, risks 4 / 5): ``pos_0 mod 4`` in 0..3 x ``S_q`` 2 / 3 / 4 over four sequences -- a SHORT one (~60 tokens: 0 / 1 / 2
+    tail lanes per the residue; a row with ``(pos_j + 1) % 4 == 0`` has no open block), the identity-bound one, a saturated one (2049 complete
+    blocks, 512 selected: the block completed between ``pos_0`` and ``pos_last`` is listed by the LATER rows only, so the union's count must be
+    anchored at the LAST row), and one whose rows all list ``pos_0``'s open block's predecessors; the one-hot-V key-count probe row by row:
+    ``LSE_j == log |V_j|`` (the attended key COUNT: no double count, no missing key -- a listed block that is also an earlier row's open block
+    is seen once by each) and ``O_j x |V_j|`` == the visible set's histogram modulo D (the attended SET); then the fp32 per-row oracle on
+    random Q / K / V of the same lists within the budget."""
+    H, KH, top_k = 24, 2, 512
+    k0 = 14
+    kv_lens = [4 * k0 + r + S_q, 2048 + r + S_q, 8192 + r + S_q, 4 * 300 + r + S_q]
+    SKV = max(kv_lens)
+    B = len(kv_lens)
+    g = torch.Generator(device="cuda").manual_seed(300 + 16 * S_q + r)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=0.99)
+    # sequence 3: row 0 lists everything up to its own tail; the LATER rows list the block completed after pos_0 (the completed-between block)
+    # -- explicitly, so the tail rule's two lanes (row 0's tail lane, the later rows' list lane) are both exercised
+    pos0 = kv_lens[3] - S_q
+    between = (pos0 + 1) // BS  # row 0's open block (if open), complete for the row j with pos_j >= 4 between + 3
+    for j in range(S_q):
+        pos_j = pos0 + j
+        if pos_j // BS > between or ((pos_j + 1) % BS == 0 and pos_j // BS == between):
+            if not bool((ids[3, j] == between).any()):
+                ids[3, j, int(lens[3, j]) - 1] = between
+    u_ids, u_lens = _union_of(ids, lens)
+    counts, hist, masks = _probe_expectations(ids, lens, kv_lens, S_q, top_k)
+    assert bool((counts > 0).all())
+    q, k, v = _one_hot_probe_inputs(B, S_q, kv_lens, H, KH, g)
+    outs = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, 1.0 / math.sqrt(D), union_rows=S_q, launches=2)
+    o, lse, _ = outs[0]
+    assert torch.equal(o, outs[1][0]) and torch.equal(lse, outs[1][1]), "two launches must be bitwise"
+    report = []
+    for b in range(B):
+        for j in range(S_q):
+            n = int(counts[b, j])
+            got_lse = lse[b, :, j]
+            assert torch.allclose(
+                got_lse, torch.full_like(got_lse, math.log(n)), atol=0, rtol=2e-6
+            ), f"seq {b} row {j} (pos {kv_lens[b] - S_q + j}): LSE {got_lse[0].item():.7f} vs log |V_j| = log {n} = {math.log(n):.7f} -- a key counted twice or missed"
+            want = hist[b, j] / n  # the set's histogram modulo D over the count
+            got = o[b, j].float()  # [H, D], identical over the heads (K = 0)
+            d = (got - want[None, :]).abs().max().item()
+            tol = float(_ulp_of(want.max().reshape(1), torch.bfloat16).max()) + 1e-6
+            assert d <= tol, f"seq {b} row {j}: the attended set's histogram is off by {d:.3e} (tol {tol:.3e})"
+            n_tail = -(-(kv_lens[b] - S_q + j + 1) // BS) - (kv_lens[b] - S_q + 1) // BS if kv_lens[b] - S_q >= 0 else 0
+            report.append(f"b{b}r{j}:|V|={n}")
+    # the same lists on random operands against the fp32 per-row oracle
+    q2, k2, v2, _ = _inputs(B, S_q, H, KH, torch.bfloat16, 7, SKV=SKV)
+    ref_o, ref_lse, _ = _reference_perrow_decode(q2, k2, v2, ids, lens, kv_lens, 1.0 / math.sqrt(D), top_k)
+    outs2 = _launch_union(q2, (k2, v2), u_ids, u_lens, kv_lens, top_k, 1.0 / math.sqrt(D), union_rows=S_q)
+    max_o, max_lse = _check([(oo, ll) for oo, ll, _ in outs2], ref_o, ref_lse)
+    print(
+        f"\nunion tail matrix S_q={S_q} r={r} lens={kv_lens}: |U| {u_lens.tolist()}; "
+        + " ".join(report)
+        + f"; random operands max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}"
+    )
+
+
+@requires_rubin
+def test_union_form_degenerate_rows():
+    """U3: an empty sequence (every row dead: O = 0 / LSE = -inf), a sequence shorter than the step (the leading rows dead, the rest live), a row
+    with no complete block (its tail lane only), ``union_lens = 0`` with a tail (the tail lanes alone) and without (dead), ``union_lens = 2048``
+    (four disjoint 512-lists: 65 tiles; split 1 and 16 = dead chunks), identical lists (|U| = 512, every row's bit), a 0-nibble word (a dead lane
+    for every column: the oracle without that block), a ``-1`` inside the count (no key), ids past the length (masked key by key) and past the
+    tensor; every cell within the budget of the fp32 per-row oracle on the lists the union words DEFINE."""
+    H, KH, top_k, S_q = 24, 2, 512, 4
+    dtype = torch.bfloat16
+    oracle = _oracle()
+    dev = torch.device("cuda")
+    scale = 1.0 / math.sqrt(D)
+    # --- dead / short / no-complete-block sequences and the identical lists in ONE batch
+    kv_lens = [0, 2, 5, 300, 2051, 8192 + 2]
+    B = len(kv_lens)
+    SKV = max(kv_lens)
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 41, SKV=SKV)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=None)
+    ids[4] = ids[4, 0:1].expand(S_q, top_k)  # identical lists on the identity-bound sequence (every row lists every complete block of row 0)
+    lens[4] = lens[4, 0]
+    u_ids, u_lens = _union_of(ids, lens)
+    # L 0 / L 2: no complete block for any row (positions < 3); L 5 at S_q 4: rows at 1 .. 4 -- the last row has ONE complete block (tokens 0..3)
+    assert int(u_lens[0]) == 0 and int(u_lens[1]) == 0 and int(u_lens[2]) == 1, u_lens.tolist()
+    assert int(u_lens[4]) == int(lens[4, 0]) and bool(((u_ids[4, : int(u_lens[4])] & 15) == 15).all()), "identical lists: |U| = the list, every bit"
+    ref_o, ref_lse, _ = _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    assert torch.isinf(ref_lse[0]).all() and torch.isinf(ref_lse[1, :, :2]).all() and torch.isfinite(ref_lse[1, :, 2:]).all()
+    outs = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    print(
+        f"\nunion degenerate batch lens={kv_lens}: |U| {u_lens.tolist()} max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} dead rows {int(torch.isinf(ref_lse).sum())}"
+    )
+    # --- the union's count anchored at the LAST row: a sequence whose later rows list the block completed after pos_0 (|U| > row 0's count)
+    # and the full 2048-word union (four disjoint lists) at 65 tiles, split 1 and 16
+    kv_lens = [8192 + 3, 8192 + 1]
+    B = 2
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 42, SKV=8192 + 3)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=0.0)
+    u_ids, u_lens = _union_of(ids, lens)
+    assert bool((u_lens == UNION_W).all()), u_lens.tolist()
+    ref_o, ref_lse, pv_abs = _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    outs = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    sp = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=16, launches=1)
+    _check([(sp[0][0], sp[0][1])], ref_o, ref_lse)
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+    d, ratio = _split_vs_unsplit(sp[0][0].float(), outs[0][0].float(), dtype, pv_abs, live)
+    assert ratio <= 1.0, f"65 tiles at split 16 vs unsplit: {ratio:.3f} of the derived budget"
+    print(f"union |U| = 2048 (65 tiles): max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}; split 16 vs unsplit {d:.3e} = {ratio:.3f} of the budget")
+    # --- union_lens = 0 with a tail (the tail lanes alone) / a 0-nibble word / a -1 inside the count / an id past the length and past the tensor
+    # (the tensor holds 128 keys, the sequences 86: a block in [22, 32) is inside the tensor and entirely past the length -- every key fails
+    # key_abs < L_b --, block 10000 is past the tensor.  A block STRADDLING the length (21: keys 84 / 85 inside) is never listed: it is the
+    # open block of the rows that could see it, and a list word for it would duplicate their tail lane -- the contract violation the
+    # header names, counted twice by the per-row tile and here alike, so no oracle can be written for it.)
+    L = 4 * 20 + 2 + S_q
+    kv_lens = [L, L, L, L]
+    B = 4
+    SKV = 128
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 43, SKV=SKV)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=None)
+    ids[0] = -1
+    lens[0] = 0  # sequence 0: no list, the tail lanes alone
+    u_ids, u_lens = _union_of(ids, lens)
+    assert int(u_lens[0]) == 0
+    # the words the kernel reads define the function: a 0-nibble word hides its block from every row, a -1 word is no key, an id past the
+    # length is masked key by key, an id past the tensor reads zero rows -- the oracle sees the lists the words define
+    ids_eff = ids.clone()
+    w1 = u_ids[1, 3].item()
+    blk1 = w1 >> 4
+    u_ids[1, 3] = blk1 << 4  # a 0-nibble word
+    ids_eff[1][ids_eff[1] == blk1] = -1
+    w2 = u_ids[2, 5].item()
+    blk2 = w2 >> 4
+    u_ids[2, 5] = -1  # -1 inside the count
+    ids_eff[2][ids_eff[2] == blk2] = -1
+    n3 = int(u_lens[3])
+    u_ids[3, 1] = (10_000 << 4) | 15  # past the tensor (the gather reads zero rows; every key past the length)
+    u_ids[3, 2] = ((L // BS + 1) << 4) | 15  # block 22: inside the tensor, every key past the length -- masked key by key (all four)
+    # rebuild sequence 3's effective lists from the edited words (the union words ARE the contract): the two replaced words' former
+    # blocks leave every row's list, a block with every key at or past the length contributes nothing
+    for j in range(S_q):
+        mine = []
+        for w in u_ids[3, :n3].tolist():
+            if w >= 0 and ((w >> 4) * BS < L) and ((w & 15) >> j) & 1:
+                mine.append(w >> 4)
+        mine = sorted(set(mine), reverse=True)
+        ids_eff[3, j] = -1
+        ids_eff[3, j, : len(mine)] = torch.tensor(mine, dtype=torch.int32, device=dev)
+        lens[3, j] = len(mine)
+    for b in (1, 2):
+        for j in range(S_q):
+            row = ids_eff[b, j][ids_eff[b, j] >= 0]
+            ids_eff[b, j] = -1
+            ids_eff[b, j, : row.numel()] = row
+            lens[b, j] = row.numel()
+    ref_o, ref_lse, _ = _reference_perrow_decode(q, k, v, ids_eff, lens, kv_lens, scale, top_k)
+    outs = _launch_union(q, (k, v), u_ids.contiguous(), u_lens, kv_lens, top_k, scale, union_rows=S_q)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs], ref_o, ref_lse)
+    print(f"union edited words (tail-only / 0-nibble / -1 / past the tensor) lens={kv_lens}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "B, split", [(32, 2), (32, 3), (4, 16), (2, 65)], ids=["B32-split2-lean-walk", "B32-split3-lean-walk", "B4-split16", "B2-split65-one-tile-chunks"]
+)
+def test_union_form_splits_match_the_unsplit_item_with_the_pinned_combine(B, split):
+    """U4: the union item cut into 2 / 3 (B 32: the lean-walk combine form), 16 and 65 chunks (one tile per chunk at most; dead chunks at 17 tiles):
+    within the budget of the oracle, split == unsplit within the derived two-term budget, the per-row tile within the ulp bound, two launches
+    bitwise; the combine form is the adapter's pinned one for the grid."""
+    from cudnn.sdpa.fwd.kernels.sm100 import split_combine
+
+    kv_lens = [8192 - (i % 7) for i in range(B)]
+    r = _union_cell(B=B, SKV=8192, kv_lens=kv_lens, S_q=4, agreement=0.995, split=split, seed=50 + split)
+    # the combine form on the cell's grid (B, H_q 24, S_q 4): the lean group walk where the split-aware rule selects it (B 32 at a split
+    # of at most 4: the lean grid past the decode-grid kernel's bound), the module's own forms elsewhere -- the probe adapter at the
+    # cell's B and rows, never launched
+    q, k, v, g = _inputs(B, 4, 24, 2, torch.bfloat16, 0, SKV=64)
+    a = _union_adapter(
+        q,
+        (k, v),
+        torch.full((B, UNION_W), -1, dtype=torch.int32, device=q.device),
+        torch.zeros(B, dtype=torch.int32, device=q.device),
+        [64] * B,
+        512,
+        0.0625,
+        union_rows=4,
+        o=q,
+        lse=None,
+        split=split,
+    )
+    print(
+        f"\nunion split {split} B {B}: vs oracle max|dO| {r['max_o']:.5f}; split vs unsplit {r['split_d']:.3e} = {r['split_ratio']:.3f} of the budget, |dLSE| {r['split_lse_d']:.2e}; vs per-row tile {r['perrow_ulp']:.3f} ulp"
+    )
+    from cudnn.sdpa.fwd import heuristics as heur
+
+    form = a.combine_form()
+    walk = heur.decode_combine_lean_walk_selected(B, 24, 4, split, device_cc=(10, 7))
+    assert walk == (B == 32) and (form == split_combine.DECODE_GRID_LEAN_WALK) == walk, (B, split, form, walk)
+
+
+@requires_rubin
+def test_union_form_capture_of_the_first_launch_replays_bitwise():
+    """U4 (capture): the union adapter's first execute after the compile captures into a CUDA graph and the replay equals the eager launch over
+    the same lists, and over NEW lists / lengths written into the same buffers."""
+    B, S_q, H, KH, top_k = 4, 4, 24, 2, 512
+    dtype = torch.bfloat16
+    kv_lens = [8192, 4097, 300, 2051]
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 61, SKV=8192)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=0.995)
+    u_ids, u_lens = _union_of(ids, lens)
+    scale = 1.0 / math.sqrt(D)
+    dev = q.device
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    o = torch.full((B, S_q, H, D), _sentinel(dtype), device=dev, dtype=dtype)
+    lse = torch.full((B, H, S_q), _sentinel(dtype), device=dev, dtype=torch.float32)
+    a = _union_adapter(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, o=o, lse=lse, split=3)
+    assert a.check_support()
+    a.compile()
+    ws = torch.zeros((a.scratch_workspace_bytes() // 4,), device=dev, dtype=torch.float32)
+    side = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    import cuda.bindings.driver as cuda
+
+    with torch.cuda.stream(side):
+        with torch.cuda.graph(graph, stream=side):
+            a.execute(stream=cuda.CUstream(int(side.cuda_stream)), workspace=ws)
+    torch.cuda.synchronize()
+    o.fill_(_sentinel(dtype))
+    graph.replay()
+    torch.cuda.synchronize()
+    rep_o, rep_lse = o.clone(), lse.clone()
+    eager = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=3, launches=1)
+    assert torch.equal(rep_o, eager[0][0]) and torch.equal(rep_lse, eager[0][1]), "the captured first launch replays the eager launch bitwise"
+    ref_o, ref_lse, _ = _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    _check([(rep_o, rep_lse)], ref_o, ref_lse)
+    # new lists and lengths into the same buffers
+    kv_lens2 = [6000, 8192, 2052, 61]
+    ids2, lens2 = _perrow_decode_lists(B, S_q, top_k, kv_lens2, g, agreement=0.0)
+    u2, n2 = _union_of(ids2, lens2)
+    u_ids.copy_(u2)
+    u_lens.copy_(n2)
+    seq_kv_t = a.seq_kv_lens
+    seq_kv_t.copy_(torch.tensor(kv_lens2, device=dev, dtype=torch.int32))
+    graph.replay()
+    torch.cuda.synchronize()
+    ref2_o, ref2_lse, _ = _reference_perrow_decode(q, k, v, ids2, lens2, kv_lens2, scale, top_k)
+    max_o, max_lse = _check([(o.clone(), lse.clone())], ref2_o, ref2_lse)
+    print(f"\nunion capture: replay bitwise the eager launch; new lists / lengths replayed: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "P, hnd, fill, dtype",
+    [
+        pytest.param(16, True, "nan", torch.bfloat16, id="p16-HND-nan-bf16"),
+        pytest.param(32, True, "other", torch.float16, id="p32-HND-other-f16"),
+        pytest.param(64, False, "nan", torch.bfloat16, id="p64-NHD-nan-bf16"),
+    ],
+)
+def test_union_form_paged_read_is_bitwise_the_dense_read(P, hnd, fill, dtype):
+    """U5: the union form over page pools (HND / NHD, page 16 / 32 / 64; the unwritten rows past a sequence's length -- another sequence's tokens
+    or NaN -- and the -1 pages past the live ones) BITWISE the dense read of the same tokens and within the budget of the oracle."""
+    r = _union_cell(B=4, SKV=8192, kv_lens=[8192, 2052, 4097, 7000], S_q=4, dtype=dtype, agreement=0.995, seed=70 + P, paged=(P, hnd, fill))
+    print(
+        f"\nunion paged page {P} {'HND' if hnd else 'NHD'} fill {fill} {dtype}: bitwise the dense read; max|dO| {r['max_o']:.5f}; vs per-row tile {r['perrow_ulp']:.3f} ulp"
+    )
+
+
+@requires_rubin
+def test_union_form_gate_on_the_unsplit_item_and_in_the_combine():
+    """U6: the fused epilogue gate on the UNSPLIT union item (the gate box (S_q, G, 64) x 4 into the freed Q slot, read per pass) vs the ungated
+    union item through the production elementwise gate within ONE rounding of the dtype per element, vs the fp32 oracle gated exactly within
+    the budget, the LSE untouched (bitwise the ungated item's); the gate riding the COMBINE at split 2 within one rounding of the fused one."""
+    B, S_q, H, KH, top_k = 2, 4, 24, 2, 512
+    dtype = torch.bfloat16
+    kv_lens = [8192, 2051]
+    q, k, v, g = _inputs(B, S_q, H, KH, dtype, 81, SKV=8192)
+    ids, lens = _perrow_decode_lists(B, S_q, top_k, kv_lens, g, agreement=0.995)
+    u_ids, u_lens = _union_of(ids, lens)
+    scale = 1.0 / math.sqrt(D)
+    gate = (torch.randn(B, S_q, H, D, device=q.device, dtype=torch.float32, generator=g) * 2.0).to(dtype)
+    ref_o, ref_lse, _ = _reference_perrow_decode(q, k, v, ids, lens, kv_lens, scale, top_k)
+    outs_f = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, gate=gate)
+    outs_u = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, launches=1)
+    max_o, max_lse = _check([(o, l) for o, l, _ in outs_f], ref_o * torch.sigmoid(gate.float()), ref_lse)
+    (o_f, lse_f, _), (o_u, lse_u, _) = outs_f[0], outs_u[0]
+    assert torch.equal(lse_f, lse_u), "the gate must not touch the LSE"
+    o_ug = _elementwise_gate(o_u, gate)
+    live = ~torch.isinf(ref_lse).permute(0, 2, 1)
+    ulp, d = _ulp_dist(o_f, o_ug, dtype, live)
+    assert ulp <= 1.0, f"gated union vs unfused-then-gated: {ulp:.3f} ulp (max|d| {d:.3e})"
+    sp = _launch_union(q, (k, v), u_ids, u_lens, kv_lens, top_k, scale, union_rows=S_q, split=2, launches=1, gate=gate)
+    _check([(sp[0][0], sp[0][1])], ref_o * torch.sigmoid(gate.float()), ref_lse)
+    ulp_c, d_c = _ulp_dist(sp[0][0], o_f, dtype, live)
+    print(
+        f"\nunion gate: vs oracle max|dO| {max_o:.5f}; vs unfused-then-gated {ulp:.3f} ulp; the combine's gate (split 2) vs the fused one {ulp_c:.3f} ulp (max|d| {d_c:.3e})"
+    )
+
+
+# ---------------------------------------------------------------------------- host: the union form's declines and the rendering's pins
+def _union_operands(S=4, H=24, KH=2, B=2, dtype="torch.bfloat16", top_k=512):
+    o = _operands(B=B, S=S, H=H, KH=KH, SKV=8192, dtype=dtype, top_k=top_k)
+    o.update(
+        block_ids=_T((B, UNION_W), (UNION_W, 1), "torch.int32"),
+        block_lens=_T((B,), (1,), "torch.int32"),
+        seq_kv_lens=_T((B,), (1,), "torch.int32"),
+        bottom_right=True,
+        union_rows=S,
+    )
+    return o
+
+
+def test_union_form_is_accepted_and_builds_the_union_params(sm107_host_target):
+    """The union declaration passes ``check_support`` and compiles the record's union fields into the TemplateParams (``qsa_union_rows``, the
+    2048-word list) while ``top_k`` keeps the per-row width for the split bound (65 tiles on the rendering)."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    a = SparseGqaFwdDslSm107(**_union_operands(S=4))
+    assert a.check_support()
+    p = a.template_params()
+    assert p.qsa_union_rows == 4 and p.qsa_block_topk == UNION_W and p.bottom_right and not p.qsa_list_per_sequence
+    a65 = SparseGqaFwdDslSm107(**{**_union_operands(S=4), "split_kv": 65})
+    assert a65.check_support()
+    with pytest.raises(NotImplementedError, match="exceeds the item's maximum tile count"):
+        SparseGqaFwdDslSm107(**{**_union_operands(S=4), "split_kv": 66}).check_support()
+    a3 = SparseGqaFwdDslSm107(**_union_operands(S=3, H=16, KH=1))  # G 16 x S_q 3 = 48 columns
+    assert a3.check_support() and a3.template_params().qsa_union_rows == 3
+
+
+@pytest.mark.parametrize(
+    "over, exc, word",
+    [
+        pytest.param(dict(union_rows=1), NotImplementedError, "union_rows=1 is the per-row form", id="rows-1"),
+        pytest.param(dict(union_rows=5), NotImplementedError, "union_rows must be in", id="rows-5"),
+        pytest.param(dict(S=4, H=32, KH=2), NotImplementedError, "exceed the rendering's 48", id="GxSq-64"),
+        pytest.param(dict(thd=True), NotImplementedError, "with thd=True is not served|does not compose with thd", id="thd"),
+        pytest.param(dict(bottom_right=False), NotImplementedError, "needs bottom_right=True", id="no-bottom-right"),
+        pytest.param(dict(block_lens=None), ValueError, "needs block_lens", id="no-union-lens"),
+        pytest.param(dict(block_ids=_T((2, 1024), (1024, 1), "torch.int32")), ValueError, r"block_ids \[B, 2048\]", id="width-1024"),
+        pytest.param(dict(list_per_sequence=True), NotImplementedError, "does not compose with list_per_sequence", id="shared-list"),
+        pytest.param(
+            dict(include_open_block=False), NotImplementedError, "pure_list is not served|does not compose with include_open_block=False", id="pure-list"
+        ),
+        pytest.param(dict(S=3), ValueError, "must equal the step's S_q", id="rows-ne-Sq"),
+    ],
+)
+def test_union_form_typed_declines(over, exc, word, sm107_host_target):
+    """U7: every union request the rendering does not serve is a typed decline naming the condition, BEFORE the kernel module is imported."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    shape = {k: over.pop(k) for k in ("S", "H", "KH") if k in over}
+    kw = _union_operands(**shape) if shape else _union_operands()
+    if "S" in shape and "union_rows" not in over and shape["S"] != 4:
+        kw["union_rows"] = 4  # rows-ne-Sq: the declaration says 4 rows, Q carries 3
+    kw.update(over)
+    with pytest.raises(exc, match=word):
+        SparseGqaFwdDslSm107(**kw).check_support()
+
+
+def test_union_config_constants_match_the_header_tables():
+    """U8 (host): the union record's constants are the kernel header's UNION tables -- N_Q 48, the five-stage half-tile ring, KV_TX 8,192 per
+    gather warp (16 gather4 x 512 B at 4 gather warps), IDS_TX 8,192, Q_TX 24,576, one Q and one ids slot, three P^T atoms, SMEM 224,064 B under
+    the standard carveout at the specified starts, DESC_VERSION 0, TMEM 512 (288 used, the running state at 192), the init sums 4 / 12 / 256 /
+    14 / 288, the 16-warp population at 128 registers with a balanced split; the per-row record untouched."""
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+    from cudnn.sdpa.fwd.config_sm107 import SMEM_STANDARD_CARVEOUT_BYTES, d256_sparse_smem_layout, make_cfg_d256_sparse
+
+    base = dict(dtype_qkv=2, cta_mma=1, pack_gqa=True, qsa_block_size=4, bottom_right=True)
+    cfg, _ = make_cfg_d256_sparse(TemplateParams(qh_per_kh=12, qsa_block_topk=UNION_W, qsa_union_rows=4, **base))
+    lay = d256_sparse_smem_layout(cfg)
+    assert (cfg.N_Q, cfg.UNION_ROWS, cfg.STAGES_KV, cfg.KV_HALVES, cfg.STAGES_Q, cfg.STAGES_IDS, cfg.P_ATOMS, cfg.P_SWZ_BYTES) == (48, 4, 5, 2, 1, 1, 3, 32)
+    assert (cfg.KV_TX_BYTES_PER_WARP, cfg.KV_STAGE_BYTES, cfg.IDS_TX_BYTES, cfg.Q_TX_BYTES, cfg.GATE_TX_BYTES) == (8192, 32768, 8192, 24576, 24576)
+    assert (cfg.GATHER_WARPS, cfg.TOTAL_WARPS, cfg.ENTRY_REGS, cfg.BLOCKS_PER_WARP, cfg.GATHER_BOXES_PER_STAGE, cfg.GATHERS_PER_WARP_PER_STAGE) == (
+        4,
+        16,
+        128,
+        8,
+        2,
+        16,
+    )
+    assert cfg.SOFTMAX_WARPS * cfg.SOFTMAX_REGS + cfg.GATHER_WARPS * cfg.GATHER_REGS + cfg.AUX_WARPS * cfg.AUX_REGS == cfg.ENTRY_REGS * cfg.TOTAL_WARPS
+    assert (cfg.KV_FULL_ARRIVERS, cfg.IDS_EMPTY_ARRIVERS, cfg.SOFTMAX_LANES, cfg.READ_TILE_ARRIVERS, cfg.BAR_TMEM_THREADS) == (4, 12, 256, 14, 288)
+    assert (cfg.SOFTMAX_GROUPS, cfg.COLS_PER_GROUP, cfg.SOFTMAX_PASSES, cfg.PASS_COLS) == (2, 24, 3, 8)
+    assert (cfg.TMEM_COLS, cfg.S_ACC_OFF, cfg.O_OFF, cfg.ML_OFF) == (512, (0, 48), (96, 144), 192)
+    assert (cfg.Q_BOX_TOKENS, cfg.Q_BOX_HEADS, cfg.Q_BOX_ROWS, cfg.BLOCK_TOPK, cfg.MAX_TILES_PER_ITEM) == (4, 12, 48, UNION_W, 65)
+    assert lay["starts"] == {"sQ": 0, "sP": 24576, "sKV": 49152, "sKV_last": 180224, "sIds": 212992, "red": 221248, "misc": 223552}
+    assert cfg.SMEM_TOTAL_BYTES == lay["total"] == 224064 and cfg.SMEM_CARVEOUT_BYTES == SMEM_STANDARD_CARVEOUT_BYTES and cfg.DESC_VERSION == 0
+    # the three-group knob (24 warps / 80) and the 20-warp population (8 gather warps / 96) still render through the factory
+    cfg3, _ = make_cfg_d256_sparse(TemplateParams(qh_per_kh=12, qsa_block_topk=UNION_W, qsa_union_rows=4, **base), softmax_groups=3)
+    assert (cfg3.TOTAL_WARPS, cfg3.ENTRY_REGS, cfg3.COLS_PER_GROUP, cfg3.SOFTMAX_PASSES, cfg3.READ_TILE_ARRIVERS) == (20, 96, 16, 2, 18)
+    cfg8, _ = make_cfg_d256_sparse(TemplateParams(qh_per_kh=12, qsa_block_topk=UNION_W, qsa_union_rows=4, **base), gather_warps=8)
+    assert (cfg8.TOTAL_WARPS, cfg8.ENTRY_REGS, cfg8.KV_TX_BYTES_PER_WARP, cfg8.KV_FULL_ARRIVERS) == (20, 96, 4096, 8)
+    # S_q 2 at 24/2: the same rendering with a 24-row Q box; the per-row record is untouched
+    cfg2, _ = make_cfg_d256_sparse(TemplateParams(qh_per_kh=12, qsa_block_topk=UNION_W, qsa_union_rows=2, **base))
+    assert (cfg2.N_Q, cfg2.Q_BOX_ROWS, cfg2.Q_TX_BYTES, cfg2.SMEM_TOTAL_BYTES) == (48, 24, 12288, 224064)
+    pr, _ = make_cfg_d256_sparse(TemplateParams(qh_per_kh=12, qsa_block_topk=512, dtype_qkv=2, cta_mma=1, pack_gqa=True, qsa_block_size=4))
+    assert (pr.N_Q, pr.STAGES_KV, pr.KV_HALVES, pr.TOTAL_WARPS, pr.ENTRY_REGS, pr.SMEM_TOTAL_BYTES, pr.UNION_ROWS, pr.P_ATOMS, pr.SOFTMAX_PASSES) == (
+        16,
+        3,
+        1,
+        20,
+        96,
+        226688,
+        0,
+        1,
+        1,
+    )
+    for bad in (
+        dict(qsa_union_rows=1),
+        dict(qsa_union_rows=4, qh_per_kh=16),
+        dict(qsa_union_rows=4, bottom_right=False),
+        dict(qsa_union_rows=4, qsa_block_topk=512),
+        dict(qsa_union_rows=4, thd_varlen=True),
+    ):
+        kw = dict(qh_per_kh=12, qsa_block_topk=UNION_W, dtype_qkv=2, cta_mma=1, pack_gqa=True, qsa_block_size=4, bottom_right=True)
+        kw.update(bad)
+        with pytest.raises(ValueError):
+            make_cfg_d256_sparse(TemplateParams(**kw))
+
+
+def test_union_kernel_source_pins():
+    """U8 (host): the union arm's conventions in the source -- every union term a ``const_expr`` fold of the module constant UNION_ROWS (the per-row
+    body traces its program), the ONE bounds helper carrying the last-row anchor and the 0..2 tail ids, the word's block field by an arithmetic
+    shift in the gather quad and the softmax lane, the per-row visibility nibble spread through span words (bit words, one select per cell),
+    ``accumulate=True`` on the second BMM1 half, one ``mb_kv_empty`` commit per half-stage, the P^T atom arithmetic, the running state in TMEM
+    (ML_OFF) with the first-tile SELECT, the LOAD wait before the ``mb_s_empty`` arrive after the LAST pass, the per-column store predicate, no
+    new barrier / SmemTile."""
+    code = _code(_kernel_source())
+    for name in (
+        "UNION_ROWS = CFG.UNION_ROWS",
+        "KV_HALVES = CFG.KV_HALVES",
+        "SOFTMAX_PASSES = CFG.SOFTMAX_PASSES",
+        "PASS_COLS = CFG.PASS_COLS",
+        "P_ATOMS = CFG.P_ATOMS",
+        "ML_OFF = CFG.ML_OFF",
+    ):
+        assert name in code, name
+    assert code.count("cutlass.const_expr(UNION_ROWS > 0)") >= 14, "every union term folds on the module constant"
+    i_ib = code.index("def _item_bounds(")
+    ib = code[i_ib : code.index("\ndef ", i_ib + 1)]
+    for frag in (
+        "pos_last = pos + cutlass.Int32(UNION_ROWS - 1)",
+        "n_sel_default = cute.math.min(cutlass.Int32(BLOCK_TOPK), n_last // bs)",
+        "n_tail = cute.math.max((n_last + bs - one) // bs - tail_lo, zero)",
+        "dead = (pos_last < zero) | (eff_seqlen_kv <= zero) | (n_listed == zero)",
+    ):
+        assert frag in ib, frag
+    assert (
+        "loaded = loaded >> cutlass.Int32(UNION_WORD_SHIFT)" in code
+        and "_block_id_at(idx, word >> cutlass.Int32(UNION_WORD_SHIFT), count, n_tail, tail_lo, dead)" in code
+    )
+    assert "member_j = open_j if is_tail else listed_j" in code and "keep = keep | _select_i32(v_j, spans[j], 0)" in code
+    assert "bit = cutlass.Boolean(keep & cutlass.Int32(1 << (c0 + jj)))" in code, "one bit test + one select per cell"
+    assert (
+        "accumulate=True" in code and "sQ[q_idx].shifted(h * Q_ISSUE_SUBTILES * N_Q * GRANU_ELEMS).desc()" in code
+    ), "the second K half accumulates onto the first"
+    assert (
+        code.count("bars.mb_kv_empty[kv_state.idx].arrive(cta_group=1, pred=") == 3
+    ), "one commit per half-stage in BMM1 (the helper) and BMM2 (per d-block, the per-row body's)"
+    assert "LEADING_BYTE_OFFSET_P = TILE_N * CFG.P_SWZ_BYTES if P_ATOMS > 1 else 0" in code and "leading_byte_offset=LEADING_BYTE_OFFSET_P" in code
+    assert "atom = chunk_q // cutlass.Int32(P_CHUNKS_PER_ATOM)" in code
+    assert "m_old_j = _select_f32(first_tile, NEG_INF, cutlass.Float32(m_ld[jj]))" in code, "the first tile's running state is a SELECT over the TMEM residue"
+    assert code.count('nvvm.tcgen05_st("32x32b", m_ptr') == 1 and code.count('nvvm.tcgen05_st("32x32b", l_ptr') == 1
+    i_ld = code.index('s_raw = nvvm.tcgen05_ld("32x32b"')
+    i_wait = code.index("nvvm.tcgen05_wait(kind=nvvm.Tcgen05Wait.LOAD)", i_ld)
+    i_arr = code.index("bars.mb_s_empty[par].arrive()", i_ld)
+    assert i_ld < i_wait < i_arr and "if cutlass.const_expr(p == SOFTMAX_PASSES - 1):" in code[i_wait:i_arr]
+    assert "col_live.append(cutlass.Int32(c0 + jj) < n_live_cols)" in code
+    assert "grid_shape = (SPLIT_KV, KH, B)" in code
+    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4
+
+
+def test_union_rendering_trace_compile_is_spill_free(tmp_path):
+    """U8 (host, sm_107a trace-compile): the default union rendering (24/2 x S_q 4, bf16, split 4, 16 warps) carries no spill (STL 0 / LDL 0 within
+    the toolchain tolerance), no ``setmaxnreg`` (the flat count is the gate) and the bit-word mask (R2P > 0) -- the register arbitration,
+    re-run on every change of the body.  Skips without the arch in the DSL or an nvdisasm that decodes it."""
+    import cudnn.sdpa.fwd.config_sm107 as c107
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    cands = nvdisasm_candidates()
+    if not cands:
+        pytest.skip("no nvdisasm executable to try")
+    kernel = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
+    probe = textwrap.dedent("""
+        import glob, hashlib, os, re, subprocess, sys
+        dump, cands = sys.argv[1], sys.argv[2:]
+        os.environ["CUTE_DSL_DUMP_DIR"] = dump
+        os.environ["CUTE_DSL_KEEP"] = "cubin"
+        os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+        os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+        from cudnn.frost.template_loader import load_template
+        from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+        import cudnn.sdpa.fwd.config_sm107 as c107
+        params = TemplateParams(dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=2048, qsa_block_size=4, bottom_right=True, qsa_union_rows=4, split_kv=4, seq_kv_lens_present=True)
+        path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
+        mod = load_template(path, params, tag="union_probe")
+        print("WARPS", mod.CFG.TOTAL_WARPS, "ENTRY", mod.CFG.ENTRY_REGS)
+        getattr(mod.compile, "__wrapped__", mod.compile)(has_lse=True, has_block_lens=True)
+        cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+        if not cubins:
+            print("FAIL no cubin"); sys.exit(3)
+        for c in cands:
+            proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+            if proc.returncode == 0 and proc.stdout.strip():
+                sass = proc.stdout.splitlines()
+                for key in ("STL", "LDL", "USETMAXREG", " R2P "):
+                    print("SASS", key.strip(), sum(1 for ln in sass if key in ln))
+                sys.exit(0)
+        print("SKIP no nvdisasm decodes the cubin")
+        """)
+    dump = tmp_path / "union_sm107a"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", probe, str(dump), *cands], capture_output=True, text=True, timeout=1500)
+    assert proc.returncode == 0, f"the union rendering's sm_107a trace-compile failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    out = proc.stdout.splitlines()
+    if any(ln.startswith("SKIP") for ln in out):
+        pytest.skip(str([ln for ln in out if ln.startswith("SKIP")]))
+    stats = {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
+    print(f"\nunion rendering sm_107a: {[ln for ln in out if ln.startswith('WARPS')]} SASS {stats}")
+    assert_no_new_spills(stats, {"STL": 0, "LDL": 0}, "union rendering: ")
+    assert stats["USETMAXREG"] == 0 and stats["R2P"] > 0
