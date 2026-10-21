@@ -57,6 +57,16 @@ two launches bitwise:
   (the shared list BITWISE the per-token form fed with the replicated step-0 list + the completed block appended explicitly);
   the boundary decline at ``S_q = 5``.
 
+* the e4m3 K / V arm (``kv_cache_dtype=torch.float8_e4m3fn`` with ``k_scale`` / ``v_scale``, 2026-10-21; the kernel's in-kernel dequant
+  arm over PAGED pools under a bf16 Q): at a POWER-OF-TWO scale (1.0 included) the arm is BITWISE the bf16 kernel fed the bf16 pools of
+  ``bf16(code x scale)`` -- O and LSE, the shared and the per-row list forms, splits 1 / 4 / 17, the gate in the epilogue and in the
+  combine, HND / NHD, pages 16 / 64, ``block_lens`` given / absent, dead sequences, -1 pages and straddling blocks -- and within the
+  budget vs the fp32 oracle on the dequantized pool; at a GENERIC scale within the budget vs that oracle (the distance to the bf16-pool
+  reference reported, never gated); read cells past the length poisoned with the finite e4m3 sentinel 0x7E (448) leave the output
+  unchanged; the host declines by name (the dense arm, an f16 Q, the pool dtype both ways, the scales both ways, the 16-byte rule in
+  e4m3 elements); every bf16 rendering's cubin is byte-identical to the committed pre-arm record (``renderings/md5_fwd_sparse_d256_kv_bf16_sm_107a.txt``)
+  and the e4m3 rendering's SASS carries half the gather4 issues, no new spills.
+
 Tolerances: atol 2e-2 on O and LSE, no rtol -- the sparse module's own budget, TIGHTER than the dense sm107 suite's O bar (atol
 5e-2 / rtol 3e-2) and equal to its LSE atol; nothing widened, nothing added.
 """
@@ -70,7 +80,8 @@ import sys
 import pytest
 import torch
 
-from frost_test_utils import requires_dsl, requires_rubin
+import cudnn
+from frost_test_utils import SPILL_TOLERANCE, requires_dsl, requires_rubin
 
 pytestmark = [pytest.mark.L0, requires_dsl]
 
@@ -124,6 +135,7 @@ def test_claims_record_agrees_with_the_config_wired_arms():
         "bottom_right": C.bottom_right,
         "list_per_sequence": C.index_list_per_sequence,
         "seq_q_lens": C.padded,
+        "kv_e4m3": cudnn.data_type.FP8_E4M3 in C.kv_cache_dtypes,  # the K / V storage dtype arm: e4m3 PAGED pools under a bf16 Q
     }
     for arm, claimed in pairs.items():
         assert claimed == (arm in SPARSE_D256_WIRED_ARMS), f"{arm}: record {claimed}, wired {arm in SPARSE_D256_WIRED_ARMS}"
@@ -804,7 +816,8 @@ def test_sparse_kernel_source_pins():
     # The per-TILE ring waits (the gather warps' kv_empty x 3; the MMA warp's kv_full x 3, s_empty x 2, p_full x 1; the softmax
     # warps' s_full and the in-loop bmm2_done) take the module constant; the per-ITEM waits (q_full, ids_full / ids_empty, the
     # epilogue's bmm2_done) and the exit drains keep the default form.
-    assert code.count("spin=SPIN_RING_WAITS") == 11, "every per-tile ring wait takes the module constant, nothing else"
+    # (+ the KV_E4M3 arm's per-(warp, stage) landing wait in _cast_kv_stage: 12 since 2026-10-21)
+    assert code.count("spin=SPIN_RING_WAITS") == 12, "every per-tile ring wait takes the module constant, nothing else"
     assert "SPIN_RING_WAITS: bool = False" in code
     # the LOAD wait orders the s_empty arrive after the S^T read (frost-kernels.md section 3)
     i_ld = code.index('s_raw = nvvm.tcgen05_ld("32x32b"')
@@ -939,7 +952,7 @@ def test_sparse_kernel_decode_form_source_pins():
     assert "P(cutlass.Float32) if SPLIT_KV > 1 else P(STORAGE_DTYPE)" in code
     assert 'raise ValueError("sparse_d256_f16: split_kv > 1 requires has_lse=True' in code
     # no new ring, tile or wait
-    assert code.count("MBarrier(_alloc(") == 13 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 11
+    assert code.count("MBarrier(_alloc(") == 14 and code.count("SmemTile(") == 4 and code.count("spin=SPIN_RING_WAITS") == 12
 
 
 # ============================================================================ the reference (torch; any device)
@@ -2249,18 +2262,22 @@ def test_sparse_kernel_gate_arm_source_pins():
     assert code.count("bars.mb_gate_empty.arrive()") == 1
     assert code.count("tma_load_tile(sQ[qg_idx], tma_gate(") == 1, "the gate lands in the item's own Q^T slot"
     assert "sGate" not in code and code.count("SmemTile(") == 4
-    assert code.count("spin=SPIN_RING_WAITS") == 11, "the gate waits are per-item waits on the default form"
+    assert code.count("spin=SPIN_RING_WAITS") == 12, "the gate waits are per-item waits on the default form"
     assert code.count("gate_epilogue_pairs(") == 1 and "gate_inv_sum(inv_j)" in code and code.count("gate_half_opaque()") == 1
     assert "_select_f32(dead_cols[j], ZERO, gated[j])" in code, "the dead-column SELECT per element, AFTER the gate fma"
     assert "GATE_TX_BYTES = CFG.GATE_TX_BYTES" in code and "n_bytes=Q_SLOT_BYTES" not in code and "n_bytes=6144" not in code
     i_sig = code.index("def _kernel(")
     sig = code[i_sig : code.index(") -> None:", i_sig)]
-    # the LAST RUNTIME parameter: a trailing ``cutlass.Constexpr`` (the programmatic-dependent-launch switch, a compile-time specialization
-    # the compiled call never carries) may follow it without moving any parameter offset
-    runtime_params = [ln for ln in sig.splitlines() if ln.strip() and "cutlass.Constexpr[" not in ln]
-    assert (
-        runtime_params[-1].strip() == "tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,"
-    ), "the gate descriptor is the LAST runtime kernel parameter"
+    # the gate descriptor was the LAST kernel parameter until the K / V storage dtype arm appended its two Optional scale tensors after it
+    # (2026-10-21): the gate keeps its position, the two new slots are None (dropped) on every bf16 rendering.  A trailing
+    # ``cutlass.Constexpr`` (the programmatic-dependent-launch switch, a compile-time specialization the compiled call never carries) sits
+    # between them without moving any RUNTIME parameter offset
+    runtime_params = [ln.strip() for ln in sig.splitlines() if ln.strip() and "cutlass.Constexpr[" not in ln]
+    assert runtime_params[-3:] == [
+        "tma_gate_desc: cutlass.GridConstant[tmap.TensorMap] = None,",
+        "k_scale_tensor: Optional[cute.Tensor] = None,",
+        "v_scale_tensor: Optional[cute.Tensor] = None,",
+    ], sig[-400:]
     # the ungated rendering keeps its drains; the gated one consumes mb_gate_empty in ORDER as well as in count: the exit-path wait
     # BEFORE the last item's gate (a parity wait two completions behind a single-stage barrier never returns), then x STAGES_GATE
     assert "cutlass.range_constexpr(CFG.STAGES_GATE + 1)" not in code, "the drain is STAGES_GATE deep once the exit path waits before the last gate"
@@ -2832,7 +2849,7 @@ def test_sparse_kernel_softmax_split_source_pins():
     assert code.count("for w in cutlass.range_constexpr(SOFTMAX_WARPS_PER_GROUP):") == 2, "a column max / sum combines ONE group's four warps"
     assert "for w in cutlass.range_constexpr(SOFTMAX_WARPS):" not in code
     assert "n_live_cols = (cutlass.Int32(Q_BOX_ROWS) - col0) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(Q_BOX_ROWS)" in code
-    assert code.count("spin=SPIN_RING_WAITS") == 11 and code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3 and code.count("SmemTile(") == 4
+    assert code.count("spin=SPIN_RING_WAITS") == 12 and code.count("cutlass.range(0, n_tiles, 1, unroll=1)") == 3 and code.count("SmemTile(") == 4
     assert (
         code.count("bars.mb_s_empty[par].arrive()") == 1
         and code.count("bars.mb_p_full[par].arrive()") == 1
@@ -3478,3 +3495,588 @@ def test_prefill_form_pdl_arm_is_bitwise_the_plain_arm(dtype):
     max_o, max_lse = _check([outs[True]], ref_o, ref_lse)
     _assert_bitwise(outs[True], outs[False], f"prefill {dtype} use_pdl vs plain")
     print(f"\nprefill pdl arm {dtype}: bitwise the plain arm; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f}")
+
+
+# ============================================================================ the e4m3 K / V arm (kv_cache_dtype=torch.float8_e4m3fn, 2026-10-21)
+_E4M3 = "torch.float8_e4m3fn"
+_E4M3_MAX = 448.0
+
+
+def _e4m3_paged_operands(B=1, S=1, H=24, KH=2, P=16, dtype="torch.bfloat16", top_k=512, hnd=True, scales=True, **over):
+    """The e4m3 arm's host stand-ins: the decode form's paged operands with e4m3 pools, the attribute and the two 1-element fp32 scales."""
+    o = _decode_operands(B=B, S=S, H=H, KH=KH, dtype=dtype, top_k=top_k, P=P, hnd=hnd)
+    pool = o["k"]
+    o.update(k=_T(pool.shape, pool.stride(), _E4M3), v=_T(pool.shape, pool.stride(), _E4M3), kv_cache_dtype=torch.float8_e4m3fn)
+    if scales:
+        o.update(k_scale=_T((1,), (1,), "torch.float32"), v_scale=_T((1,), (1,), "torch.float32"))
+    o.update(over)
+    return o
+
+
+@pytest.mark.parametrize("hnd", [True, False], ids=["HND", "NHD"])
+def test_adapter_accepts_e4m3_pools_and_builds_the_kv_dtype_params(hnd, sm107_host_target):
+    """The record claims FP8_E4M3 pools: a bf16 Q over e4m3 paged pools with the two scales is served, the template is the KV_E4M3
+    specialization (``TemplateParams.kv_dtype = 0``) over the same paged / decode arms, the pool geometry is derived in e4m3 ELEMENTS (an NHD
+    head stride of 256 elements = two 128-B boxes; the HND row terms unchanged), the config renders the arm (two 128-element boxes per row,
+    the 4 KiB per-warp landing bytes, the zone at bf16 box 2, the THREAD producer of mb_kv_full at the unchanged count 8, 24 landing
+    barriers, the SMEM total up by the misc reserve only); a bf16 declaration keeps ``kv_dtype = -1``."""
+    from cudnn.sdpa.fwd.config_sm107 import make_cfg_d256_sparse
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    a = SparseGqaFwdDslSm107(**_e4m3_paged_operands(B=2, S=1, hnd=hnd, split_kv=4))
+    assert a.check_support() is True and a.kv_e4m3
+    tp = a.template_params()
+    assert (tp.kv_dtype, tp.paged_kv, tp.bottom_right, tp.qsa_list_per_sequence, tp.split_kv, tp.dtype_qkv) == (0, True, True, True, 4, 2)
+    _num_pages, _mp, geom_k, geom_v = a._paged
+    s_page, s_head, s_tok, _ = _pool_strides(2, 16, hnd)
+    assert geom_k == geom_v == ((s_page, s_tok, 0, 2 * 16, 16) if hnd else (s_page, s_tok, D, 16, 0))
+    cfg, _ = make_cfg_d256_sparse(tp)
+    base, _ = make_cfg_d256_sparse(SparseGqaFwdDslSm107(**_decode_operands(B=2, S=1, P=16, hnd=hnd, split_kv=4)).template_params())
+    assert (cfg.KV_DTYPE, cfg.KV_E4M3, cfg.KV_BPE, cfg.GATHER_BOXES_KV, cfg.GATHER_BOX_ELEMS_KV, cfg.GATHERS_PER_WARP_PER_STAGE_KV) == (0, 1, 1, 2, 128, 8)
+    assert (cfg.KV8_TX_BYTES_PER_WARP, cfg.KV_E4M3_ZONE_BOX0, cfg.KV_FULL_PRODUCER, cfg.KV8_FULL_STAGES) == (4096, 2, 1, 24)
+    assert (cfg.KV_FULL_ARRIVERS, cfg.IDS_EMPTY_ARRIVERS, cfg.READ_TILE_ARRIVERS, cfg.SOFTMAX_LANES, cfg.TOTAL_WARPS, cfg.ENTRY_REGS) == (
+        base.KV_FULL_ARRIVERS,
+        base.IDS_EMPTY_ARRIVERS,
+        base.READ_TILE_ARRIVERS,
+        base.SOFTMAX_LANES,
+        base.TOTAL_WARPS,
+        base.ENTRY_REGS,
+    ), "the arm changes no init count, no warp, no register split"
+    assert (
+        cfg.SMEM_TOTAL_BYTES == base.SMEM_TOTAL_BYTES + 256
+        and cfg.SMEM_CARVEOUT_BYTES == base.SMEM_CARVEOUT_BYTES
+        and cfg.DESC_VERSION == base.DESC_VERSION == 0
+    )
+    assert (base.KV_DTYPE, base.KV_E4M3, base.KV8_FULL_STAGES, base.KV_FULL_PRODUCER) == (-1, 0, 0, 0)
+    assert SparseGqaFwdDslSm107(**_decode_operands(B=2, S=1, P=16)).template_params().kv_dtype == -1
+
+
+@pytest.mark.parametrize(
+    "mutate, exc, word",
+    [
+        # the arm's own declines: paged pools only, a bf16 Q only, the vocabulary
+        (
+            lambda o: (o.clear(), o.update(**_decode_operands(B=1, S=1), kv_cache_dtype=torch.float8_e4m3fn)),
+            NotImplementedError,
+            "PAGED pools only",
+        ),  # the attribute on a DENSE declaration (bf16 K / V): the paged-only decline speaks before the pool dtype
+        (lambda o: o.update(**_e4m3_paged_operands(dtype="torch.float16")), NotImplementedError, "needs a bf16 Q"),
+        (lambda o: o.update(kv_cache_dtype=torch.float16), NotImplementedError, "kv_cache_dtype must be None"),
+        # the pool dtype both ways
+        (lambda o: o.update(k=_paged_operands(S=1)["k"], v=_paged_operands(S=1)["v"]), ValueError, "K dtype torch.bfloat16 must be torch.float8_e4m3fn"),
+        (lambda o: o.update(kv_cache_dtype=None, k_scale=None, v_scale=None), ValueError, "K dtype torch.float8_e4m3fn must equal Q's"),
+        # the scales both ways and their form
+        (lambda o: o.update(k_scale=None), ValueError, "needs k_scale"),
+        (lambda o: o.update(v_scale=None), ValueError, "needs v_scale"),
+        (lambda o: o.update(k_scale=_T((1,), (1,), "torch.bfloat16")), ValueError, "k_scale must be a 1-element fp32 tensor"),
+        (lambda o: o.update(v_scale=_T((2,), (1,), "torch.float32")), ValueError, "v_scale must be a 1-element fp32 tensor"),
+        (
+            lambda o: (
+                o.clear(),
+                o.update(**_decode_operands(B=1, S=1, P=16), k_scale=_T((1,), (1,), "torch.float32"), v_scale=_T((1,), (1,), "torch.float32")),
+            ),
+            ValueError,
+            "refused rather than silently ignored",
+        ),  # the scales on a bf16-pool declaration
+        # the 16-byte rule in e4m3 ELEMENTS: a token stride of 8 e4m3 elements (8 B) is refused, 16 serves (the bf16 rule's 8 elements = 16 B)
+        (
+            lambda o: o.update(
+                k=_T((6, 2, 16, D), (2 * 16 * (D + 8), 16 * (D + 8), D + 8, 1), _E4M3), v=_T((6, 2, 16, D), (2 * 16 * (D + 8), 16 * (D + 8), D + 8, 1), _E4M3)
+            ),
+            ValueError,
+            "multiple of 16 elements (TMA's 16-byte rule in torch.float8_e4m3fn elements)",
+        ),
+        # an NHD head stride that is a 64-element bf16 box start but not a 128-element e4m3 one
+        (
+            lambda o: o.update(k=_T((6, 2, 16, D), (16 * 2 * D, 64, 2 * D, 1), _E4M3), v=_T((6, 2, 16, D), (16 * 2 * D, 64, 2 * D, 1), _E4M3)),
+            ValueError,
+            "multiple of 128 elements",
+        ),
+    ],
+)
+def test_adapter_declines_every_unserved_e4m3_request_by_name(mutate, exc, word, sm107_host_target):
+    """Every row of the e4m3 arm's contract is a typed decline naming the feature or the operand (Rule 1, both directions: the attribute
+    without e4m3 pools, e4m3 pools without the attribute, the scales missing with it and given without it); nothing falls through."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    o = _e4m3_paged_operands(B=1, S=1)
+    mutate(o)
+    with pytest.raises(exc, match=re.escape(word)):
+        SparseGqaFwdDslSm107(**o).check_support()
+    # the serving-stride twin: a token stride of 16 e4m3 elements (16 B) and an NHD head stride of 128 elements serve
+    ok = _e4m3_paged_operands(B=1, S=1)
+    ok.update(k=_T((6, 2, 16, D), (16 * (2 * D + 16), D, 2 * D + 16, 1), _E4M3), v=_T((6, 2, 16, D), (16 * (2 * D + 16), D, 2 * D + 16, 1), _E4M3))
+    assert SparseGqaFwdDslSm107(**ok).check_support() is True
+
+
+def test_config_kv_dtype_arm_and_every_dense_factory_rejects_it():
+    """``TemplateParams.kv_dtype`` (appended, default -1): the sparse factory renders the arm at 0 over paged bf16 records and declines f16
+    activations, the dense K / V operands and any other value by name; every DENSE factory's shared validator -- the SM100 line's, the Rubin
+    line's and the d256 decode tile's -- rejects a set value naming the sparse flavor (a dense template would read e4m3 codes as bf16 bit
+    patterns); the record's tail stays append-only (``kv_dtype`` after ``q_in_tmem``)."""
+    import dataclasses
+
+    import cudnn.sdpa.fwd.config_sm100 as c100
+    import cudnn.sdpa.fwd.config_sm107 as c107
+    from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+
+    assert [f.name for f in dataclasses.fields(TemplateParams)][-2:] == ["q_in_tmem", "kv_dtype"] and TemplateParams().kv_dtype == -1
+    base = dict(
+        dtype_qkv=2, cta_mma=1, pack_gqa=True, qh_per_kh=12, qsa_block_topk=512, qsa_block_size=4, paged_kv=True, page_size=16, seq_kv_lens_present=True
+    )
+    cfg, _ = c107.make_cfg_d256_sparse(TemplateParams(**base, kv_dtype=0))
+    assert (
+        cfg.KV_E4M3 == 1
+        and cfg.GATHER_BOXES_KV * cfg.GATHER_BOX_ELEMS_KV == cfg.TILE_K
+        and cfg.KV8_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES // 2
+    )
+    assert cfg.KV_E4M3_ZONE_BOX0 * cfg.TILE_N * 128 == cfg.KV_STAGE_BYTES // 2 and "kv_e4m3" in c107.SPARSE_D256_WIRED_ARMS
+    with pytest.raises(ValueError, match="serves bf16 activations only"):
+        c107.make_cfg_d256_sparse(TemplateParams(**dict(base, dtype_qkv=3), kv_dtype=0))
+    with pytest.raises(ValueError, match="serves the PAGED pools only"):
+        c107.make_cfg_d256_sparse(TemplateParams(**dict(base, paged_kv=False, page_size=0), kv_dtype=0))
+    with pytest.raises(ValueError, match="kv_dtype must be -1"):
+        c107.make_cfg_d256_sparse(TemplateParams(**base, kv_dtype=1))
+    for what, trip in (
+        ("sm100 _validate_params", lambda: c100._validate_params("d128", TemplateParams(dtype_qkv=2, kv_dtype=0))),
+        ("sm107 _validate_params", lambda: c107._validate_params("sm107 d256", TemplateParams(dtype_qkv=2, kv_dtype=0))),
+        ("d256 decode", lambda: c100.make_cfg_d256_decode(TemplateParams(dtype_qkv=2, cta_mma=1, decode_q_tile=16, kv_dtype=0))),
+        ("sm100 d128", lambda: c100.make_cfg_d128(TemplateParams(dtype_qkv=2, cta_mma=2, kv_dtype=0))),
+        ("sm107 d256", lambda: c107.make_cfg_d256(TemplateParams(dtype_qkv=2, cta_mma=1, kv_dtype=0))),
+        ("sm107 d128", lambda: c107.make_cfg_d128(TemplateParams(dtype_qkv=2, cta_mma=2, kv_dtype=0))),
+    ):
+        with pytest.raises(ValueError, match="is the index-list sparse flavor's"):
+            trip()
+
+
+def test_sparse_kernel_kv_e4m3_arm_source_pins():
+    """The arm's shape in the source (no GPU): ONE landing ring (``mb_kv8_full``, TMA_LOAD, ONE_LANE, every stage initialised in the elected
+    block), ``mb_kv_full``'s producer kind read off the config at the UNCHANGED count, the arming helper the one site that arms a load (both
+    arms), the cast helper's order -- the landing wait, pass A, a warp sync, pass B's loads, a warp sync, its stores, the proxy fence, a warp
+    sync, the elected THREAD arrive (a branch: THREAD has no ``pred=`` path) --, every cast site advancing ``cast_state`` by STAGES_KV (three
+    sites: after the in-loop K issue, after the V issue, after the loop), the fold sites (k_scale once in the prologue into the scale, v_scale
+    into the normaliser before the dead-row SELECT), the converts exact (no multiply in the cast asm), the swizzle shared with the P^T store's
+    helpers (never a hand XOR), the two scale tensors / pointers Optional-None, the gather map in the K / V storage dtype."""
+    code = _code(_kernel_source())
+    assert (
+        "mb_kv8_full=kv8_full" in code
+        and "kv8_full = MBarrier(_alloc(KV8_FULL_STAGES), stages=KV8_FULL_STAGES, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if KV_E4M3 else None"
+        in code
+    )
+    assert "kv_full_producer = Producer.THREAD if CFG.KV_FULL_PRODUCER else Producer.TMA_LOAD" in code
+    assert "init_count=CFG.KV_FULL_ARRIVERS, producer=kv_full_producer" in code
+    assert "for s in cutlass.range_constexpr(KV8_FULL_STAGES):\n                    bars.mb_kv8_full[s].init()" in code
+    assert code.count("kv_mbar = _arm_kv_load(bars, w, kv_state.idx)") == 3 and "n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync()" in code
+    assert code.count("bars.mb_kv_full[kv_state.idx].arrive(n_bytes=") == 0, "the bf16 arm arms its load through the one helper"
+    assert code.count("_cast_kv_stage(sKV_raw, bars, w, lane, cast_state.idx, cast_state.phase)") == 3
+    assert code.count("cast_state = advance(cast_state, STAGES_KV)") == 3 and "cast_state = PipelineState.start(phase=0)" in code
+    body = code[code.index("def _cast_kv_stage(") : code.index("\ndef _gather_warp_group(")]
+    order = [
+        "bars.mb_kv8_full[w * cutlass.Int32(STAGES_KV) + stage_idx].wait(phase, spin=SPIN_RING_WAITS)",
+        "src_box0, row, c8).load_swizzled(_KV_SMEM_SWIZZLE, alignment=16, count=4)",
+        "nvvm.bar_warp_sync(cute.arch.FULL_MASK)",
+        "src_box1, row, c8).load_swizzled(_KV_SMEM_SWIZZLE, alignment=16, count=4)",
+        "nvvm.bar_warp_sync(cute.arch.FULL_MASK)",
+        "_kv8_expand_store(sKV_raw, stage_off, cutlass.Int32(KV_E4M3_ZONE_BOX0) + dst_box_in_pair",
+        'nvvm.fence_proxy("async.shared", space="cta")',
+        "nvvm.bar_warp_sync(cute.arch.FULL_MASK)",
+        "if nvvm.elect_sync():\n        bars.mb_kv_full[stage_idx].arrive()",
+    ]
+    pos = -1
+    for frag in order:
+        nxt = body.index(frag, pos + 1)
+        assert nxt > pos, frag
+        pos = nxt
+    # the inter-pass sync, pass B's per-group sync (inside its range_constexpr: one site, four groups traced) and the publish sync
+    assert body.count("nvvm.bar_warp_sync(cute.arch.FULL_MASK)") == 3 and body.count('nvvm.fence_proxy("async.shared", space="cta")') == 1
+    pass_b = body[body.index("src_box1, row, c8).load_swizzled") : body.index('nvvm.fence_proxy("async.shared", space="cta")')]
+    assert pass_b.index("nvvm.bar_warp_sync(cute.arch.FULL_MASK)") < pass_b.index("_kv8_expand_store("), "pass B syncs between a group's loads and its stores"
+    asm = code[code.index("def _e4m3x16_to_bf16x16(") : code.index("\ndef _kv8_chunk_ptr(")].split("nvvm.inline_ptx(")[1]
+    assert "mul" not in asm, "the cast is exact: no multiply"
+    assert asm.count("cvt.rn.bf16x2.e4m3x2") == 8 and "cvt.rn.bf16x2.f32" not in asm, "eight exact converts per 16-B chunk, no re-rounding"
+    assert "store_swizzled(wa, _KV_SMEM_SWIZZLE, alignment=16)" in code and "_KV_SMEM_SWIZZLE = cutlass.Swizzle(_SWZ_BITS[CFG.K_SWZ_BYTES], 4, 3)" in code
+    assert "^ cutlass.Int32(j & _GATE_SWZ_ROW_MASK)" in code and code.count(" ^ ") == 1, "the only hand XOR is the gate read's (pre-existing)"
+    assert "scale_log2_kv = scale_log2 * k_scale" in code and "* scale_log2_kv, NEG_INF" in code and "* scale_log2, NEG_INF" not in code
+    i_inv = code.index("inv_j = ONE / cute.math.max(l_tot, TINY)")
+    assert code.index("inv_j = inv_j * v_scale", i_inv) < code.index("lse_j = _select_f32(row_dead, NEG_INF, lse_j)", i_inv)
+    assert "k_scale_tensor: Optional[cute.Tensor] = None" in code and "k_scale_ptr: Optional[cute.Pointer] = None" in code
+    assert "P(cutlass.Float32, 4) if KV_E4M3 else None" in code and "dtype=KV_STORAGE_DTYPE" in code and "box_dims=(GATHER_BOX_ELEMS_KV, 1)" in code
+    assert "(k_scale_ptr is not None) != KV_E4M3" in code
+    assert "col_base + cutlass.Int32(b * GATHER_BOX_ELEMS_KV)" in code and "(KV_E4M3_ZONE_BOX0 + b) * SUB_BOX_ELEMS" in code
+
+
+# --- the bf16 renderings' md5 pin and the e4m3 rendering's SASS pins (host sm_107a trace-compiles)
+_RENDERINGS = os.path.join(_HERE, "renderings")
+_KV_RECORD = os.path.join(_RENDERINGS, "md5_fwd_sparse_d256_kv_bf16_sm_107a.txt")
+_RENDER_ARMS = {
+    "dense_bf16_g12": dict(dtype_qkv=2, qh_per_kh=12),
+    "dense_f16_g16": dict(dtype_qkv=3, qh_per_kh=16),
+    "one_group_bf16": dict(dtype_qkv=2, qh_per_kh=12, qsa_softmax_groups=1),
+    "paged16_bf16": dict(dtype_qkv=2, qh_per_kh=12, paged_kv=True, page_size=16, seq_kv_lens_present=True),
+    "thd_bf16": dict(dtype_qkv=2, qh_per_kh=12, thd_varlen=True, seq_kv_lens_present=True),
+    "decode_paged16_shared_split4": dict(
+        dtype_qkv=2, qh_per_kh=12, paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True, split_kv=4
+    ),
+    "decode_paged16_shared_gated": dict(
+        dtype_qkv=2, qh_per_kh=12, paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, qsa_list_per_sequence=True, epilogue_gate=True
+    ),
+    "decode_paged64_per_row_split2": dict(dtype_qkv=2, qh_per_kh=12, paged_kv=True, page_size=64, seq_kv_lens_present=True, bottom_right=True, split_kv=2),
+}
+_E4M3_RENDER_ARMS = {
+    "e4m3_decode_paged16_shared_split4": dict(_RENDER_ARMS["decode_paged16_shared_split4"], kv_dtype=0),
+    "e4m3_decode_paged16_per_row_gated": dict(
+        dtype_qkv=2, qh_per_kh=12, paged_kv=True, page_size=16, seq_kv_lens_present=True, bottom_right=True, epilogue_gate=True, kv_dtype=0
+    ),
+}
+_RENDER_BASE = dict(cta_mma=1, pack_gqa=True, qsa_block_topk=512, qsa_block_size=4)
+_RENDER_BODY = r"""
+import glob, hashlib, json, os, re, subprocess, sys
+dump, params_json, cands = sys.argv[1], sys.argv[2], sys.argv[3:]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump
+os.environ["CUTE_DSL_KEEP"] = "cubin"
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+from cudnn.sdpa.fwd.config_sm100 import TemplateParams
+from cudnn.frost.template_loader import load_template
+import cudnn.sdpa.fwd.config_sm107 as c107
+params = TemplateParams(**json.loads(params_json))
+path = os.path.join(os.path.dirname(os.path.abspath(c107.__file__)), "kernels", "sm107", "sparse_d256_f16.py")
+mod = load_template(path, params, tag="sdpa_fwd_sm107_sparse_d256_render_pin")
+print("KV_E4M3", int(mod.CFG.KV_E4M3))
+mod.compile(has_lse=True, has_block_lens=True)
+cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+if not cubins:
+    print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+sass = None
+for c in cands:
+    try:
+        proc = subprocess.run([c, "-c", cubins[-1]], capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.SubprocessError):
+        continue
+    if proc.returncode == 0 and proc.stdout.strip():
+        sass = proc.stdout.splitlines(); break
+if sass is None:
+    print("NOSASS"); sys.exit(0)
+def cnt(*subs):
+    return sum(1 for ln in sass if all(sb in ln for sb in subs))
+for key, subs in (("GATHER4", ("UTMALDG", "GATHER4")), ("STL", (" STL",)), ("LDL", (" LDL",)), ("USETMAXREG", ("USETMAXREG",)), ("E4M3", ("E4M3",))):
+    print("SASS", key, cnt(*subs))
+"""
+
+
+def _kv_record():
+    assert os.path.isfile(_KV_RECORD), _KV_RECORD
+    dsl, want = None, {}
+    for ln in open(_KV_RECORD).read().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"sparse_d256_f16 sm_107a (\S+) rc=0 cubin_md5=([0-9a-f]{32}) GATHER4=(\d+) STL=(\d+) LDL=(\d+) USETMAXREG=(\d+)", ln)
+        if m:
+            want[m.group(1)] = dict(md5=m.group(2), GATHER4=int(m.group(3)), STL=int(m.group(4)), LDL=int(m.group(5)), USETMAXREG=int(m.group(6)))
+    return dsl, want
+
+
+def _render(tmp_path, arm: str, params: dict):
+    """One fresh sm_107a trace-compile of the sparse kernel's rendering ``params`` (the cubin kept, the compiled-plan cache off); returns
+    ``(cubin md5, SASS counts or None, KV_E4M3)``.  Skips when the DSL has no sm_107a target."""
+    import json
+    import subprocess
+
+    from frost_test_utils import arch_known_to_the_dsl, nvdisasm_candidates
+
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a")
+    dump = tmp_path / f"render_{arm}"
+    dump.mkdir()
+    env = dict(os.environ)
+    proc = subprocess.run(
+        [sys.executable, "-c", _RENDER_BODY, str(dump), json.dumps(dict(_RENDER_BASE, **params)), *nvdisasm_candidates()],
+        capture_output=True,
+        text=True,
+        timeout=1500,
+        env=env,
+    )
+    assert proc.returncode == 0, f"sm_107a trace-compile of {arm} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    out = proc.stdout.splitlines()
+    md5 = next(ln.split()[1] for ln in out if ln.startswith("CUBIN_MD5 "))
+    kv = int(next(ln.split()[1] for ln in out if ln.startswith("KV_E4M3 ")))
+    counts = None if any(ln.startswith("NOSASS") for ln in out) else {ln.split()[1]: int(ln.split()[2]) for ln in out if ln.startswith("SASS ")}
+    print(f"\n{arm} sm_107a: cubin md5 {md5}, KV_E4M3 {kv}, SASS {counts}")
+    return md5, counts, kv
+
+
+def test_pre_e4m3_md5_record_is_committed_and_complete():
+    dsl, want = _kv_record()
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert set(want) == set(_RENDER_ARMS), (sorted(want), sorted(_RENDER_ARMS))
+    assert all(v["GATHER4"] == 48 for v in want.values()), "the bf16 renderings issue 16 gather4 per warp per operand stage at three sites"
+
+
+@pytest.mark.parametrize("arm", list(_RENDER_ARMS))
+def test_bf16_renderings_are_byte_identical_to_the_pre_e4m3_record(tmp_path, arm):
+    """Every bf16 rendering (dense bf16 / f16, one softmax group, paged, THD, the decode form split / gated / per-row) traces to a cubin
+    BYTE-IDENTICAL to the record written before the K / V storage dtype arm landed: every new kernel argument is ``Optional[...] = None``
+    on these renderings and every seam of the arm sits under a ``const_expr`` on the Cfg fields (frost-kernels.md section 6)."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    dsl, want = _kv_record()
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build, re-render the record")
+    md5, counts, kv = _render(tmp_path, arm, _RENDER_ARMS[arm])
+    assert kv == 0
+    assert md5 == want[arm]["md5"], f"{arm}: cubin md5 {md5} != the pre-arm record's {want[arm]['md5']} -- a bf16 rendering changed"
+
+
+@pytest.mark.parametrize("arm", list(_E4M3_RENDER_ARMS))
+def test_e4m3_rendering_sass_pins(tmp_path, arm):
+    """The KV_E4M3 rendering on sm_107a: HALF the gather4 issues of its bf16 twin (8 per warp per operand stage at the three issue sites: 24
+    UTMALDG GATHER4 against 48), the e4m3 -> bf16 converts present, the register split's USETMAXREG count unchanged (0: ptxas drops setmaxnreg on
+    this 20-warp body, the flat 96), and no new spills beyond the toolchain tolerance over the bf16 twin's count."""
+    dsl, want = _kv_record()
+    twin = want["decode_paged16_shared_split4" if "split4" in arm else "decode_paged16_shared_gated"]
+    md5, counts, kv = _render(tmp_path, arm, _E4M3_RENDER_ARMS[arm])
+    assert kv == 1 and md5 not in {v["md5"] for v in want.values()}
+    if counts is None:
+        pytest.skip("no nvdisasm decodes the sm_107a cubin on this host: the SASS pins are unverified here (the md5 and the compile stand)")
+    assert counts["GATHER4"] == 24 and twin["GATHER4"] == 48, counts
+    assert counts["E4M3"] > 0, "the e4m3 -> bf16 converts are absent from the SASS"
+    assert counts["USETMAXREG"] == twin["USETMAXREG"], counts
+    assert counts["STL"] <= twin["STL"] + SPILL_TOLERANCE and counts["LDL"] <= twin["LDL"] + SPILL_TOLERANCE, (counts, twin)
+
+
+# --- Rubin: the e4m3 arm against the bf16 kernel over the dequantized pool and the fp32 oracle
+def _quantize_e4m3(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """The write-through's chain as torch computes it: ``sat_e4m3(fp32(x) x fp32(1 / scale))`` (RN, saturating at 448)."""
+    inv = torch.reciprocal(torch.tensor([float(scale)], device=x.device, dtype=torch.float32))
+    return (x.float() * inv).clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+
+
+def _dequantize_e4m3(codes: torch.Tensor, scale: float) -> torch.Tensor:
+    """``bf16(fp32(code) x scale)`` -- EXACT at a power-of-two scale (3 mantissa bits inside bf16's 7, the exponent in range)."""
+    return (codes.float() * float(scale)).to(torch.bfloat16)
+
+
+def _e4m3_twin_pools(k, v, kv_lens, P, hnd, g, k_scale, v_scale, *, fill="nan", minus_one_tail=True):
+    """From dense bf16 ``k`` / ``v`` ``[B, SKV, KH, D]``: the e4m3 code pools under ``k_scale`` / ``v_scale`` and the bf16 pools holding the
+    DEQUANTIZED codes (``bf16(code x scale)``), both through the SAME shuffled table (one generator state per pagination), plus the
+    dequantized dense twins for the oracle.  ``fill``: the unwritten rows' value -- NaN (a gathered unwritten row would poison O) or a FINITE
+    e4m3 code (the 0x7E = 448 sentinel: a gathered unwritten row would move O)."""
+    seed = int(torch.randint(0, 2**31 - 1, (1,), generator=g, device=g.device))
+    k8, v8 = _quantize_e4m3(k, k_scale), _quantize_e4m3(v, v_scale)
+    kd, vd = _dequantize_e4m3(k8, k_scale), _dequantize_e4m3(v8, v_scale)
+    g8 = torch.Generator(device=k.device).manual_seed(seed)
+    g16 = torch.Generator(device=k.device).manual_seed(seed)
+    k8p, v8p, table8 = _paginate(k8, v8, kv_lens, P, hnd, "nan", g8, minus_one_tail=minus_one_tail)
+    k16p, v16p, table16 = _paginate(kd, vd, kv_lens, P, hnd, "nan", g16, minus_one_tail=minus_one_tail)
+    assert torch.equal(table8, table16)
+    if fill != "nan":
+        for pool in (k8p, v8p):
+            nanmask = torch.isnan(pool.float())
+            pool[nanmask] = torch.full((), float(fill), device=pool.device, dtype=torch.float32).to(torch.float8_e4m3fn)
+        for pool in (k16p, v16p):
+            nanmask = torch.isnan(pool.float())
+            pool[nanmask] = torch.full((), float(fill), device=pool.device, dtype=torch.bfloat16)
+    return (k8p, v8p, table8), (k16p, v16p, table16), kd, vd
+
+
+def _launch_kv_pools(q, pools, kv_lens, ids, lens, top_k, scale, P, *, scales=None, split=1, launches=2, gate=None, with_lse=True, list_per_sequence=True):
+    """Sentinel-filled O / LSE per launch through the adapter over paged pools (``pools`` = (k, v, table)): the bf16 arm, or -- ``scales`` =
+    (k_scale, v_scale) 1-element fp32 tensors -- the e4m3 arm (``kv_cache_dtype=torch.float8_e4m3fn``).  A split's workspace is sentinel-filled."""
+    from cudnn.sdpa.fwd.sparse_gqa_sm107 import SparseGqaFwdDslSm107
+
+    dev = q.device
+    B, S, H, _ = q.shape
+    seq_kv = torch.tensor(kv_lens, device=dev, dtype=torch.int32)
+    sent = _sentinel(q.dtype)
+    kw = dict(kv_cache_dtype=torch.float8_e4m3fn, k_scale=scales[0], v_scale=scales[1]) if scales is not None else {}
+    outs = []
+    for _ in range(launches):
+        o = torch.full((B, S, H, D), sent, device=dev, dtype=q.dtype)
+        lse = torch.full((B, H, S), sent, device=dev, dtype=torch.float32) if with_lse else None
+        a = SparseGqaFwdDslSm107(
+            q=q,
+            k=pools[0],
+            v=pools[1],
+            o=o,
+            lse=lse,
+            block_ids=ids,
+            block_lens=lens,
+            seq_kv_lens=seq_kv,
+            top_k=top_k,
+            scale=scale,
+            paged_kv=True,
+            page_size=P,
+            block_table=pools[2],
+            list_per_sequence=list_per_sequence,
+            bottom_right=True,
+            split_kv=split,
+            epilogue_gate=gate,
+            **kw,
+        )
+        assert a.check_support()
+        assert a.template_params().kv_dtype == (0 if scales is not None else -1)
+        a.compile()
+        ws = None
+        if split > 1:
+            ws = torch.full((a.scratch_workspace_bytes() // 4,), 1.5e30, device=dev, dtype=torch.float32)
+        a.execute(stream=_stream(), workspace=ws)
+        torch.cuda.synchronize()
+        outs.append((o, lse))
+    return outs
+
+
+def _e4m3_cell(*, B, SKV, kv_lens, S_q, k_scale, v_scale, P, hnd, split=1, per_row=False, gate=False, block_lens=True, seed=0, fill="nan", oracle=True):
+    """One e4m3 cell: the dequantized bf16 pools through the bf16 kernel and the code pools through the e4m3 arm on the same lists / table /
+    lengths; returns ``(e4m3 outs, bf16 outs, ref_o, ref_lse, dead rows)`` with the references the fp32 oracle on the DEQUANTIZED pool."""
+    dtype = torch.bfloat16
+    q, k, v, g = _inputs(B, S_q, 24, 2, dtype, seed, SKV=SKV)
+    dev = q.device
+    kvl = torch.tensor(kv_lens, device=dev, dtype=torch.long)
+    if per_row:
+        positions = (kvl[:, None] - S_q) + torch.arange(S_q, device=dev)[None, :]
+        ids, lens = _oracle().random_block_ids(positions, 512, BS, generator=g, kv_lens=kvl[:, None], shuffle=True)
+        ids, lens = ids.contiguous(), lens.contiguous()
+    else:
+        ids, lens = _decode_lists("shuffled", B, S_q, 512, kv_lens, g)
+    lens_arg = lens if block_lens else None
+    scale = 1.0 / math.sqrt(D)
+    pools8, pools16, kd, vd = _e4m3_twin_pools(k, v, kv_lens, P, hnd, g, k_scale, v_scale, fill=fill)
+    gate_t = (torch.randn(B, S_q, 24, D, device=dev, dtype=torch.float32, generator=g) * 2.0).to(dtype) if gate else None
+    scales = (torch.tensor([k_scale], device=dev, dtype=torch.float32), torch.tensor([v_scale], device=dev, dtype=torch.float32))
+    outs8 = _launch_kv_pools(q, pools8, kv_lens, ids, lens_arg, 512, scale, P, scales=scales, split=split, gate=gate_t, list_per_sequence=not per_row)
+    outs16 = _launch_kv_pools(q, pools16, kv_lens, ids, lens_arg, 512, scale, P, split=split, gate=gate_t, list_per_sequence=not per_row, launches=1)
+    ref_o = ref_lse = None
+    if oracle:
+        if per_row:
+            ref_o, ref_lse = _reference_rows(q, kd, vd, ids, lens_arg, positions, kv_lens, scale, 512)
+        else:
+            ref_o, ref_lse, _pv = _reference_decode(q, kd, vd, ids, lens_arg, kv_lens, scale, 512)
+        if gate:
+            ref_o = ref_o * torch.sigmoid(gate_t.float())
+    return outs8, outs16, ref_o, ref_lse
+
+
+def _reference_rows(q, k, v, ids, lens, positions, kv_lens, scale, top_k):
+    """The fp32 oracle at per-row positions (``bottom_right`` with per-token lists ``[B, S, top_k]``): natural-log LSE, dead rows exact."""
+    oracle = _oracle()
+    B, S, H, _ = q.shape
+    SKV, KH = k.shape[1], k.shape[2]
+    G = H // KH
+    dev = q.device
+    ref_o = torch.zeros(B, S, H, D, device=dev, dtype=torch.float32)
+    ref_lse = torch.full((B, H, S), float("-inf"), device=dev, dtype=torch.float32)
+    for b in range(B):
+        L = int(kv_lens[b])
+        allowed = oracle.qsa_visible_mask(ids[b], None if lens is None else lens[b], positions[b], L, SKV, BS, top_k=top_k)
+        for h in range(H):
+            sc = (q[b, :, h].float() @ k[b, :, h // G].float().t()) * scale
+            sc = sc.masked_fill(~allowed, float("-inf"))
+            rmax = sc.amax(dim=-1)
+            dead = torch.isinf(rmax) & (rmax < 0)
+            safe = torch.where(dead, torch.zeros_like(rmax), rmax)
+            p = torch.where(allowed, torch.exp(sc - safe[:, None]), torch.zeros_like(sc))
+            den = p.sum(dim=-1)
+            oc = (p @ v[b, :, h // G].float()) / torch.where(dead, torch.ones_like(den), den)[:, None]
+            ref_o[b, :, h] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+            ref_lse[b, h] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
+    return ref_o, ref_lse
+
+
+@requires_rubin
+@pytest.mark.parametrize(
+    "B, SKV, kv_lens, S_q, k_scale, v_scale, P, hnd, split, per_row, gate, block_lens",
+    [
+        pytest.param(1, 2052, [2052], 1, 1.0, 1.0, 16, True, 1, False, False, True, id="B1-S2052-shared-unsplit-p16-HND-scale-1-1"),
+        pytest.param(
+            4,
+            8192,
+            [8192, 2052, 4097, 7000],
+            1,
+            0.5,
+            2.0,
+            16,
+            True,
+            4,
+            False,
+            False,
+            False,
+            id="B4-S8K-shared-split4-p16-HND-scale-half-2-no-block-lens-straddle",
+        ),
+        pytest.param(4, 8192, [8192, 300, 2051, 4096], 4, 1.0, 1.0, 16, True, 1, False, True, True, id="B4-S8K-Sq4-shared-mtp-gated-epilogue-p16-HND"),
+        pytest.param(
+            1, 32768, [32768], 4, 2.0, 0.25, 64, False, 17, True, True, True, id="B1-S32K-Sq4-per-row-split17-gate-in-combine-p64-NHD-scale-2-quarter"
+        ),
+        pytest.param(4, 2052, [2052, 0, 2052, 1], 1, 1.0, 1.0, 16, True, 4, False, False, True, id="B4-S2052-dead-and-one-token-sequence-split4"),
+    ],
+)
+def test_e4m3_paged_pools_at_a_power_of_two_scale_are_bitwise_the_bf16_pools_of_the_dequantized_values(
+    B, SKV, kv_lens, S_q, k_scale, v_scale, P, hnd, split, per_row, gate, block_lens
+):
+    """The arm's strongest pin: with ``k_scale = 2^e`` / ``v_scale = 2^f`` (1.0 included -- the serving stacks' value for a checkpoint without
+    scales) the e4m3 arm's O and LSE are BITWISE the bf16 kernel's over pools holding ``bf16(code x scale)`` -- the shared and the per-row
+    list forms, splits 1 / 4 / 17 (17 = one tile per chunk), the gate in the epilogue (unsplit) and in the combine (split), HND page 16 and
+    NHD page 64, ``block_lens`` given / absent, a straddling open block (4097, 2051), -1 pages past the live ones, a dead (0) and a one-token
+    (1) sequence; both within the budget vs the fp32 oracle on the dequantized pool; two e4m3 launches bitwise.  fp32 scaling by a power of
+    two commutes with every rounding on the path (the fold multiplies the scale into ``scale_log2`` / ``inv_sum`` BEFORE the per-element
+    multiply, never a third per-element multiply), so any ordering slip of the in-place expansion -- a stale e4m3 byte, a mis-swizzled
+    chunk -- is a wrong bf16 value here, never a tolerance miss."""
+    outs8, outs16, ref_o, ref_lse = _e4m3_cell(
+        B=B,
+        SKV=SKV,
+        kv_lens=kv_lens,
+        S_q=S_q,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        P=P,
+        hnd=hnd,
+        split=split,
+        per_row=per_row,
+        gate=gate,
+        block_lens=block_lens,
+        seed=5,
+    )
+    max_o, max_lse = _check(outs8, ref_o, ref_lse)
+    _check(outs16, ref_o, ref_lse)
+    _assert_bitwise(outs8[0], outs16[0], f"e4m3 arm at scales ({k_scale}, {v_scale}) vs the bf16 kernel over bf16(code x scale)")
+    print(
+        f"\ne4m3 power-of-two B={B} S_kv={SKV} lens={kv_lens} S_q={S_q} scales=({k_scale}, {v_scale}) p{P} {'HND' if hnd else 'NHD'} split={split} "
+        f"{'per-row' if per_row else 'shared'} gate={gate}: BITWISE the bf16 kernel; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} vs the oracle; dead rows {int(torch.isinf(ref_lse).sum())}"
+    )
+
+
+@requires_rubin
+@pytest.mark.parametrize("k_scale, v_scale, split", [(0.37, 1.9, 1), (1.9, 0.37, 8)], ids=["scale-0.37-1.9-unsplit", "scale-1.9-0.37-split8"])
+def test_e4m3_paged_pools_at_a_generic_scale_match_the_fp32_oracle_on_the_dequantized_pool(k_scale, v_scale, split):
+    """At a generic scale the arm keeps K / V exact (the codes) and rounds the folded scale once in fp32 where the bf16 kernel over
+    ``bf16(code x scale)`` rounds every element to bf16 first: both are a bf16 Q over the dequantized pool within the budget vs the fp32 oracle
+    on it (nothing widened); the two kernels' mutual distance is REPORTED (one bf16 rounding of K / V per element), never a gate."""
+    outs8, outs16, ref_o, ref_lse = _e4m3_cell(
+        B=4, SKV=8192, kv_lens=[8192, 2052, 4097, 300], S_q=1, k_scale=k_scale, v_scale=v_scale, P=16, hnd=True, split=split, seed=6
+    )
+    max_o, max_lse = _check(outs8, ref_o, ref_lse)
+    live = ~torch.isinf(ref_lse)
+    d_o, d_lse = _max_diff(outs8[0][0], outs8[0][1], outs16[0][0], outs16[0][1], live)
+    print(
+        f"\ne4m3 generic scales=({k_scale}, {v_scale}) split={split}: max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} vs the oracle on the dequantized pool (budget {ATOL}); "
+        f"vs the bf16 kernel over bf16(code x scale): |dO| {d_o:.3e} |dLSE| {d_lse:.3e} (reported, no gate)"
+    )
+
+
+@requires_rubin
+def test_e4m3_poisoned_read_cells_past_the_length_follow_the_finite_sentinel_rule():
+    """Every unwritten pool cell -- the rows past ``kv_len`` inside a sequence's last live page (the open block's straddling rows at 2051 and
+    4097), the spare pages, the -1 pages -- holds the FINITE e4m3 sentinel 0x7E (448) in one run and NaN in another: both give BITWISE the same
+    O / LSE (the kernel takes row -1 for every row past the length: a gathered poisoned row would move O under 448 and poison it under NaN),
+    and both are bitwise the bf16 kernel's over the dequantized pools under the same fills.  (A NaN code that DID reach the MMA would behave as
+    a bf16 pool's NaN: the same zero-initialised-pool contract, sdpa-invariants.md section 1.)"""
+    kw = dict(B=4, SKV=8192, kv_lens=[8192, 2051, 4097, 300], S_q=1, k_scale=1.0, v_scale=1.0, P=16, hnd=True, split=2, seed=7)
+    outs8_nan, outs16_nan, ref_o, ref_lse = _e4m3_cell(fill="nan", **kw)
+    outs8_fin, outs16_fin, _, _ = _e4m3_cell(fill=_E4M3_MAX, oracle=False, **kw)
+    max_o, max_lse = _check(outs8_nan, ref_o, ref_lse)
+    _assert_bitwise(outs8_nan[0], outs8_fin[0], "e4m3 arm: NaN-filled vs 448-filled unwritten cells")
+    _assert_bitwise(outs8_nan[0], outs16_nan[0], "e4m3 arm vs the bf16 kernel (NaN fill)")
+    _assert_bitwise(outs8_fin[0], outs16_fin[0], "e4m3 arm vs the bf16 kernel (448 fill)")
+    print(f"\ne4m3 poisoned read cells: NaN fill == 448 fill == the bf16 kernel, bitwise; max|dO| {max_o:.5f} max|dLSE| {max_lse:.6f} vs the oracle")

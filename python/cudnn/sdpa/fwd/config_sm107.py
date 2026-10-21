@@ -1602,6 +1602,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, split_wired: bool = Fals
             f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} "
             f"select the index-list sparse kernel; the dense templates do not consume them"
         )
+    if getattr(k, "kv_dtype", -1) != -1:
+        # The K / V STORAGE dtype arm (e4m3 pools under a bf16 Q) belongs to sm107/sparse_d256_f16.py (make_cfg_d256_sparse); a dense
+        # template would read the pools as its activation dtype and silently multiply e4m3 codes as bf16 bit patterns.
+        raise ValueError(
+            f"{flavor}: kv_dtype={k.kv_dtype} (the K / V storage dtype arm) is the index-list sparse flavor's (sm107/sparse_d256_f16.py); the dense "
+            f"templates do not consume it"
+        )
     if k.epilogue_gate:
         if flavor not in _EPILOGUE_GATE_FLAVORS:
             raise ValueError(f"{flavor}: epilogue_gate is wired on {sorted(_EPILOGUE_GATE_FLAVORS)} only")
@@ -2863,6 +2870,10 @@ _SPARSE_AUX_WARPS = 4  # MMA, TMA-LDG, scheduler, spare: one complete warpgroup 
 _SPARSE_TOPK_MIN, _SPARSE_TOPK_MAX = 4, 512
 _SPARSE_IDS_SLOT_PAD_BYTES = 64  # 16 reserved words per staged list (unread in v1; keeps the slot a 16-B multiple at every top_k)
 _SPARSE_SMEM_MISC_BYTES = 512  # tmem_ptr 16 B + 15 mbarrier arrays (29 stages, 16-B padded) 272 B + the 2-slot payload ring 64 B = 352 B (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering), reserved as 512
+# The KV_E4M3 rendering adds ONE barrier ring -- the per-gather-warp fp8 landing barriers mb_kv8_full[GATHER_WARPS x STAGES_KV] (24 stages = 192 B,
+# 16-B padded 208 B) -- so its misc reserve grows by this much (512 -> 768 B; the only SMEM change of the arm: 226,688 -> 226,944 B, still under
+# the standard carveout).
+_SPARSE_SMEM_MISC_KV_E4M3_EXTRA_BYTES = 256
 # The S^T / P^T ring depth: the S^T TMEM slots (S_ACC_OFF), the sP buffers and the s_full / s_empty / p_full / bmm2_done rings are all
 # STAGES_S deep, and the column-max exchange scratch holds one slot per ring parity + the epilogue's lane sum.  The kernel reads the
 # depth ONCE (`STAGES_S = CFG.STAGES_S`) and spells it at every ring site -- never a literal 2 (frost-kernels.md section 6: a depth
@@ -2899,7 +2910,14 @@ _REG_FILE_PER_CTA = 65536
 # empty chunk is a dead item (one clamped tile, O = 0 / LSE = -inf = the combine's identity).  SPLIT_KV <= MAX_TILES_PER_ITEM (a
 # larger split has an empty chunk on EVERY item); never with the kernel's own EPILOGUE_GATE (the gate rides the combine) and never
 # under THD (the persistent claim-counter form has no split axis).
-SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right"})
+# "kv_e4m3" (2026-10-21): the K / V STORAGE dtype arm -- the paged pools hold e4m3 CODES under per-tensor fp32 DEscales; the gather warps land
+# the two 128-B e4m3 boxes of every row in the UPPER half of the same 64 KiB bf16 stage (8 gather4 per warp per operand stage instead of 16)
+# and expand their own 16 rows IN PLACE (cvt.rn.bf16x2.e4m3x2, exact; no scale in the cast) into the bf16 SW128 tile the two MMA descriptors
+# already read; k_scale folds into the softmax scale, v_scale into the normaliser (both read on device).  No SMEM growth beyond the misc
+# reserve, no new warp, no TMEM change; NO existing barrier's init count changes -- one ring of single-arrive TMA_LOAD landing barriers is
+# added (mb_kv8_full) and mb_kv_full's producer KIND flips to an elected THREAD arrive per gather warp at the same count.  bf16 activations
+# (dtype_qkv=2) and the paged pools only (TemplateParams.kv_dtype=0).
+SPARSE_D256_WIRED_ARMS: frozenset = frozenset({"paged_kv", "thd_varlen", "epilogue_gate", "split_kv", "list_per_sequence", "bottom_right", "kv_e4m3"})
 
 
 def sparse_entry_regs(total_warps: int) -> int:
@@ -3041,6 +3059,25 @@ class CfgD256Sparse:
     SOFTMAX_WARPS_PER_GROUP: int = _SPARSE_SOFTMAX_WARPS_PER_GROUP
     COLS_PER_GROUP: int = _SPARSE_N_Q
 
+    # --- the K / V STORAGE dtype arm (APPENDED 2026-10-21; TemplateParams.kv_dtype): KV_DTYPE -1 = the activation dtype (every field below
+    # its bf16 value, the kernel traces the program it traced before), 0 = e4m3 codes (KV_E4M3 = 1).  The gather map's element size KV_BPE,
+    # the per-row box count / box width in KV elements (GATHER_BOXES_KV x GATHER_BOX_ELEMS_KV == TILE_K), the gathers per warp per operand
+    # stage, the per-warp expect_tx of the fp8 landing barriers (KV8_TX_BYTES_PER_WARP: 8 x 512 B = 4 KiB under the arm, 0 otherwise), the bf16
+    # box index the e4m3 landing zone starts at (KV_E4M3_ZONE_BOX0 = 2: the UPPER half of the stage -- pinned 2 x 16 KiB == STAGE / 2 ==
+    # GATHER_BOXES_KV x 16 KiB), mb_kv_full's producer kind (KV_FULL_PRODUCER 0 = TMA_LOAD expect_tx per gather warp, 1 = one elected THREAD
+    # arrive per gather warp after its cast; the COUNT KV_FULL_ARRIVERS is unchanged) and the fp8 landing ring's stage count (KV8_FULL_STAGES =
+    # GATHER_WARPS x STAGES_KV under the arm, 0 otherwise).
+    KV_DTYPE: int = -1
+    KV_E4M3: int = 0
+    KV_BPE: int = 2
+    GATHER_BOXES_KV: int = 4
+    GATHER_BOX_ELEMS_KV: int = 64
+    GATHERS_PER_WARP_PER_STAGE_KV: int = 16
+    KV8_TX_BYTES_PER_WARP: int = 0
+    KV_E4M3_ZONE_BOX0: int = 0
+    KV_FULL_PRODUCER: int = 0
+    KV8_FULL_STAGES: int = 0
+
 
 def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
     """The sparse kernel's SMEM byte table as the allocator lays it out: declaration order = address order, the descriptor-read
@@ -3065,7 +3102,7 @@ def d256_sparse_smem_layout(cfg: CfgD256Sparse) -> dict:
         off + (cfg.STAGES_S + 1) * cfg.SOFTMAX_WARPS * cfg.COLS_PER_GROUP * 4
     )  # [slot][warp][column]: one slot per S ring parity + the epilogue's lane sum = 768 B at either group count
     starts["misc"] = off
-    off += _SPARSE_SMEM_MISC_BYTES
+    off += _SPARSE_SMEM_MISC_BYTES + (_SPARSE_SMEM_MISC_KV_E4M3_EXTRA_BYTES if getattr(cfg, "KV_E4M3", 0) else 0)  # + the fp8 landing ring's 24 mbarriers
     total = off
     if total <= SMEM_STANDARD_CARVEOUT_BYTES:
         carveout = SMEM_STANDARD_CARVEOUT_BYTES
@@ -3080,7 +3117,11 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
     st = lay["starts"]
     _check(
         [
-            (cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16), f"{flavor}: f16/bf16 inputs only (got DTYPE_QKV={cfg.DTYPE_QKV}); the gathered tile has no FP8 arm"),
+            (
+                cfg.DTYPE_QKV in (_DTYPE_BF16, _DTYPE_FP16),
+                f"{flavor}: f16/bf16 Q / P / O only (got DTYPE_QKV={cfg.DTYPE_QKV}); the K / V STORAGE may be e4m3 under KV_DTYPE=0 (the in-kernel dequant arm), "
+                f"the MMA operands stay f16 / bf16",
+            ),
             (cfg.DTYPE_O == cfg.DTYPE_QKV, f"{flavor}: half input requires DTYPE_O == DTYPE_QKV (got {cfg.DTYPE_O} vs {cfg.DTYPE_QKV})"),
             (cfg.BPE == 2 and cfg.BPE_O == 2 and cfg.GATE_BPE == 2, f"{flavor}: BPE / BPE_O / GATE_BPE are 2 on the half kernel"),
             (
@@ -3169,6 +3210,64 @@ def _validate_cfg_d256_sparse(cfg: CfgD256Sparse, flavor: str = _SPARSE_FLAVOR) 
             (
                 cfg.KV_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES == cfg.TILE_N * cfg.TILE_K * cfg.BPE,
                 f"{flavor}: the gather warps' expect_tx must sum to the 64 KiB stage ({cfg.KV_TX_BYTES_PER_WARP} x {cfg.GATHER_WARPS} vs {cfg.KV_STAGE_BYTES})",
+            ),
+            # the K / V STORAGE dtype arm (KV_E4M3): the e4m3 rows land as GATHER_BOXES_KV boxes of GATHER_BOX_ELEMS_KV e4m3 elements in the UPPER
+            # half of the stage and are expanded in place to the bf16 tile -- every coupling the kernel's addressing relies on, pinned
+            (
+                cfg.KV_DTYPE in (-1, 0) and cfg.KV_E4M3 == int(cfg.KV_DTYPE == 0),
+                f"{flavor}: KV_DTYPE is -1 (the activation dtype) or 0 (e4m3 codes) and KV_E4M3 follows it",
+            ),
+            (
+                not cfg.KV_E4M3 or cfg.DTYPE_QKV == _DTYPE_BF16,
+                f"{flavor}: the e4m3 K / V arm (KV_DTYPE=0) serves bf16 activations only (got DTYPE_QKV={cfg.DTYPE_QKV}); f16 activations over e4m3 pools are declined by name",
+            ),
+            (
+                not cfg.KV_E4M3 or cfg.PAGED_KV == 1,
+                f"{flavor}: the e4m3 K / V arm (KV_DTYPE=0) serves the PAGED pools only (the dense K / V operands keep the activation dtype)",
+            ),
+            (cfg.KV_BPE == (1 if cfg.KV_E4M3 else cfg.BPE), f"{flavor}: KV_BPE is 1 under the e4m3 arm and BPE otherwise (got {cfg.KV_BPE})"),
+            (
+                cfg.GATHER_BOXES_KV == (cfg.TILE_K * cfg.KV_BPE) // _GATHER4_BOX_BYTES
+                and cfg.GATHER_BOX_ELEMS_KV == _GATHER4_BOX_BYTES // cfg.KV_BPE
+                and cfg.GATHER_BOXES_KV * cfg.GATHER_BOX_ELEMS_KV == cfg.TILE_K,
+                f"{flavor}: a 256-wide row is GATHER_BOXES_KV 128-B boxes of GATHER_BOX_ELEMS_KV elements of the K / V storage dtype (2 x 128 e4m3, 4 x 64 bf16); "
+                f"got {cfg.GATHER_BOXES_KV} x {cfg.GATHER_BOX_ELEMS_KV} at KV_BPE={cfg.KV_BPE}",
+            ),
+            (
+                cfg.GATHERS_PER_WARP_PER_STAGE_KV == cfg.BLOCKS_PER_WARP * cfg.GATHER_BOXES_KV,
+                f"{flavor}: gathers per warp per stage in the K / V storage dtype = blocks per warp x GATHER_BOXES_KV (got {cfg.GATHERS_PER_WARP_PER_STAGE_KV})",
+            ),
+            (
+                cfg.KV8_TX_BYTES_PER_WARP == (cfg.GATHERS_PER_WARP_PER_STAGE_KV * cfg.GATHER_ISSUE_BYTES if cfg.KV_E4M3 else 0),
+                f"{flavor}: the fp8 landing barriers' per-warp expect_tx must equal the warp's e4m3 gather4 bytes (got {cfg.KV8_TX_BYTES_PER_WARP}); a consumer waiting "
+                f"on bytes that never come is a hang",
+            ),
+            (
+                not cfg.KV_E4M3 or cfg.KV8_TX_BYTES_PER_WARP * cfg.GATHER_WARPS == cfg.KV_STAGE_BYTES // 2,
+                f"{flavor}: the gather warps' e4m3 bytes must sum to HALF the bf16 stage (the landing zone is the stage's upper half): "
+                f"{cfg.KV8_TX_BYTES_PER_WARP} x {cfg.GATHER_WARPS} vs {cfg.KV_STAGE_BYTES // 2}",
+            ),
+            (
+                cfg.KV_E4M3_ZONE_BOX0 == ((cfg.GATHER_BOXES - cfg.GATHER_BOXES_KV) if cfg.KV_E4M3 else 0),
+                f"{flavor}: the e4m3 landing zone starts at bf16 box GATHER_BOXES - GATHER_BOXES_KV (= 2: the upper half) under the arm, 0 otherwise (got {cfg.KV_E4M3_ZONE_BOX0})",
+            ),
+            (
+                not cfg.KV_E4M3
+                or (
+                    cfg.KV_E4M3_ZONE_BOX0 * cfg.TILE_N * _GATHER4_BOX_BYTES == cfg.KV_STAGE_BYTES // 2
+                    and cfg.GATHER_BOXES_KV * cfg.TILE_N * _GATHER4_BOX_BYTES == cfg.KV_STAGE_BYTES // 2
+                ),
+                f"{flavor}: the zone coupling -- the e4m3 zone (GATHER_BOXES_KV x 16 KiB) must be exactly the stage's upper half (bf16 boxes KV_E4M3_ZONE_BOX0..): the in-place "
+                f"expansion's pass B overwrites the e4m3 rows it staged, nothing else",
+            ),
+            (
+                cfg.KV_FULL_PRODUCER == int(cfg.KV_E4M3),
+                f"{flavor}: mb_kv_full's producer is the elected THREAD arrive per gather warp (1) under the e4m3 arm and the TMA_LOAD expect_tx (0) otherwise; its "
+                f"count KV_FULL_ARRIVERS never changes",
+            ),
+            (
+                cfg.KV8_FULL_STAGES == (cfg.GATHER_WARPS * cfg.STAGES_KV if cfg.KV_E4M3 else 0),
+                f"{flavor}: the fp8 landing ring has one single-arrive barrier per (gather warp, stage) under the arm (got {cfg.KV8_FULL_STAGES}), none otherwise",
             ),
             # the Q^T / gate box: one token per item
             (cfg.PACK_GQA == 1, f"{flavor}: the work item IS the token's packed query-head group (PACK_GQA must be 1)"),
@@ -3353,6 +3452,8 @@ def _sparse_arms_requested(params: TemplateParams) -> Tuple[str, ...]:
         arms.append("pure_list")
     if params.seq_q_lens_present:
         arms.append("seq_q_lens")
+    if getattr(params, "kv_dtype", -1) == 0:
+        arms.append("kv_e4m3")
     return tuple(arms)
 
 
@@ -3374,7 +3475,25 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
     if params.qsa_block_size != _SPARSE_BLOCK_SIZE:
         raise ValueError(f"{flavor}: qsa_block_size must be {_SPARSE_BLOCK_SIZE} (one tma_gather4 = four rows); got {params.qsa_block_size}")
     if params.dtype_qkv not in (_DTYPE_BF16, _DTYPE_FP16):
-        raise ValueError(f"{flavor}: f16/bf16 inputs only (got dtype_qkv={params.dtype_qkv}); the gathered tile has no FP8 arm")
+        raise ValueError(
+            f"{flavor}: f16/bf16 Q / P / O only (got dtype_qkv={params.dtype_qkv}); the K / V STORAGE may be e4m3 under kv_dtype=0 (the in-kernel dequant arm "
+            "over the paged pools, bf16 activations), the MMA operands stay f16 / bf16"
+        )
+    # The K / V STORAGE dtype arm (kv_dtype, appended): -1 = the activation dtype; 0 = e4m3 codes -- bf16 activations and the paged pools only
+    # (a scope choice: cvt.rn.f16x2.e4m3x2 exists, the dense K / V operands have no serving need; both declined BY NAME).
+    kv_dtype = int(getattr(params, "kv_dtype", -1))
+    if kv_dtype not in (-1, 0):
+        raise ValueError(f"{flavor}: kv_dtype must be -1 (the activation dtype) or 0 (e4m3 codes, the K / V storage dtype arm); got {kv_dtype}")
+    kv_e4m3 = kv_dtype == 0
+    if kv_e4m3 and params.dtype_qkv != _DTYPE_BF16:
+        raise ValueError(
+            f"{flavor}: kv_dtype=0 (e4m3 K / V pools) serves bf16 activations only (got dtype_qkv={params.dtype_qkv}); f16 activations over e4m3 pools are a "
+            "follow-up (cvt.rn.f16x2.e4m3x2 exists; no serving stack asks for it)"
+        )
+    if kv_e4m3 and not params.paged_kv:
+        raise ValueError(
+            f"{flavor}: kv_dtype=0 (e4m3 K / V) serves the PAGED pools only (paged_kv=True); the dense K / V operands keep the activation dtype (no serving need)"
+        )
     dtype_o = resolve_dtype_o(params)
     if dtype_o != params.dtype_qkv:
         raise ValueError(f"{flavor}: half input requires dtype_o == dtype_qkv; got dtype_o={dtype_o}")
@@ -3440,6 +3559,14 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
     gather_boxes = (tile_k * b) // _GATHER4_BOX_BYTES
     gathers_per_warp = blocks_per_warp * gather_boxes
     issue_bytes = _GATHER4_ROWS * _GATHER4_BOX_BYTES
+    # the K / V storage dtype arm: the gather map's element size, the per-row box count in that dtype (2 x 128 e4m3 | 4 x 64 bf16), the
+    # per-warp e4m3 bytes (the fp8 landing barriers' expect_tx), the zone's first bf16 box (the stage's upper half) and the landing ring's size
+    kv_bpe = 1 if kv_e4m3 else b
+    gather_boxes_kv = (tile_k * kv_bpe) // _GATHER4_BOX_BYTES
+    gathers_per_warp_kv = blocks_per_warp * gather_boxes_kv
+    kv8_tx = gathers_per_warp_kv * issue_bytes if kv_e4m3 else 0
+    kv_zone_box0 = (gather_boxes - gather_boxes_kv) if kv_e4m3 else 0
+    stages_kv = 3  # K(t), V(t), K(t+1) resident; the fp8 landing ring is one barrier per (gather warp, stage)
     q_box_tokens = 1
     q_box_rows = q_box_tokens * params.qh_per_kh
     ids_tx = params.qsa_block_topk * 4
@@ -3469,7 +3596,7 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         V_SWZ_BYTES=v_swz_bytes(tile_o, 1, b),
         P_SWZ_BYTES=n_q * b,
         TILE_K_HW=tile_k_hw(params.dtype_qkv),
-        STAGES_KV=3,
+        STAGES_KV=stages_kv,
         STAGES_S=_SPARSE_STAGES_S,
         STAGES_Q=2,
         STAGES_IDS=2,
@@ -3500,6 +3627,16 @@ def make_cfg_d256_sparse(params: TemplateParams, *, gather_warps: int = 8, softm
         GATHERS_PER_WARP_PER_STAGE=gathers_per_warp,
         KV_TX_BYTES_PER_WARP=gathers_per_warp * issue_bytes,
         KV_STAGE_BYTES=tile_n * tile_k * b,
+        KV_DTYPE=kv_dtype,
+        KV_E4M3=int(kv_e4m3),
+        KV_BPE=kv_bpe,
+        GATHER_BOXES_KV=gather_boxes_kv,
+        GATHER_BOX_ELEMS_KV=_GATHER4_BOX_BYTES // kv_bpe,
+        GATHERS_PER_WARP_PER_STAGE_KV=gathers_per_warp_kv,
+        KV8_TX_BYTES_PER_WARP=kv8_tx,
+        KV_E4M3_ZONE_BOX0=kv_zone_box0,
+        KV_FULL_PRODUCER=int(kv_e4m3),
+        KV8_FULL_STAGES=(gather_warps * stages_kv) if kv_e4m3 else 0,
         Q_BOX_TOKENS=q_box_tokens,
         Q_BOX_ROWS=q_box_rows,
         Q_SLOT_BYTES=n_q * tile_k * b,

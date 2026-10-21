@@ -33,8 +33,15 @@ multiple of 4 (a 4-token block never straddles a page, so the kernel does one ta
 and a page index past the table read as zero rows.  The kernel derives per operand from the strides: rows per page (page
 stride / token stride), rows per head (head stride / token stride for an HND pool, 0 for an NHD pool whose head lives in the
 column coordinate) and the column head stride -- one compiled kernel serves both layouts.  The pools' dtype is the
-activation dtype (``kv_cache_dtypes``: bf16 / f16 with a bf16 / f16 Q); the block's paged-READ mode (``block_table`` /
-``kv_lens`` through the gated attention block) lands with the decode form.
+activation dtype (``kv_cache_dtypes``: bf16 / f16 with a bf16 / f16 Q) or -- ``kv_cache_dtype=torch.float8_e4m3fn`` (appended 2026-10-21;
+``paged_kv=True`` and a bf16 Q only) -- e4m3 CODES under ONE fp32 per-tensor DEscale per operand (``k_scale`` / ``v_scale``: 1-element fp32
+CUDA tensors, REQUIRED with the attribute and refused without it; value = code x scale, the serving stacks' fp8 KV-cache recipe): the
+kernel's in-kernel dequant arm (``TemplateParams.kv_dtype=0``, ``CFG.KV_E4M3``) gathers the e4m3 rows as two 128-B boxes per row, expands them
+in place to the bf16 operand tile (exact) and folds the scales as the serving stacks do -- ``k_scale`` into the softmax scale, ``v_scale``
+into the normaliser (the LSE is the log-sum-exp of the scores over the dequantized K; the split partials carry ``v_scale``, the combine is
+untouched); at a power-of-two scale the result is BITWISE the bf16 kernel fed ``bf16(code x scale)``.  The e4m3 pool's stride contract is the
+bf16 one spelled in e4m3 elements: the token stride a multiple of 16 elements (16 B), an NHD head stride a multiple of 128 elements (a 128-B
+box start).  The block's paged-READ mode (``block_table`` / ``kv_lens`` through the gated attention block) lands with the decode form.
 
 The DECODE FORM (``bottom_right=True`` + ``list_per_sequence=True`` [+ ``split_kv=S``]; the same kernel specialised by three
 ``TemplateParams`` arms, dense BSHD or paged pools, never THD): the step's ``S_q <= 4`` rows per sequence sit at the END of the
@@ -133,7 +140,10 @@ class SparseCapabilities:
     d_shapes: frozenset = frozenset({(_D, _D)})
     d_pad_multiple: int = 0  # exact native shape only: the gather box count and the Q box are derived for d = 256
     dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})
-    kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16})  # the paged pools' dtype = Q's (reached through paged_kv)
+    # the paged pools' dtype: Q's (reached through paged_kv), or FP8_E4M3 -- e4m3 codes under per-tensor fp32 DEscales dequantized IN-KERNEL (the
+    # gather warps expand the rows in place, the scales folded into the softmax scale and the normaliser) with a bf16 Q only (2026-10-21); the dense
+    # K / V operands keep Q's dtype.  A ``Capabilities``-vocabulary field: the support-matrix tracker moves in the same commit (Rule S2).
+    kv_cache_dtypes: frozenset = frozenset({cudnn.data_type.HALF, cudnn.data_type.BFLOAT16, cudnn.data_type.FP8_E4M3})
     causal: bool = True  # the in-block mask: key <= the token's position (top-left, or bottom-right)
     bottom_right: bool = True  # pos = kv_len_b - S_q + row: the decode / verify rows at the END of the sequence; dense BSHD or paged, never THD
     swa: bool = False
@@ -173,6 +183,8 @@ SPARSE_CAPABILITIES = SparseCapabilities()
 
 _DTYPE_CODE = {"torch.bfloat16": 2, "torch.float16": 3}
 _DTYPE_PUBLIC = {"torch.bfloat16": cudnn.data_type.BFLOAT16, "torch.float16": cudnn.data_type.HALF}
+_KV_CACHE_E4M3 = "torch.float8_e4m3fn"  # the one non-activation pool dtype served (compared through str(), like every dtype here)
+_ITEMSIZE = {"torch.bfloat16": 2, "torch.float16": 2, _KV_CACHE_E4M3: 1}
 
 
 @dataclass(frozen=True)
@@ -266,11 +278,17 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
     rows at the TOKEN stride (the page_size axis'), so the page stride must be a whole number of token rows and every head
     either folds into the row (HND: the head stride a multiple of the token stride, ``rows_per_head = head_stride /
     token_stride``, column head stride 0) or lives in the column (NHD: the head stride below the token stride, a multiple of
-    64 elements, the heads' columns inside one token row).  A ``ValueError`` names the stride that fits neither."""
+    one 128-B box, the heads' columns inside one token row).  The two TMA rules are BYTE rules spelled in the pool's elements
+    (``16 // itemsize`` for the token stride, ``128 // itemsize`` for an NHD head stride: 8 / 64 bf16, 16 / 128 e4m3).  A
+    ``ValueError`` names the stride that fits neither."""
     num_pages, _KH, P, _D = _shape(pool)  # the pool's head count IS KH (the caller derived it from this shape; V's shape equals K's)
     s_page, s_head, s_tok, _ = _strides(pool)
-    if s_tok % 8 != 0:
-        raise ValueError(f"sparse d256 forward (sm107): {name} pool token stride must be a multiple of 8 elements (TMA's 16-byte rule); got {s_tok}")
+    itemsize = _ITEMSIZE.get(str(pool.dtype), 2)
+    tok_align, box_align = 16 // itemsize, 128 // itemsize
+    if s_tok % tok_align != 0:
+        raise ValueError(
+            f"sparse d256 forward (sm107): {name} pool token stride must be a multiple of {tok_align} elements (TMA's 16-byte rule in {pool.dtype} elements); got {s_tok}"
+        )
     if s_page <= 0 or s_page % s_tok != 0:
         raise ValueError(
             f"sparse d256 forward (sm107): {name} pool page stride {s_page} must be a positive multiple of the token stride {s_tok} (whole rows per page)"
@@ -284,8 +302,10 @@ def _paged_pool_geometry(name: str, pool, KH: int, page_size: int) -> Tuple[int,
             raise ValueError(f"sparse d256 forward (sm107): {name} pool heads at {rows_per_head} rows apart do not fit the page's {rows_per_page} rows")
     elif s_head < s_tok:
         rows_per_head, col_head = 0, s_head  # NHD: the head is a column term
-        if s_head % 64 != 0:
-            raise ValueError(f"sparse d256 forward (sm107): {name} pool head stride must be a multiple of 64 elements (a 128-B column box start); got {s_head}")
+        if s_head % box_align != 0:
+            raise ValueError(
+                f"sparse d256 forward (sm107): {name} pool head stride must be a multiple of {box_align} elements (a 128-B column box start in {pool.dtype} elements); got {s_head}"
+            )
         if (KH - 1) * s_head + _D > s_tok:
             raise ValueError(f"sparse d256 forward (sm107): {name} pool heads at {s_head} elements apart do not fit the token row of {s_tok}")
     else:
@@ -388,8 +408,18 @@ class SparseGqaFwdDslSm107:
         workspace=None,
         softmax_groups: int = 0,
         use_pdl: bool = False,
+        kv_cache_dtype=None,
+        k_scale=None,
+        v_scale=None,
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
+        # The K / V STORAGE dtype (appended 2026-10-21; a DECLARATION attribute, never a knob): None = Q's dtype (the pools / operands as before);
+        # torch.float8_e4m3fn = the paged pools hold e4m3 codes under the per-tensor fp32 DEscales k_scale / v_scale (1-element CUDA tensors or
+        # storage-free descriptors, REQUIRED with the attribute and refused without it) -- the kernel's in-kernel dequant arm
+        # (TemplateParams.kv_dtype=0), paged_kv=True and a bf16 Q only; validated in check_support, both directions.
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_e4m3 = kv_cache_dtype is not None and str(kv_cache_dtype) == _KV_CACHE_E4M3
+        self.k_scale, self.v_scale = k_scale, v_scale
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
         # the launch attribute plus the griddepcontrol sites in both kernels it reaches -- the sparse core (compile(use_pdl=): every role's
         # wait before its first dependent global read; no explicit release, the CTA exit triggers the dependent at the core's completion)
@@ -493,6 +523,8 @@ class SparseGqaFwdDslSm107:
             ("seq_q_lens", self.seq_q_lens),
             ("gate", self.gate),
             ("workspace", self.workspace),
+            ("k_scale", self.k_scale),
+            ("v_scale", self.v_scale),
         ):
             device = _require_cuda_device(name, t, device, allow_unbound=True)
         self._device_index = device
@@ -546,13 +578,54 @@ class SparseGqaFwdDslSm107:
                 f"top_k={self.top_k} -- a larger split has an empty chunk (a dead work item) on every item"
             )
 
-        # dtypes: one half dtype for Q / K / V / O, fp32 LSE
+        # dtypes: one half dtype for Q / O (and K / V, unless the e4m3 pool attribute is declared), fp32 LSE
         dt = str(self.q.dtype)
         if dt not in _DTYPE_CODE:
             raise NotImplementedError(f"sparse d256 forward (sm107): Q must be bf16 or f16; got {dt}")
-        for name, t in (("K", self.k), ("V", self.v), ("O", self.o)):
-            if str(t.dtype) != dt:
-                raise ValueError(f"sparse d256 forward (sm107): {name} dtype {t.dtype} must equal Q's {dt}")
+        if self.kv_cache_dtype is not None and not self.kv_e4m3 and str(self.kv_cache_dtype) != dt:
+            raise NotImplementedError(
+                f"sparse d256 forward (sm107): kv_cache_dtype must be None (K / V in Q's dtype) or torch.float8_e4m3fn (e4m3 pools under per-tensor scales); got "
+                f"{self.kv_cache_dtype}"
+            )
+        if self.kv_e4m3:
+            # the K / V STORAGE dtype arm: the PAGED pools only (the dense K / V operands have no serving need), a bf16 Q (a scope choice: the f16 cast
+            # exists, no serving stack asks for it), the pools in e4m3, the two scales present and well-formed -- each by name
+            if not self.paged_kv:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): kv_cache_dtype=torch.float8_e4m3fn is served on the PAGED pools only (paged_kv=True: the in-kernel dequant arm "
+                    "gathers e4m3 rows through the block table); the dense K / V operands take Q's dtype"
+                )
+            if dt != "torch.bfloat16":
+                raise NotImplementedError(
+                    f"sparse d256 forward (sm107): kv_cache_dtype=torch.float8_e4m3fn needs a bf16 Q (one bf16 operand tile over the dequantized codes); got Q {dt} -- "
+                    "f16 activations over e4m3 pools are declined by name (a follow-up)"
+                )
+            for name, t in (("K", self.k), ("V", self.v)):
+                if str(t.dtype) != _KV_CACHE_E4M3:
+                    raise ValueError(
+                        f"sparse d256 forward (sm107): {name} dtype {t.dtype} must be torch.float8_e4m3fn (kv_cache_dtype=torch.float8_e4m3fn declared)"
+                    )
+            for name, t in (("k_scale", self.k_scale), ("v_scale", self.v_scale)):
+                if t is None:
+                    raise ValueError(
+                        f"sparse d256 forward (sm107): kv_cache_dtype=torch.float8_e4m3fn needs {name} (a 1-element fp32 CUDA tensor: the pool's per-tensor DEscale, "
+                        "value = code x scale; read on device, folded in-kernel)"
+                    )
+                if str(t.dtype) != "torch.float32" or _shape(t) not in ((1,), ()):
+                    raise ValueError(f"sparse d256 forward (sm107): {name} must be a 1-element fp32 tensor (the per-tensor DEscale); got {t.dtype} {_shape(t)}")
+        else:
+            for name, t in (("K", self.k), ("V", self.v)):
+                if str(t.dtype) != dt:
+                    raise ValueError(
+                        f"sparse d256 forward (sm107): {name} dtype {t.dtype} must equal Q's {dt} (kv_cache_dtype=torch.float8_e4m3fn declares e4m3 pools)"
+                    )
+            if self.k_scale is not None or self.v_scale is not None:
+                raise ValueError(
+                    "sparse d256 forward (sm107): k_scale / v_scale are the per-tensor DEscales of e4m3 pools (kv_cache_dtype=torch.float8_e4m3fn); this declaration's "
+                    "K / V are in Q's dtype and the kernel would never read them -- refused rather than silently ignored"
+                )
+        if str(self.o.dtype) != dt:
+            raise ValueError(f"sparse d256 forward (sm107): O dtype {self.o.dtype} must equal Q's {dt}")
         if self.lse is not None and str(self.lse.dtype) != "torch.float32":
             raise ValueError(f"sparse d256 forward (sm107): LSE must be float32; got {self.lse.dtype}")
         if self.gate is not None:
@@ -833,6 +906,8 @@ class SparseGqaFwdDslSm107:
             bottom_right=self.bottom_right,
             qsa_list_per_sequence=self.list_per_sequence,
             qsa_softmax_groups=self.softmax_groups,
+            # the K / V storage dtype arm (appended): 0 = e4m3 codes (the in-kernel dequant arm), -1 = the activation dtype
+            kv_dtype=0 if self.kv_e4m3 else -1,
         )
 
     def combine_form(self) -> int:
@@ -952,6 +1027,8 @@ class SparseGqaFwdDslSm107:
         seq_q_lens=None,
         workspace=None,
         gate=None,
+        k_scale=None,
+        v_scale=None,
     ):
         """Launch on ``stream`` (default: the framework's current stream).  Validation only -- no conversion, no allocation.
 
@@ -963,7 +1040,8 @@ class SparseGqaFwdDslSm107:
         variant, ``None`` -> the kernel's derived default count -- the variant must have been compiled (:meth:`compile`), never
         compiled here.  THD: ``seq_q_lens`` binds like the others and ``workspace`` (the metadata buffer,
         :meth:`scratch_workspace_bytes`, 16-byte aligned) is the one operand that need not match a declaration -- any buffer of
-        at least the size serves."""
+        at least the size serves.  ``k_scale`` / ``v_scale`` (appended) bind the e4m3 pools' per-tensor DEscales -- REQUIRED on a
+        ``kv_cache_dtype=torch.float8_e4m3fn`` declaration (1-element fp32 CUDA tensors, read on device), REFUSED otherwise."""
         if not self._G:
             self.check_support()
         q = self._bind("q", q, self.q, required=True)
@@ -982,6 +1060,16 @@ class SparseGqaFwdDslSm107:
                 raise ValueError("sparse d256 forward (sm107): thd=True needs the metadata workspace at execute(workspace=) (scratch_workspace_bytes() bytes)")
             self._check_workspace(ws, self._NSEQ)
         gate = self._bind("gate", gate, self.gate, required=self.gate is not None)
+        if self.kv_e4m3:
+            k_scale = self._bind("k_scale", k_scale, self.k_scale, required=True)
+            v_scale = self._bind("v_scale", v_scale, self.v_scale, required=True)
+        elif k_scale is not None or v_scale is not None:
+            raise ValueError(
+                "sparse d256 forward (sm107): k_scale / v_scale belong to a kv_cache_dtype=torch.float8_e4m3fn declaration; this declaration's K / V are in Q's dtype "
+                "-- refused rather than silently ignored"
+            )
+        else:
+            k_scale = v_scale = None
         # every pointer handed to the kernel with assumed_align=16 starts on a 16-byte boundary (a storage-offset view is refused by name)
         for name, t in (("Q", q), ("K", k), ("V", v), ("O", o), ("block_ids", ids), ("the epilogue gate", gate)):
             _require_16b_base(name, t)
@@ -1015,6 +1103,8 @@ class SparseGqaFwdDslSm107:
             ("seq_q_lens", seq_q_lens),
             ("gate", gate),
             ("workspace", ws),
+            ("k_scale", k_scale),
+            ("v_scale", v_scale),
         ):
             _require_cuda_device(name, t, device)
         fn = self._fns.get(lens is not None)
@@ -1026,9 +1116,9 @@ class SparseGqaFwdDslSm107:
         import torch
 
         with torch.cuda.device(device):
-            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream)
+            return self._execute_on_device(q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, k_scale, v_scale)
 
-    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream):
+    def _execute_on_device(self, q, k, v, o, ids, lse, lens, seq_kv_lens, table, seq_q_lens, ws, gate, fn, stream, k_scale=None, v_scale=None):
         import torch
         import cutlass
         import cuda.bindings.driver as cuda_driver
@@ -1037,6 +1127,7 @@ class SparseGqaFwdDslSm107:
 
         gmem = cute.AddressSpace.gmem
         half = cutlass.BFloat16 if self._dtype_code == 2 else cutlass.Float16
+        kv_dtype = cutlass.Float8E4M3FN if self.kv_e4m3 else half  # the K / V pools in their STORAGE dtype (the module specialization's)
 
         def P(t, dtype, align=16):
             return None if t is None else make_ptr(dtype, t.data_ptr(), gmem, assumed_align=align)
@@ -1088,8 +1179,8 @@ class SparseGqaFwdDslSm107:
             kernel_gate = gate
         fn(
             q_ptr=P(q, half),
-            k_ptr=P(k, half),
-            v_ptr=P(v, half),
+            k_ptr=P(k, kv_dtype),
+            v_ptr=P(v, kv_dtype),
             o_ptr=o_ptr,
             lse_ptr=lse_ptr,
             block_ids_ptr=P(ids, cutlass.Int32, 16),
@@ -1106,6 +1197,9 @@ class SparseGqaFwdDslSm107:
             paged_geom=paged_geom,
             gate_ptr=P(kernel_gate, half),
             gate_strides=_strides(kernel_gate)[:3] if kernel_gate is not None else (0, 0, 0),
+            # the e4m3 pools' DEscales (the KV_E4M3 rendering's two slots; None drops them from the bf16 renderings' signature)
+            k_scale_ptr=P(k_scale, cutlass.Float32, 4),
+            v_scale_ptr=P(v_scale, cutlass.Float32, 4),
             stream=stream,
             **thd_kw,
         )

@@ -460,6 +460,14 @@ class TemplateParams:
     # TMEM map gains the Q slots, the MMA form and the commit site move): the template-module cache keys on this record alone.  Picked by
     # config_sm107.sm107_q_in_tmem_pick (0 until measured; the sweep seam pins 1); validated by the factory (config_sm107._validate_q_in_tmem).
     q_in_tmem: int = 0
+    # The K / V STORAGE dtype of the index-list sparse flavor's PAGED pools (APPENDED 2026-10-21; the ``dtype_qkv`` vocabulary): -1 = the
+    # activation dtype (every existing record renders byte-identically), 0 = e4m3 CODES under per-tensor fp32 DEscales -- the sparse core's
+    # in-kernel dequant arm (sm107/sparse_d256_f16.py ``CFG.KV_E4M3``: the gather warps land the e4m3 rows as two 128-B boxes per row in
+    # the upper half of the bf16 stage and expand their own rows in place to the bf16 tile the MMA descriptors read; ``k_scale`` folded into
+    # the softmax scale, ``v_scale`` into the normaliser, both read on device).  Q / P / O stay ``dtype_qkv`` (bf16 only with the arm, paged
+    # pools only: config_sm107.make_cfg_d256_sparse).  A DECLARATION attribute (the pools' numerics), never a knob.  Every other factory
+    # rejects a set value by name (``_validate_params`` / ``make_cfg_d256_decode``): a dense template has no arm for it.
+    kv_dtype: int = -1
 
 
 # Paged KV is wired through the K/V TMA-LDG sites of these flavors only; any
@@ -551,6 +559,13 @@ def _validate_params(flavor: str, k: TemplateParams, *, scale_prefolded_wired: b
         raise ValueError(
             f"{flavor}: qsa_block_topk={k.qsa_block_topk} / qsa_block_size={k.qsa_block_size} / qsa_softmax_groups={k.qsa_softmax_groups} select the "
             f"index-list sparse kernel; the dense templates do not consume them"
+        )
+    if getattr(k, "kv_dtype", -1) != -1:
+        # The K / V STORAGE dtype arm (e4m3 pools under a bf16 Q) is the index-list sparse flavor's (config_sm107.make_cfg_d256_sparse); a
+        # dense template would read the pools as its activation dtype and silently multiply e4m3 codes as bf16 bit patterns.
+        raise ValueError(
+            f"{flavor}: kv_dtype={k.kv_dtype} (the K / V storage dtype arm) is the index-list sparse flavor's (sm107/sparse_d256_f16.py); the dense "
+            f"templates do not consume it"
         )
     if k.dtype_qkv not in (DTYPE_E4M3, DTYPE_E5M2, DTYPE_BF16, DTYPE_FP16):
         raise ValueError(f"{flavor}: DTYPE_QKV must be E4M3/E5M2/BF16/FP16 (0..3); got {k.dtype_qkv}")
@@ -1586,6 +1601,11 @@ def make_cfg_d256_decode(params: TemplateParams, q_tiles: Tuple[int, ...] = _D25
         raise ValueError(
             f"d256 decode: qsa_block_topk={params.qsa_block_topk} / qsa_block_size={params.qsa_block_size} / qsa_softmax_groups={params.qsa_softmax_groups} "
             f"select the index-list sparse kernel; the decode tile does not consume them"
+        )
+    if getattr(params, "kv_dtype", -1) != -1:
+        raise ValueError(
+            f"d256 decode: kv_dtype={params.kv_dtype} (the K / V storage dtype arm) is the index-list sparse flavor's (sm107/sparse_d256_f16.py); the "
+            f"decode tile does not consume it"
         )
     if params.decode_q_tile not in q_tiles:
         raise ValueError(f"d256 decode: decode_q_tile must be one of {q_tiles}; got {params.decode_q_tile}")

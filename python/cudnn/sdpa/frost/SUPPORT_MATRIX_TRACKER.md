@@ -3486,6 +3486,30 @@ page 16 / 64 / 48, NHD and HND, bf16 and f16, B = 2 with different lengths and l
 mode (`block_table` / `kv_lens` at `execute`) is served since 2026-10-14 as the block-sparse DECODE / extend-with-prefix mode (the
 `Rubin d256 gated attention block -- serving forms` section above).
 
+Served since 2026-10-21 (the standalone adapter: `kv_cache_dtype=torch.float8_e4m3fn` with `k_scale` / `v_scale`; `SparseCapabilities.kv_cache_dtypes`
+gains `FP8_E4M3`) -- e4m3 PAGED pools under a bf16 Q: the pools hold e4m3 CODES under ONE fp32 per-tensor DEscale per operand (value = code x
+scale; the serving stacks' fp8 KV-cache recipe; the scales 1-element fp32 CUDA tensors read on device, REQUIRED with the attribute and refused
+without it), dequantized IN-KERNEL by the sparse core's `KV_E4M3` arm (`TemplateParams.kv_dtype = 0`, a module specialization): the 8 gather
+warps `tma_gather4` the e4m3 rows as TWO 128-B boxes per row instead of four (8 gather4 per warp per operand stage instead of 16; the K / V
+bytes halve) into the upper half of the same 64 KiB bf16 stage and expand their own 16 rows IN PLACE (`cvt.rn.bf16x2.e4m3x2`, exact, no
+scale in the cast) into the bf16 SW128 tile the two MMA descriptors already read; `k_scale` is folded into the softmax scale and `v_scale` into
+the normaliser (the serving stacks' function; the LSE is the log-sum-exp of the scores over the dequantized K; the split partials carry
+`v_scale`, the combine is untouched).  No SMEM growth beyond the misc reserve (one ring of 24 single-arrive landing barriers; the standard
+carveout, L1 kept), no new warp, no TMEM change, NO existing barrier's init count changes (`mb_kv_full`'s producer kind flips from the TMA's
+expect_tx to one elected thread arrive per gather warp at the same count 8); every bf16 rendering's cubin is byte-identical to the pre-arm record
+(`test/python/sdpa/frost/renderings/md5_fwd_sparse_d256_kv_bf16_sm_107a.txt`, eight renderings), the e4m3 rendering carries 24 gather4 issues
+against 48 and no new spills.  Numerics: at a POWER-OF-TWO scale (1.0 included -- the stacks' value for a checkpoint without scales) the arm
+is BITWISE the bf16 kernel fed `bf16(code x scale)` (fp32 scaling by 2^e commutes with every rounding on the path); at a generic scale the
+arm keeps K / V exact and rounds the folded scale once in fp32 -- within the module's budget vs the fp32 oracle on the dequantized pool (the
+distance to the bf16-pool kernel reported, never gated).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf
+claim; `test_sdpa_fwd_sparse_sm107.py`): the power-of-two pin at B 1 / 4, S_kv 2052 / 8K / 32K, the shared and the per-row list forms, splits
+1 / 4 / 17, the gate in the epilogue and in the combine, HND 16 / NHD 64, `block_lens` given / absent, straddling open blocks, -1 pages, a dead
+and a one-token sequence; the generic-scale oracle at (0.37, 1.9) / (1.9, 0.37); unwritten pool cells poisoned with the finite e4m3 sentinel
+0x7E (448) and with NaN alike (bitwise: the kernel takes row -1 past the length).  Declined by name: e4m3 K / V on the dense (unpaged) operands,
+an f16 Q over e4m3 pools, the pool dtype both ways, the scales both ways, a token stride below 16 e4m3 elements / an NHD head stride off the
+128-element box (the 16-byte rule in e4m3 elements).  Through the gated attention block the arm is the block-sparse DECODE mode's e4m3 form
+(the serving-forms section above).
+
 Served since 2026-10-08 (`thd=True`; the standalone adapter, and the gated attention block since the same day): packed THD
 sequences — Q / O `[1, T_q, H, 256]`, K / V `[1, T_kv, H_kv, 256]` (capacities; the live totals are device values), `block_ids`
 `[T_q, top_k]` with ids RELATIVE TO THEIR SEQUENCE, `seq_q_lens` and `seq_kv_lens` as per-sequence lengths `[B]` or cumulative
@@ -3551,4 +3575,6 @@ end to end against the fp32 block oracle (the serving-forms section above, `test
 
 Not served (typed declines by name; each lands with its accept cell and flips this section in the same change): THD and paged pools in one declaration, THD with the in-block indexer (through the block), any of the decode form's three arms under THD, a shared list at `S_q > 4`, a split past the item's tile
 count, the kernel's own epilogue gate under a split (the combine carries it), a sink, a sliding window / band, Q-length trimming
-of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8.
+of a dense batch, log2 stats, a pure caller list without the tail, head dims other than 256, FP8 / MXFP8 ACTIVATIONS (an fp8 Q / P is a
+different function; e4m3 K / V POOLS under a bf16 Q are served since 2026-10-21, above), e4m3 K / V on the dense (unpaged) operands, an f16 Q
+over e4m3 pools.

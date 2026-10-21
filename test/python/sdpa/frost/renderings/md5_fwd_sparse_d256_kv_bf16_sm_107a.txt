@@ -1,0 +1,12 @@
+# The sparse d256 kernel's bf16 renderings BEFORE the K / V storage dtype arm (TemplateParams.kv_dtype) landed: host trace-compile
+# (CUTE_DSL_ARCH=sm_107a, CUTE_DSL_KEEP=cubin, the compiled-plan cache off) of the tree the arm was built on, one fresh process per arm.
+# Re-render the record (test_sdpa_fwd_sparse_sm107.py::_render_record_arms) when the DSL build changes: the cubin is a function of it.
+dsl=nvidia-cutlass-dsl 4.8.0
+sparse_d256_f16 sm_107a dense_bf16_g12 rc=0 cubin_md5=65e1582df24e93f54903bb62f95b0df4 GATHER4=48 STL=1 LDL=1 USETMAXREG=0
+sparse_d256_f16 sm_107a dense_f16_g16 rc=0 cubin_md5=97cc4d9946663c4d56cf57c10e900a83 GATHER4=48 STL=1 LDL=1 USETMAXREG=0
+sparse_d256_f16 sm_107a one_group_bf16 rc=0 cubin_md5=e676ad0a9cd7127c1602e78e6404e89a GATHER4=48 STL=0 LDL=0 USETMAXREG=0
+sparse_d256_f16 sm_107a paged16_bf16 rc=0 cubin_md5=8d009d67d8a90b1fe424b413294bb7b5 GATHER4=48 STL=1 LDL=1 USETMAXREG=0
+sparse_d256_f16 sm_107a thd_bf16 rc=0 cubin_md5=f10e4d68f68b55fca296b82e513cdfa1 GATHER4=48 STL=0 LDL=0 USETMAXREG=0
+sparse_d256_f16 sm_107a decode_paged16_shared_split4 rc=0 cubin_md5=05175c5749799aa608d0ad435e3e966e GATHER4=48 STL=0 LDL=0 USETMAXREG=0
+sparse_d256_f16 sm_107a decode_paged16_shared_gated rc=0 cubin_md5=bec12130de09f1d9b1260ace88902e0a GATHER4=48 STL=0 LDL=0 USETMAXREG=0
+sparse_d256_f16 sm_107a decode_paged64_per_row_split2 rc=0 cubin_md5=08123fa8f75d2a3f97346f73c9773212 GATHER4=48 STL=0 LDL=0 USETMAXREG=0

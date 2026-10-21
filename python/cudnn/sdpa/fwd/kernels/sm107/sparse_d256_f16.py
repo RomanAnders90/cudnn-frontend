@@ -133,8 +133,19 @@ Table re-based on the two-group default 2026-10-09; before that it led with the 
                                                                                                                                                           1      per item; drained at exit by the TMA warp
     5  mb_kv_full[3]        TMA_LOAD     each gather warp: arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=elect_sync()) once per stage fill,
                                          then its 16 gather4 x 512 B = 8192 B (OOB / -1 rows zero-filled AND credited); 8 x 8192 = the 64 KiB stage
+                                         KV_E4M3 (CHANGED KIND, SAME COUNT): THREAD -- each gather warp `if elect_sync(): arrive()` once per
+                                         operand stage AFTER its pass A + pass B STS, the fence.proxy.async and a bar.warp.sync (CFG.KV_FULL_PRODUCER)
                                                                                                         8 == 8       MMA before BMM1 (K) / BMM2 (V)       0      kv_state(3) per LOAD, order K(0) K(1) V(0) K(2) V(1) ... V(n-1),
                                                                                                                                                                  CARRIED across items in the gather warps AND the MMA warp
+   5e  mb_kv8_full[8 x 3]   TMA_LOAD     [KV_E4M3 arm only; one barrier per (gather warp w, stage s) at index w x STAGES_KV + s] the owning warp's
+                                         elected lane: arrive(n_bytes=KV8_TX_BYTES_PER_WARP = 4096, pred=elect_sync()), then its 8 gather4 x 512 B
+                                         into the stage's e4m3 zone (OOB / -1 rows zero-filled AND credited)
+                                                                                                        1 == 1       the SAME warp before its pass-A LDS of the stage (per-warp granularity:
+                                                                                                                     warp w casts as soon as ITS bytes land)
+                                                                                                                                                          0      cast_state(3) per LOAD, LAGGING kv_state by one load (the cast of L
+                                                                                                                                                                 runs after the issue of L + 1), CARRIED across items; every arrive has
+                                                                                                                                                                 its wait in the same warp (a warp never issues a load it does not cast),
+                                                                                                                                                                 so no exit drain
     6  mb_kv_empty[3]       MMA_COMMIT   the MMA warp, pred=elect_p after the last MMA reading the stage (K: with s_full's commit; V: with bmm2_done's)
                                                                                                         1 == 1       all 8 gather warps before refilling 1      the same kv_state; each gather warp drains STAGES_KV at exit
     7  mb_s_full[2]         MMA_COMMIT   the MMA warp, pred=elect_p right after BMM1(t)               1 == 1       8 softmax warps (4), top of tile t   0      s_state(2) per TILE, never reset at an item boundary
@@ -177,7 +188,10 @@ Table re-based on the two-group default 2026-10-09; before that it led with the 
                                          128: the column-max exchange per tile + the per-lane sum per item; the groups never wait on each other
    18  barrier 0            bar          all THREADS_PER_CTA lanes once (640; 512 at one group), after fence_mbarrier_init (the spare warp exits only after it)
 
-Init: ``if warp_idx == 0: if nvvm.elect_sync():`` every stage of every ring (``.init()`` is per stage) + the two scheduler rings
+The KV_E4M3 arm changes NO init count of any existing barrier (KV_FULL_ARRIVERS 8, IDS_EMPTY_ARRIVERS 16, READ_TILE_ARRIVERS 18, SOFTMAX_LANES
+256, ONE_LANE everywhere else) and ADDS one ring of single-arrive TMA_LOAD barriers (row 5e: 24 stages, 192 B in the misc reserve, every stage
+initialised in the same elected block); the only existing row that moves is row 5's producer KIND (the TMA's expect_tx -> one elected THREAD
+arrive per gather warp), its count and its consumer unchanged.  Init: ``if warp_idx == 0: if nvvm.elect_sync():`` every stage of every ring (``.init()`` is per stage) + the two scheduler rings
 (ONE_LANE / READ_TILE_ARRIVERS); fence_mbarrier_init + barrier_cta_sync OUTSIDE the branch.  Phase discipline: every ring
 slot and parity above comes from a PipelineState CARRIED across work items in every role that touches it and advanced at
 every producer fire / consumer wait -- NEVER recomputed from a per-item tile index, and never a manual ``^ 1`` flip (rows 11 / 12
@@ -330,11 +344,24 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
                                                                                                               descriptor decodes it (P_SWZ_BYTES = N_Q x BPE)
                                                                                                               and it spreads the 32-B lane stride            16,384
     sKV[3]         196,608    8 gather warps, tma_gather4 x 128 per stage: box b of quad q at b x 16 KiB + q x 512 B (512-B quads inside
-                              1024-B sub-boxes = the tiled SW128 layout)
+                              1024-B sub-boxes = the tiled SW128 layout).  KV_E4M3: (a) the TMA lands e4m3 box b8 of quad q at
+                              (KV_E4M3_ZONE_BOX0 + b8) x 16 KiB + q x 512 B -- the UPPER 32 KiB of the stage, 8 gather4 per warp; (b) the
+                              owning gather warp's lanes: 16 STS.128 per lane per operand stage into bf16 boxes 0..3 rows [16 w, 16 w + 16)
+                              under store_swizzled (SW128)
                                                                 MMA descriptors over the same bytes: K-major A of BMM1 (SBO 1 KiB) and
-                                                                MN-major A of BMM2 (V^T: LBO 16 KiB between d atoms, SBO 1 KiB)
-                                                                                                 n/a          SW128 -- both descriptors read it; the gather
-                                                                                                              map writes under the same SW128                24,576; sKV[2] at 155,648 = 152 KiB
+                                                                MN-major A of BMM2 (V^T: LBO 16 KiB between d atoms, SBO 1 KiB).  KV_E4M3: + the
+                                                                owning gather warp's lanes, 8 LDS.128 per lane per operand stage from e4m3 boxes
+                                                                0 / 1 rows [16 w, 16 w + 16) under load_swizzled (the in-place ALIAS: e4m3 box 0 =
+                                                                bf16 box 2's bytes, e4m3 box 1 = bf16 box 3's; per warp the e4m3 rows and the bf16
+                                                                rows [16 w, 16 w + 16) of boxes 2 / 3 are the SAME 4 KiB -- pass A reads box 0 and
+                                                                writes boxes 0 / 1, pass B stages box 1 in registers, warp-syncs, writes boxes 2 / 3;
+                                                                the coupling GATHER_BOXES_KV x 16 KiB == bf16 boxes 2..3 == STAGE / 2 is pinned by the
+                                                                config validator)
+                                                                                                 n/a; 16 B per lane per access, 8 lanes per 128-B row (KV_E4M3)
+                                                                                                              SW128 -- both descriptors read it; the gather
+                                                                                                              map writes under the same SW128; the thread-side
+                                                                                                              accesses follow the same XOR, which spreads the 8
+                                                                                                              chunk slots over the 32 banks (conflict-free)  24,576; sKV[2] at 155,648 = 152 KiB
     sIds[2]          4,224    the TMA warp, ONE cp.async.bulk of IDS_TX_BYTES from block_ids[item_row]; no STS (slot = IDS_TX_BYTES + 64 B reserve, unread)
                                                                 gather warps: ONE uniform LDS.128 of blocks 32 i + 4 w .. + 3; softmax lanes: LDS.32 of
                                                                 block 32 i + lane // 4 (4 adjacent lanes share a word); both clamped into the slot
@@ -345,14 +372,19 @@ lane-only buffers last so no alignment padding is spent; 1024-B alignment modell
                                                                 the group's 4 warps after named barrier 2
                                                                                                  4 B          none (one address per warp per column)          225,408
     misc               512    tmem_ptr (16 B), 15 mbarrier arrays (29 stages, 16-B padded: 272 B), the payload ring (64 B) -- 352 B in a 512 B reserve
-                              (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering: 384 B; the total is unchanged)        226,176
+                              (+ the two 1-stage gate arrays, 32 B, on the EPILOGUE_GATE rendering: 384 B; the total is unchanged).  KV_E4M3: 768 --
+                              + the fp8 landing barriers mb_kv8_full (GATHER_WARPS x STAGES_KV = 24 8-B mbarriers, 192 B, 16-B padded 208 B); the
+                              reserve grows by 256 B, the ONLY SMEM change of the arm                                                          226,176
     total          226,688 B = 221.4 KiB  < 232,448 B (227 KiB, the standard carveout; L1 keeps its 100 KiB) by 5,760 B
+                   (KV_E4M3: 226,944 B = 221.6 KiB, 5,504 B under the standard carveout; the last MMA-operand start is unchanged, so DESC_VERSION stays 0)
 
 Descriptor version: the LAST MMA-operand start is sKV[STAGES_KV - 1] = 155,648 B < 262,144 -> DESC_VERSION = 0, ONE module
 constant passed to every SmemTile (a version-0 descriptor's 14-bit start_address wraps at 256 KiB; version 1 is not a
 transparent widening, so it is derived, never "set to be safe").  A separate gate slot (+8 KiB) or ring depth 4 (+64 KiB)
 needs the oversized carveout (ALLOW_OVERSIZED_SHARED_MEMORY, L1 -> 8 kB) -- measured levers, not defaults.  Proxy fences:
-after the P^T generic stores (before mb_p_full), after the once-per-CTA sQ tail-row zeroing; the TMEM path is ordered by
+after the P^T generic stores (before mb_p_full), after the once-per-CTA sQ tail-row zeroing, and -- KV_E4M3 -- after each gather warp's
+in-place bf16 expansion of a stage (before its mb_kv_full arrive; the same fence orders the warp's generic LDS of the e4m3 zone before its
+NEXT TMA write into it three loads later); the TMEM path is ordered by
 tcgen05_fence + the commits; the sIds bulk copy -> LDS and gate TMA -> LDS edges are ordered by their mbarrier waits.
 
 TMEM MAP (64 columns per CTA, allocated once, is_exclusive=False -- <= 512 columns; at two softmax column groups group g touches columns
@@ -365,7 +397,9 @@ GATHER TENSOR MAP: one 2-D map per operand, tokens OUTER, the token's FULL ROW i
 SW128 span; the head and the d-box live in the COLUMN coordinate (h x D + box x 64; + o_k / o_v on the block's slab), every
 batch / sequence / page term in the ROW coordinate (b x S + 4 blk + r; cu_seqlens_k[b] + 4 blk + r; the paged form below).
 Stride contract: last dim contiguous, head stride a multiple of 64 elements, token stride a multiple of 8 elements, extents
-< 2^32, page_size % 4 == 0.
+< 2^32, page_size % 4 == 0.  KV_E4M3: the SAME byte rules spelled in e4m3 elements -- dtype Float8E4M3FN, box (128 elems, 1 row) = one
+128-B span, the token stride a multiple of 16 elements (16 B), the head stride a multiple of 128 elements (a 128-B box start); the
+strides the host hands are the pool's own (in e4m3 elements).
 
 PAGED ARM (CFG.PAGED_KV; a const_expr branch of the gather warps only -- the softmax, MMA and TMA warps and every barrier /
 SMEM row are the dense arm's): K / V are page POOLS [num_pages, H_kv, PAGE_SIZE, D] addressed through a (B, max_pages) int32
@@ -381,6 +415,42 @@ block whose first token is at or past the batch's KV length (its page index may 
 index past the table and a -1 table entry (the page -1 convention of the dense paged tiles) all take row -1: TMA zero-fill,
 bytes credited -- so the rows of a partially filled last page beyond the KV length (another sequence's tokens, or garbage)
 never reach an MMA, and the straddling rows of the open block are masked exactly as in the dense arm (key_abs < the length).
+
+KV-E4M3 ARM (CFG.KV_E4M3; TemplateParams.kv_dtype = 0; a const_expr arm of the gather warps, the softmax prologue / epilogue and the
+host's gather maps -- the bf16 rendering traces the same program as before; bf16 Q / P / O over PAGED e4m3 pools only): the pools hold
+e4m3 CODES under ONE fp32 per-tensor DEscale per operand (value = code x scale; the serving stacks' fp8 KV-cache recipe), read on
+device from the 1-element tensors ``k_scale`` / ``v_scale``.  A K / V row is 256 B = TWO 128-B SW128 boxes (GATHER_BOXES_KV = 2 of
+GATHER_BOX_ELEMS_KV = 128 e4m3 elements) instead of four, so each gather warp issues 8 gather4 per operand stage instead of 16
+(KV8_TX_BYTES_PER_WARP = 8 x 512 = 4096 B; 8 warps = the 32 KiB e4m3 tile) and lands them in the UPPER HALF of the SAME 64 KiB bf16
+stage buffer: e4m3 box b8 of quad q at bf16 box (KV_E4M3_ZONE_BOX0 + b8) x 16 KiB + q x 512 B (KV_E4M3_ZONE_BOX0 = 2) -- the quad / sub-box
+addressing of today's boxes 2 / 3, so the swizzle the hardware applies is a tiled load's.  Each warp then EXPANDS ITS OWN 16 rows
+([16 w, 16 w + 16) of every box) IN PLACE into the bf16 SW128 tile the two MMA descriptors already read -- ``cvt.rn.bf16x2.e4m3x2``
+(EXACT: e4m3 is a subset of bf16; NO scale multiply in the cast) through load_swizzled / store_swizzled under the one Swizzle(3, 4, 3):
+pass A reads e4m3 box 0 (4 LDS.128 per lane: 8 consecutive lanes read the 8 chunks of ONE 128-B row -- the SW128 XOR permutes the chunk
+slots within the row's bank cycle, all 32 banks once -- 4 rows per instruction) and writes bf16 boxes 0 / 1 (the LOWER half: nothing
+aliases there), a bar.warp.sync (every lane's reads of e4m3 box 0 are done before pass B's writes to bf16 box 2 overwrite its bytes),
+pass B reads e4m3 box 1 one 4-row group at a time (the 32 lanes cover a group's 4 rows x 8 chunks), a bar.warp.sync per group (every lane's
+reads of those rows are done before any lane overwrites them; a later group reads rows no earlier group wrote), then writes the group's rows
+of bf16 boxes 2 / 3 (= e4m3 boxes 0 / 1's bytes); each 16-B e4m3 chunk becomes two 16-B bf16 chunks whose two STS are STAGGERED by chunk parity
+(store 1 = the even bf16 chunk for lanes c8 < 4, the odd one for c8 >= 4; store 2 the complement) so every STS instruction covers all 8
+chunk slots of its 128-B bank cycle; then ``fence.proxy.async.shared::cta`` (generic STS feed a tcgen05 descriptor read -- the P^T
+store's pattern), a bar.warp.sync and ONE elected THREAD arrive on mb_kv_full[s] (barrier row 5: the SAME count 8, the producer KIND
+changes from the TMA's expect_tx).  The in-place rewrite is a per-WARP program-order problem, never a cross-warp one: the e4m3 rows a
+warp's TMA landed are exactly the rows its bf16 writes overwrite.  The gather warp runs a one-load software pipeline (issue(L + 1), then
+cast(L)) with TWO carried PipelineStates -- ``kv_state`` (the issue pointer: the mb_kv_empty wait + the stage filled, as today) and
+``cast_state`` (one load behind: the mb_kv8_full wait + the mb_kv_full arrive) -- in the ring order K(0) K(1) V(0) K(2) V(1) ... the MMA
+consumes; a dead item issues and casts its one tile of -1 rows (P14: both states advance per load on every path).  The scales are
+FOLDED, the serving stacks' function: k_scale into the softmax scale (``scale_log2 x k_scale``, one fp32 multiply per lane per CTA, read
+in the softmax prologue) and v_scale into the per-item normaliser (``inv_sum x v_scale``; under a split into the partial store, the LSE
+partial unchanged -- the combine is untouched), so the LSE is the log-sum-exp of the scores over the DEQUANTIZED K, the cast stays exact,
+and at a POWER-OF-TWO scale (1.0 included) the arm is BITWISE the bf16 kernel fed bf16(code x scale) (fp32 scaling by 2^e commutes with
+every rounding on the path).  Degenerate inputs: a -1 / dead / past-length row -> TMA zero codes -> zero bf16 -> the existing -inf mask by
+key_abs; a NaN-poisoned e4m3 cell past kv_len inside the last live page casts to a bf16 NaN and reaches the MMA with P = 0 exactly as a
+bf16 pool's NaN would (sdpa-invariants.md section 1: a zero-initialised pool is the contract; the tests poison read cells with the finite
+sentinel 0x7E = 448); a saturated code (+-448) is a finite bf16; the scales are read as given (the host checks their FORM only).  No SMEM
+growth beyond the misc reserve (the 24 fp8 landing barriers, 226,688 -> 226,944 B; the standard carveout, L1 kept), no warp added (20
+warps / 96 registers), no TMEM change, the MMA / TMA-LDG / scheduler roles untouched.  f16 activations x e4m3 pools and the dense K / V
+operands are declined by the config (a scope choice, not hardware).
 
 DECODE FORM (CFG.BOTTOM_RIGHT + CFG.LIST_PER_SEQUENCE + CFG.SPLIT_KV, each a const_expr arm; the dense rendering is unchanged):
 the serving step's S_q <= 4 rows per sequence sit at the END of the sequence (BOTTOM_RIGHT: pos = tok + L_b - S_q), share ONE
@@ -487,6 +557,10 @@ if CFG.DTYPE_QKV == 2:
     STORAGE_DTYPE = cutlass.BFloat16
 else:
     STORAGE_DTYPE = cutlass.Float16
+# The K / V STORAGE dtype arm (CFG.KV_E4M3; the header's KV-E4M3 ARM paragraph): the paged pools hold e4m3 codes, gathered as such and
+# expanded in place to the bf16 operand tile by the gather warps; Q / P / O and the MMA kind stay the activation dtype's.
+KV_E4M3 = bool(CFG.KV_E4M3)
+KV_STORAGE_DTYPE = cutlass.Float8E4M3FN if KV_E4M3 else STORAGE_DTYPE
 MMA_KIND = nvvm.Tcgen05MMAKind.F16
 CTA_GROUP_KIND = nvvm.CTAGroup.CTA_1
 
@@ -512,6 +586,15 @@ BLOCKS_PER_WARP = CFG.BLOCKS_PER_WARP
 BLOCK_TOPK = CFG.BLOCK_TOPK
 GATHER_BOXES = CFG.GATHER_BOXES
 GATHER_BOX_ELEMS = CFG.GATHER_BOX_ELEMS
+# The gather geometry in the K / V STORAGE dtype (the bf16 arm's values exactly when KV_E4M3 is off, so that rendering traces the same
+# program): the map's element size, the boxes per 256-wide row and their width in KV elements, the per-warp e4m3 bytes (the fp8 landing
+# barriers' expect_tx), the bf16 box index the e4m3 landing zone starts at (the stage's upper half), the landing ring's stage count.
+KV_BPE = CFG.KV_BPE
+GATHER_BOXES_KV = CFG.GATHER_BOXES_KV
+GATHER_BOX_ELEMS_KV = CFG.GATHER_BOX_ELEMS_KV
+KV8_TX_BYTES_PER_WARP = CFG.KV8_TX_BYTES_PER_WARP
+KV_E4M3_ZONE_BOX0 = CFG.KV_E4M3_ZONE_BOX0
+KV8_FULL_STAGES = CFG.KV8_FULL_STAGES
 # The paged arm: PAGE_SIZE tokens per pool page (0 on the dense arm, where no paged code is traced); PAGE_SIZE % BLOCK_SIZE == 0
 # (the config's predicate) is what makes ONE block-table lookup per block sufficient.
 PAGED_KV = CFG.PAGED_KV
@@ -562,6 +645,29 @@ SMEM_LAYOUT_QK = _SWZ_ENUM[CFG.Q_SWZ_BYTES]
 SMEM_LAYOUT_P = _SWZ_ENUM[CFG.P_SWZ_BYTES]
 # The generic-proxy P^T stores apply the same XOR pattern the UMMA descriptor decodes (Swizzle<B, 4, 3>).
 _P_SMEM_SWIZZLE = cutlass.Swizzle(_SWZ_BITS[CFG.P_SWZ_BYTES], 4, 3)
+# KV_E4M3: the gather warps' lane-side LDS / STS of the K / V stage follow the SW128 XOR the gather map writes and the two descriptors
+# decode (Swizzle(3, 4, 3) on the byte address: the 16-B chunk bits [4, 7) XOR the 128-B row bits [7, 10)) -- BOTH jobs of a swizzle
+# (frost-kernels.md section 5): the descriptors read the tile, and the XOR spreads the 8 chunk slots of a row over the 32 banks.
+_KV_SMEM_SWIZZLE = cutlass.Swizzle(_SWZ_BITS[CFG.K_SWZ_BYTES], 4, 3)
+# The in-place expansion's lane map (KV_E4M3): a warp casts ITS ROWS_PER_GATHER_WARP = 16 rows of every box; a 128-B box-row is 8 chunks of
+# 16 B (16 codes -> 2 bf16 chunks of 16 B); 32 lanes = 4 rows x 8 chunks per LDS / STS; 4 LDS per e4m3 box per lane, 8 per operand stage.
+ROWS_PER_GATHER_WARP = TILE_N // CFG.GATHER_WARPS
+_KV8_CHUNK_BYTES = 16
+_KV8_CHUNK_ELEMS = _KV8_CHUNK_BYTES // BPE  # 8 bf16 elements per 16-B chunk of the stage buffer (the Array's element is the activation's)
+_KV8_CHUNKS_PER_ROW = (GATHER_BOX_ELEMS_KV * KV_BPE) // _KV8_CHUNK_BYTES  # 8 chunks of 16 B per 128-B box-row
+_KV8_ROWS_PER_LDS = 32 // _KV8_CHUNKS_PER_ROW  # 4 rows per warp-wide 16-B access
+_KV8_LDS_PER_BOX = ROWS_PER_GATHER_WARP // _KV8_ROWS_PER_LDS  # 4 accesses per e4m3 box per lane
+if KV_E4M3 and (
+    _KV8_CHUNKS_PER_ROW != 8
+    or _KV8_ROWS_PER_LDS * _KV8_CHUNKS_PER_ROW != 32
+    or _KV8_LDS_PER_BOX * _KV8_ROWS_PER_LDS != ROWS_PER_GATHER_WARP
+    or GATHER_BOXES_KV != 2
+    or GATHER_BOX_ELEMS_KV * KV_BPE != GATHER_BOX_ELEMS * BPE
+    or KV_E4M3_ZONE_BOX0 + GATHER_BOXES_KV != GATHER_BOXES
+):
+    raise ValueError(
+        "sparse_d256_f16: the KV_E4M3 lane map needs 128-B box-rows of 8 chunks, 16 rows per gather warp, two e4m3 boxes landing in the stage's upper half"
+    )
 P_ROW_WORDS = N_Q // 2  # the FULL P^T row of a key lane (every group's columns)
 
 # K-major operands (K as A of BMM1, Q^T as B of BMM1): SBO = 8 rows x 128 B.
@@ -629,6 +735,7 @@ class SparseBars(NamedTuple):
     mb_tmem_dealloc: object
     mb_gate_full: object  # rows 11 / 12: the EPILOGUE_GATE arm only (None on the ungated rendering)
     mb_gate_empty: object
+    mb_kv8_full: object  # row 5e: the per-(gather warp, stage) fp8 landing barriers, KV_E4M3 arm only (None otherwise); index w x STAGES_KV + s
 
 
 def make_sparse_bars() -> SparseBars:
@@ -636,19 +743,24 @@ def make_sparse_bars() -> SparseBars:
     header's ledger derives: ONE_LANE for every TMA_LOAD / MMA_COMMIT producer, KV_FULL_ARRIVERS = one expect_tx per gather
     warp, IDS_EMPTY_ARRIVERS = one elected lane per list-reading warp, SOFTMAX_LANES for the bare lane arrives).  Rows 11 / 12
     (the gate's TMA_LOAD full barrier: ONE_LANE, and its THREAD empty barrier: SOFTMAX_LANES, one stage each -- the gate of
-    item i aliases the item's own sQ slot, so one slot is in flight at a time) exist on the EPILOGUE_GATE rendering only."""
+    item i aliases the item's own sQ slot, so one slot is in flight at a time) exist on the EPILOGUE_GATE rendering only.  Row 5e (the
+    per-(gather warp, stage) fp8 landing barriers: ONE_LANE each, TMA_LOAD; KV8_FULL_STAGES = GATHER_WARPS x STAGES_KV) exists on the
+    KV_E4M3 rendering only, where row 5's producer becomes the elected THREAD arrive of each gather warp after its cast (CFG.KV_FULL_PRODUCER)
+    at the UNCHANGED count KV_FULL_ARRIVERS -- the typed producer makes a stray ``n_bytes=`` on that arm a trace-time error (P1)."""
 
     def _alloc(n):
         return cutlass.Array(cutlass.Int64, n, alignment=16, space=cutlass.AddressSpace.smem)
 
     gate_full = MBarrier(_alloc(CFG.STAGES_GATE), stages=CFG.STAGES_GATE, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if CFG.EPILOGUE_GATE else None
     gate_empty = MBarrier(_alloc(CFG.STAGES_GATE), stages=CFG.STAGES_GATE, init_count=SOFTMAX_LANES, producer=Producer.THREAD) if CFG.EPILOGUE_GATE else None
+    kv_full_producer = Producer.THREAD if CFG.KV_FULL_PRODUCER else Producer.TMA_LOAD
+    kv8_full = MBarrier(_alloc(KV8_FULL_STAGES), stages=KV8_FULL_STAGES, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD) if KV_E4M3 else None
     return SparseBars(
         mb_q_full=MBarrier(_alloc(STAGES_Q), stages=STAGES_Q, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_q_empty=MBarrier(_alloc(STAGES_Q), stages=STAGES_Q, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_ids_full=MBarrier(_alloc(STAGES_IDS), stages=STAGES_IDS, init_count=CFG.ONE_LANE, producer=Producer.TMA_LOAD),
         mb_ids_empty=MBarrier(_alloc(STAGES_IDS), stages=STAGES_IDS, init_count=CFG.IDS_EMPTY_ARRIVERS, producer=Producer.THREAD),
-        mb_kv_full=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.KV_FULL_ARRIVERS, producer=Producer.TMA_LOAD),
+        mb_kv_full=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.KV_FULL_ARRIVERS, producer=kv_full_producer),
         mb_kv_empty=MBarrier(_alloc(STAGES_KV), stages=STAGES_KV, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_s_full=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=CFG.ONE_LANE, producer=Producer.MMA_COMMIT),
         mb_s_empty=MBarrier(_alloc(STAGES_S), stages=STAGES_S, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
@@ -657,6 +769,7 @@ def make_sparse_bars() -> SparseBars:
         mb_tmem_dealloc=MBarrier(_alloc(1), stages=1, init_count=SOFTMAX_LANES, producer=Producer.THREAD),
         mb_gate_full=gate_full,
         mb_gate_empty=gate_empty,
+        mb_kv8_full=kv8_full,
     )
 
 
@@ -1110,6 +1223,8 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, ro
     NaN) ever reaches an MMA under P = 0."""
     stage_off = stage_idx * cutlass.Int32(kvBufferElems)
     quad0 = w * cutlass.Int32(BLOCKS_PER_WARP)
+    # KV_E4M3: GATHER_BOXES_KV = 2 boxes of 128 e4m3 elements per row, landing at bf16 boxes KV_E4M3_ZONE_BOX0.. (the stage's upper half);
+    # the quad's 512-B offset inside the 16 KiB sub-box is the same in both arms (a box-row is 128 B either way).
     for q in cutlass.range_constexpr(BLOCKS_PER_WARP):
         blk = cutlass.Int32(blks[q])
         key0 = blk * cutlass.Int32(BLOCK_SIZE)
@@ -1125,12 +1240,12 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, ro
         for r in cutlass.range_constexpr(BLOCK_SIZE):
             rows.append(_select_i32(live & ((key0 + cutlass.Int32(r)) < eff_seqlen_kv), base + cutlass.Int32(r), cutlass.Int32(-1)))
         quad_elems = (quad0 + cutlass.Int32(q)) * cutlass.Int32(BLOCK_SIZE * GATHER_BOX_ELEMS)
-        for b in cutlass.range_constexpr(GATHER_BOXES):
+        for b in cutlass.range_constexpr(GATHER_BOXES_KV):
             tma_gather4(
                 desc,
-                sKV_raw.subview(stage_off + cutlass.Int32(b * SUB_BOX_ELEMS) + quad_elems),
+                sKV_raw.subview(stage_off + cutlass.Int32((KV_E4M3_ZONE_BOX0 + b) * SUB_BOX_ELEMS) + quad_elems),
                 mbar,
-                col_base + cutlass.Int32(b * GATHER_BOX_ELEMS),
+                col_base + cutlass.Int32(b * GATHER_BOX_ELEMS_KV),
                 rows[0],
                 rows[1],
                 rows[2],
@@ -1138,6 +1253,114 @@ def _gather_fill(desc, sKV_raw, stage_idx, mbar, w, blks, pages, kv_row_base, ro
                 cta_group=1,
                 l2_hint=hint,
             )
+
+
+@cute.jit
+def _arm_kv_load(bars, w, stage_idx):
+    """Arm the landing barrier of THIS warp's share of one K / V load and return its SMEM pointer for the gather4s: the bf16 arm's
+    ``mb_kv_full[stage]`` (barrier row 5, TMA_LOAD: KV_TX_BYTES_PER_WARP = the warp's 16 gather4), the KV_E4M3 arm's own
+    ``mb_kv8_full[w][stage]`` (row 5e, TMA_LOAD: KV8_TX_BYTES_PER_WARP = its 8 gather4; row 5 is then the THREAD arrive of ``_cast_kv_stage``).
+    One elected lane per warp (``pred=elect_sync()``), the count the config pins."""
+    if cutlass.const_expr(KV_E4M3):
+        mb = bars.mb_kv8_full[w * cutlass.Int32(STAGES_KV) + stage_idx]
+        mb.arrive(n_bytes=KV8_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
+    else:
+        mb = bars.mb_kv_full[stage_idx]
+        mb.arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
+    return mb.smem_ptr
+
+
+@cute.jit
+def _e4m3x16_to_bf16x16(w0: cutlass.Int32, w1: cutlass.Int32, w2: cutlass.Int32, w3: cutlass.Int32):
+    """16 e4m3 codes (four 32-bit words, memory order) -> 16 bf16 (eight words, memory order) by ``cvt.rn.bf16x2.e4m3x2`` alone -- EXACT
+    (every e4m3 value, sub-normals included, is a bf16 value; a NaN code is a bf16 NaN, a saturated +-448 a finite bf16); NO scale multiply
+    (the scales are folded into the softmax scale and the normaliser).  Word k's low byte pair -> output word 2k, its high pair -> 2k + 1,
+    the low code of a pair in the low half of the bf16 pair: the element order of the 32-B bf16 span is the 16-B e4m3 span's."""
+    return nvvm.inline_ptx(
+        "{ .reg .b16 a<8>;\n"
+        "mov.b32 {a0, a1}, $8; mov.b32 {a2, a3}, $9; mov.b32 {a4, a5}, $10; mov.b32 {a6, a7}, $11;\n"
+        "cvt.rn.bf16x2.e4m3x2 $0, a0; cvt.rn.bf16x2.e4m3x2 $1, a1; cvt.rn.bf16x2.e4m3x2 $2, a2; cvt.rn.bf16x2.e4m3x2 $3, a3;\n"
+        "cvt.rn.bf16x2.e4m3x2 $4, a4; cvt.rn.bf16x2.e4m3x2 $5, a5; cvt.rn.bf16x2.e4m3x2 $6, a6; cvt.rn.bf16x2.e4m3x2 $7, a7; }",
+        write_only_types=[cutlass.Int32] * 8,
+        read_only_args=[w0, w1, w2, w3],
+    )
+
+
+@cute.jit
+def _kv8_chunk_ptr(sKV_raw, stage_off, box, row, chunk):
+    """One 16-B chunk of a K / V stage as an Int32 pointer at its UNSWIZZLED element offset -- bf16 box ``box`` (16 KiB each), row ``row``
+    (128 B each), 16-B chunk ``chunk`` of the row; the caller's ``load_swizzled`` / ``store_swizzled`` under ``_KV_SMEM_SWIZZLE`` apply the
+    SW128 XOR the gather map wrote and the descriptors decode (never hand-XORed)."""
+    off = stage_off + box * cutlass.Int32(SUB_BOX_ELEMS) + row * cutlass.Int32(GATHER_BOX_ELEMS) + chunk * cutlass.Int32(_KV8_CHUNK_ELEMS)
+    return Pointer(sKV_raw.subview(off).data_ptr(), dtype=cutlass.Int32)
+
+
+@cute.jit
+def _kv8_expand_store(sKV_raw, stage_off, dst_box, row, codes, first_odd, dst_chunk_a, dst_chunk_b):
+    """KV_E4M3: expand one 16-B e4m3 chunk (``codes``: a Vector of 4 Int32) to its 32 B of bf16 and store them as the two 16-B chunks
+    ``dst_chunk_a`` / ``dst_chunk_b`` of row ``row`` in bf16 box ``dst_box`` -- the EVEN bf16 chunk holds elements 0..7 (output words 0..3),
+    the ODD one 8..15 (words 4..7); ``first_odd`` (lanes whose source chunk is 4..7) stores the odd chunk FIRST so that each STS instruction
+    of the 8 lanes sharing a row covers all 8 chunk slots of the 128-B bank cycle (the two destination boxes sit 16 KiB apart = the same
+    bank alignment; without the stagger every STS would hit 4 slots twice)."""
+    o0, o1, o2, o3, o4, o5, o6, o7 = _e4m3x16_to_bf16x16(cutlass.Int32(codes[0]), cutlass.Int32(codes[1]), cutlass.Int32(codes[2]), cutlass.Int32(codes[3]))
+    # the two 16-B halves one after the other (the stagger's selects stay a 4-register transient: the gather warps run at the 96-register flat
+    # entry count, and every live register here is one the item loop's carried state cannot have)
+    wa = cutlass.Vector.from_elements(
+        (_select_i32(first_odd, o4, o0), _select_i32(first_odd, o5, o1), _select_i32(first_odd, o6, o2), _select_i32(first_odd, o7, o3)), cutlass.Int32
+    )
+    _kv8_chunk_ptr(sKV_raw, stage_off, dst_box, row, dst_chunk_a).store_swizzled(wa, _KV_SMEM_SWIZZLE, alignment=16)
+    wb = cutlass.Vector.from_elements(
+        (_select_i32(first_odd, o0, o4), _select_i32(first_odd, o1, o5), _select_i32(first_odd, o2, o6), _select_i32(first_odd, o3, o7)), cutlass.Int32
+    )
+    _kv8_chunk_ptr(sKV_raw, stage_off, dst_box, row, dst_chunk_b).store_swizzled(wb, _KV_SMEM_SWIZZLE, alignment=16)
+
+
+@cute.jit
+def _cast_kv_stage(sKV_raw, bars, w, lane, stage_idx, phase):
+    """KV_E4M3 (the header's KV-E4M3 ARM paragraph): the in-place expansion of THIS warp's 16 rows of one K / V stage from the e4m3 zone (bf16
+    boxes KV_E4M3_ZONE_BOX0 .. +1, the stage's upper half) to the full bf16 SW128 tile, then the stage's publish to the MMA warp.
+
+    Waits the warp's OWN landing barrier (row 5e: its 8 gather4 have landed; nobody else's bytes gate this warp).  Lane map: ``c8 = lane & 7``
+    is the thread's 16-B source chunk of a 128-B box-row, ``lane >> 3`` its row of the 4-row group of one access; 4 accesses per e4m3 box per
+    lane cover the warp's 16 rows.  Pass A: e4m3 box 0 -> bf16 boxes 0 / 1 (the lower half: nothing aliases), chunk by chunk.  A bar.warp.sync
+    (pass B's writes to bf16 box 2 overwrite e4m3 box 0's bytes: every lane's reads of them are done).  Pass B: e4m3 box 1 -> bf16 boxes 2 / 3
+    ONE 4-row group at a time -- the group's 16-B chunks loaded (one per lane: the 32 lanes cover the group's 4 rows x 8 chunks), a
+    bar.warp.sync (every lane's read of those 4 rows is done before any lane overwrites them: bf16 box 3's rows are e4m3 box 1's SAME rows, and
+    a later group reads rows no earlier group wrote), the expand + stores; four groups per warp.  Then ``fence.proxy.async.shared::cta`` (the
+    generic STS feed the tcgen05 descriptor read -- the P^T store's pattern; it also orders this warp's generic LDS of the zone before its next
+    TMA write into it), a bar.warp.sync and ONE elected THREAD arrive on mb_kv_full[stage] (row 5: 8 warps x 1 = KV_FULL_ARRIVERS; THREAD has
+    no ``pred=`` path, P16 -- a branch).  Per lane per operand stage: 8 LDS.128, 64 cvt, 16 STS.128, 6 warp syncs, 1 proxy fence; the staged set
+    stays at one 16-B chunk per lane (the gather warps run at the 96-register flat entry count)."""
+    bars.mb_kv8_full[w * cutlass.Int32(STAGES_KV) + stage_idx].wait(phase, spin=SPIN_RING_WAITS)
+    stage_off = stage_idx * cutlass.Int32(kvBufferElems)
+    c8 = lane & cutlass.Int32(_KV8_CHUNKS_PER_ROW - 1)
+    row0 = w * cutlass.Int32(ROWS_PER_GATHER_WARP) + (lane >> cutlass.Int32(3))
+    # source chunk c8 (elements 16 c8 .. 16 c8 + 15 of the box-row) -> bf16 box (c8 // 4) of the pass's pair, chunks 2 (c8 % 4) and + 1
+    dst_box_in_pair = c8 >> cutlass.Int32(2)
+    dst_chunk_even = (c8 & cutlass.Int32(3)) << cutlass.Int32(1)
+    first_odd = c8 >= cutlass.Int32(_KV8_CHUNKS_PER_ROW // 2)
+    dst_chunk_a = dst_chunk_even + _select_i32(first_odd, 1, 0)
+    dst_chunk_b = dst_chunk_even + _select_i32(first_odd, 0, 1)
+    src_box0 = cutlass.Int32(KV_E4M3_ZONE_BOX0)
+    src_box1 = cutlass.Int32(KV_E4M3_ZONE_BOX0 + 1)
+    # pass A: e4m3 box 0 -> bf16 boxes 0 / 1
+    for it in cutlass.range_constexpr(_KV8_LDS_PER_BOX):
+        row = row0 + cutlass.Int32(it * _KV8_ROWS_PER_LDS)
+        codes = _kv8_chunk_ptr(sKV_raw, stage_off, src_box0, row, c8).load_swizzled(_KV_SMEM_SWIZZLE, alignment=16, count=4)
+        _kv8_expand_store(sKV_raw, stage_off, dst_box_in_pair, row, codes, first_odd, dst_chunk_a, dst_chunk_b)
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    # pass B: e4m3 box 1 -> bf16 boxes 2 / 3 (= the e4m3 zone's own bytes), one 4-row group at a time: the group's reads land in registers,
+    # a warp sync, then its writes (bf16 box 3's rows ARE e4m3 box 1's same rows; a later group reads rows no earlier group wrote)
+    for it in cutlass.range_constexpr(_KV8_LDS_PER_BOX):
+        row = row0 + cutlass.Int32(it * _KV8_ROWS_PER_LDS)
+        codes = _kv8_chunk_ptr(sKV_raw, stage_off, src_box1, row, c8).load_swizzled(_KV_SMEM_SWIZZLE, alignment=16, count=4)
+        nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+        _kv8_expand_store(sKV_raw, stage_off, cutlass.Int32(KV_E4M3_ZONE_BOX0) + dst_box_in_pair, row, codes, first_odd, dst_chunk_a, dst_chunk_b)
+    # publish: generic STS -> the async proxy's descriptor read (frost-tile-dsl.md section 1), every lane's work before the one arrive
+    nvvm.fence_proxy("async.shared", space="cta")
+    nvvm.bar_warp_sync(cute.arch.FULL_MASK)
+    if nvvm.elect_sync():
+        bars.mb_kv_full[stage_idx].arrive()
 
 
 @cute.jit
@@ -1176,6 +1399,12 @@ def _gather_warp_group(
     # CARRIED across items (never recomputed from a per-item tile index -- barrier rows 5 / 6).
     kv_state = PipelineState.start(phase=1)
     ids_state = PipelineState.start(phase=0)
+    if cutlass.const_expr(KV_E4M3):
+        # cast_state: the one-load-behind pointer of the in-place expansion (barrier row 5e's wait-then-arrive consumer, row 5's producer slot),
+        # CARRIED across items like kv_state and advanced per cast: within an item it lags kv_state by one load and drains to equality at the
+        # item's end (every issued load is cast before the ids_empty arrive); the kv8 ring starts at phase 0 (wait-then-arrive).
+        cast_state = PipelineState.start(phase=0)
+        lane = cute.arch.thread_idx()[0] & cutlass.Int32(31)
     tok, head, batch, item_row, kv_row_base, eff_seqlen_q, _ot, _ob, split = _decode_item(t0_init, t1_init, seq_kv_lens_tensor, n_batch, seqlen_q, seqlen_kv)
     is_valid = cutlass.Int32(1)
     sched_state = PipelineState.start()
@@ -1197,13 +1426,13 @@ def _gather_warp_group(
         blks_cur = _gather_block_ids(sIds_raw, slot_base, tile0, w, count, n_tail, tail_lo, dead)
         pages_cur = _gather_block_pages(blks_cur, block_table_tensor, batch, max_pages, eff_seqlen_kv) if cutlass.const_expr(PAGED_KV) else None
         bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-        bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
+        kv_mbar = _arm_kv_load(bars, w, kv_state.idx)
         if nvvm.elect_sync():
             _gather_fill(
                 tma_k_desc,
                 sKV_raw,
                 kv_state.idx,
-                bars.mb_kv_full[kv_state.idx].smem_ptr,
+                kv_mbar,
                 w,
                 blks_cur,
                 pages_cur,
@@ -1215,6 +1444,8 @@ def _gather_warp_group(
                 hint,
             )
         kv_state = advance(kv_state, STAGES_KV)
+        # (KV_E4M3: the item's first load has no predecessor to cast; every later issue below is followed by the cast of the load before it,
+        # and the item's last load is cast after the loop -- issue(L + 1), cast(L): the DRAM round trip of L + 1 overlaps the expansion of L.)
         for i in cutlass.range(0, n_tiles, 1, unroll=1):
             # The next tile's ids are read before this iteration's ring waits (an in-bounds address even past the last tile).
             t_next = cute.math.min(i + cutlass.Int32(1), n_tiles - cutlass.Int32(1))
@@ -1224,13 +1455,13 @@ def _gather_warp_group(
             pages_next = _gather_block_pages(blks_next, block_table_tensor, batch, max_pages, eff_seqlen_kv) if cutlass.const_expr(PAGED_KV) else None
             if i + cutlass.Int32(1) < n_tiles:
                 bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-                bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
+                kv_mbar = _arm_kv_load(bars, w, kv_state.idx)
                 if nvvm.elect_sync():
                     _gather_fill(
                         tma_k_desc,
                         sKV_raw,
                         kv_state.idx,
-                        bars.mb_kv_full[kv_state.idx].smem_ptr,
+                        kv_mbar,
                         w,
                         blks_next,
                         pages_next,
@@ -1242,14 +1473,17 @@ def _gather_warp_group(
                         hint,
                     )
                 kv_state = advance(kv_state, STAGES_KV)
+                if cutlass.const_expr(KV_E4M3):
+                    _cast_kv_stage(sKV_raw, bars, w, lane, cast_state.idx, cast_state.phase)
+                    cast_state = advance(cast_state, STAGES_KV)
             bars.mb_kv_empty[kv_state.idx].wait(kv_state.phase, spin=SPIN_RING_WAITS)
-            bars.mb_kv_full[kv_state.idx].arrive(n_bytes=KV_TX_BYTES_PER_WARP, pred=nvvm.elect_sync())
+            kv_mbar = _arm_kv_load(bars, w, kv_state.idx)
             if nvvm.elect_sync():
                 _gather_fill(
                     tma_v_desc,
                     sKV_raw,
                     kv_state.idx,
-                    bars.mb_kv_full[kv_state.idx].smem_ptr,
+                    kv_mbar,
                     w,
                     blks_cur,
                     pages_cur,
@@ -1261,8 +1495,15 @@ def _gather_warp_group(
                     hint,
                 )
             kv_state = advance(kv_state, STAGES_KV)
+            if cutlass.const_expr(KV_E4M3):
+                _cast_kv_stage(sKV_raw, bars, w, lane, cast_state.idx, cast_state.phase)
+                cast_state = advance(cast_state, STAGES_KV)
             blks_cur = blks_next
             pages_cur = pages_next
+        if cutlass.const_expr(KV_E4M3):
+            # the item's last load (V(n - 1)) -- cast_state drains to equality with kv_state before the list slot is released
+            _cast_kv_stage(sKV_raw, bars, w, lane, cast_state.idx, cast_state.phase)
+            cast_state = advance(cast_state, STAGES_KV)
 
         # The last read of this item's list slot (row 4: ONE lane per consuming warp).
         if nvvm.elect_sync():
@@ -1494,11 +1735,22 @@ def _softmax_warp_group(
     scale_log2: cutlass.Float32,
     sQ_raw=None,  # the gated arm reads the item's gate out of its freed Q^T slot (appended; unused ungated)
     use_pdl: cutlass.Constexpr[bool] = False,
+    k_scale_tensor: Optional[cute.Tensor] = None,  # KV_E4M3 (appended): the pools' per-tensor fp32 DEscales, [1] each, read once per CTA
+    v_scale_tensor: Optional[cute.Tensor] = None,
 ):
     nvvm.barrier_cta_sync(barrier_id=_BAR_TMEM, thread_count=BAR_TMEM_THREADS)
     tidx = cute.arch.thread_idx()[0]
+    # KV_E4M3: the two scales FOLDED (the serving stacks' function; the header's KV-E4M3 ARM paragraph) -- k_scale into the softmax scale (ONE fp32
+    # multiply per lane per CTA, here in the prologue), v_scale into the per-item normaliser (the epilogue below); the cast of the codes stays
+    # exact and at a power-of-two scale every rounding on the path commutes with the fold (bitwise the bf16 kernel over bf16(code x scale)).
+    scale_log2_kv = scale_log2
+    v_scale = None
+    if cutlass.const_expr(KV_E4M3):
+        k_scale = cutlass.Float32(cutlass.make_array_view(k_scale_tensor)[0])
+        v_scale = cutlass.Float32(cutlass.make_array_view(v_scale_tensor)[0])
+        scale_log2_kv = scale_log2 * k_scale
     sm_warp = tidx // cutlass.Int32(32)  # 0 .. SOFTMAX_WARPS - 1 (all groups)
-    # The column group (warp-uniform) and its first column; the key row of S^T / P^T = the d row of O^T is the lane WITHIN the group.
+    # The column group (warp-uniform) and its first column; the key row of S^T / P^T = the d row of O^T is the thread WITHIN the group.
     # At ONE group the three are the constants 0 / 0 / tidx, so that rendering traces today's program.
     grp = (sm_warp // cutlass.Int32(SOFTMAX_WARPS_PER_GROUP)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(0)
     col0 = (grp * cutlass.Int32(COLS)) if cutlass.const_expr(SOFTMAX_GROUPS > 1) else cutlass.Int32(0)
@@ -1572,7 +1824,7 @@ def _softmax_warp_group(
             valid = (blk >= cutlass.Int32(0)) & (key_abs <= pos) & (key_abs < eff_seqlen_kv)
             s_cols = []
             for j in cutlass.range_constexpr(COLS):
-                s_cols.append(_select_f32(valid, cutlass.Float32(s_raw[j]) * scale_log2, NEG_INF))
+                s_cols.append(_select_f32(valid, cutlass.Float32(s_raw[j]) * scale_log2_kv, NEG_INF))
 
             # Column max over the tile's 128 keys: butterfly inside the warp, then the group's four warps exchange through
             # SMEM (slot = the tile's ring parity, so the single barrier per tile also orders the next reuse of the slot;
@@ -1624,7 +1876,7 @@ def _softmax_warp_group(
                 p_words.append(fp32_to_fp16(p_cols[2 * w], p_cols[2 * w + 1], dtype=STORAGE_DTYPE))
             p_row_base = par * cutlass.Int32(pBufferWords) + lane * cutlass.Int32(P_ROW_WORDS)
             if cutlass.const_expr(SOFTMAX_GROUPS > 1):
-                # group g writes word offset 4 g of the lane's 32-B row = the chunk c = g of the one-group loop, under the same swizzle
+                # group g writes word offset 4 g of the thread's 32-B row = the chunk c = g of the one-group loop, under the same swizzle
                 p_row_base = p_row_base + grp * cutlass.Int32(P_GROUP_WORDS)
             for c in cutlass.range_constexpr(P_CHUNKS):
                 chunk = cutlass.Vector.from_elements(tuple(p_words[4 * c + k] for k in range(4)), cutlass.Int32)
@@ -1687,6 +1939,9 @@ def _softmax_warp_group(
             # SELECT, so neither LSE nor O ever carries it (sdpa-invariants.md sections 2-4): keep these lines together.
             lse_j = m_nat + cute.math.log(cute.math.max(l_tot, TINY), fastmath=True)
             inv_j = ONE / cute.math.max(l_tot, TINY)
+            if cutlass.const_expr(KV_E4M3):
+                # v_scale folded into the normaliser (the LSE never sees it; under a split the partial O_s carries it and the combine is untouched)
+                inv_j = inv_j * v_scale
             lse_j = _select_f32(row_dead, NEG_INF, lse_j)
             inv_j = _select_f32(row_dead, ZERO, inv_j)
             if cutlass.const_expr(CFG.EPILOGUE_GATE):
@@ -1853,6 +2108,10 @@ def _kernel(
     # the dependent grid at this grid's completion (the measured placement).  Appended LAST; the False rendering traces the program
     # above unchanged.
     use_pdl: cutlass.Constexpr[bool] = False,
+    # KV_E4M3 (appended; None on the bf16 rendering, so its specialised signature -- and cubin -- is untouched): the pools' per-tensor fp32
+    # DEscales as 1-element tensors, read once per CTA by the softmax warps and folded (k_scale into the softmax scale, v_scale into the normaliser).
+    k_scale_tensor: Optional[cute.Tensor] = None,
+    v_scale_tensor: Optional[cute.Tensor] = None,
 ) -> None:
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
     tidx, _, _ = cute.arch.thread_idx()
@@ -1956,6 +2215,9 @@ def _kernel(
             if cutlass.const_expr(CFG.EPILOGUE_GATE):
                 bars.mb_gate_full.init()  # rows 11 / 12: one stage each
                 bars.mb_gate_empty.init()
+            if cutlass.const_expr(KV_E4M3):
+                for s in cutlass.range_constexpr(KV8_FULL_STAGES):
+                    bars.mb_kv8_full[s].init()  # row 5e: every (gather warp, stage) landing barrier, in the one elected block (P4)
             for s in cutlass.range_constexpr(SCHEDULER_STAGES):
                 nvvm.mbarrier_init(sched.mb_scheduler.subview(s), CFG.ONE_LANE)
                 nvvm.mbarrier_init(sched.mb_read_tile_id.subview(s), CFG.READ_TILE_ARRIVERS)
@@ -2010,6 +2272,8 @@ def _kernel(
             scale_log2=scale_softmax_log2,
             sQ_raw=sQ_raw,
             use_pdl=use_pdl,
+            k_scale_tensor=k_scale_tensor,
+            v_scale_tensor=v_scale_tensor,
         )
     elif warp_idx < GATHER_WARP_BASE + GATHER_WARPS:
         _gather_warp_group(
@@ -2122,6 +2386,8 @@ def _host(
     gate_ptr: Optional[cute.Pointer] = None,
     gate_strides: Tuple[cutlass.Int64, cutlass.Int64, cutlass.Int64] = (cutlass.Int64(0), cutlass.Int64(0), cutlass.Int64(0)),
     use_pdl: cutlass.Constexpr[bool] = False,
+    k_scale_ptr: Optional[cute.Pointer] = None,
+    v_scale_ptr: Optional[cute.Pointer] = None,
     stream: _cuda_driver.CUstream = None,
 ) -> None:
     """Bind the explicit pointer ABI and launch the sparse core.
@@ -2155,6 +2421,11 @@ def _host(
     takes the attribute (THD x ``use_pdl`` is the adapter's typed decline: the main kernel reads the setup launch's metadata above every
     role wait).  The same math, bitwise.
 
+    KV_E4M3 (CFG.KV_E4M3; a module specialization, paged only): ``k_ptr`` / ``v_ptr`` point at e4m3 pools, ``k_strides`` / ``v_strides`` are the
+    pools' own strides IN e4m3 ELEMENTS (the gather maps are built in that dtype: box 128 elements, the stride in 16-B units), and the appended
+    ``k_scale_ptr`` / ``v_scale_ptr`` -> the two 1-element fp32 DEscales (present iff CFG.KV_E4M3, None otherwise -- a mismatch is refused at trace
+    time, the ``gate_ptr`` pattern; read on device by the softmax warps, never on the host).
+
     THD (CFG.THD_VARLEN): ``B`` is the number of SEQUENCES and ``SQ`` / ``SKV`` the packed CAPACITIES of the ``[1, T, H, D]``
     operands (batch extent 1; the live totals are device values); ``seq_kv_lens_ptr`` -> the int32 metadata workspace of
     ``THD_META_WORDS(B)`` words that the setup launch fills from ``thd_q_lens_ptr`` / ``thd_kv_lens_ptr`` (per-sequence lengths
@@ -2174,6 +2445,12 @@ def _host(
         raise ValueError(f"sparse_d256_f16: gate_ptr presence ({gate_ptr is not None}) must match CFG.EPILOGUE_GATE={CFG.EPILOGUE_GATE}")
     # The gate is O-shaped on every arm: O's (B, SQ, QH, D) form, batch extent 1 under THD (the same `thd` flag as O).
     gate_tensor = _bshd(gate_ptr, B, SQ, QH, TILE_O, gate_strides, thd) if cutlass.const_expr(gate_ptr is not None) else None
+    if cutlass.const_expr((k_scale_ptr is not None) != KV_E4M3 or (v_scale_ptr is not None) != KV_E4M3):
+        raise ValueError(
+            f"sparse_d256_f16: k_scale_ptr / v_scale_ptr presence ({k_scale_ptr is not None} / {v_scale_ptr is not None}) must match CFG.KV_E4M3={CFG.KV_E4M3}"
+        )
+    k_scale_tensor = _vec(k_scale_ptr, 1) if cutlass.const_expr(k_scale_ptr is not None) else None
+    v_scale_tensor = _vec(v_scale_ptr, 1) if cutlass.const_expr(v_scale_ptr is not None) else None
     lse_tensor = None
     if cutlass.const_expr(lse_ptr is not None):
         l0, l1, l2 = lse_strides
@@ -2228,15 +2505,17 @@ def _host(
     # the column box live in the COLUMN coordinate (gather warps: head x head_stride + box x 64), the batch / page term in
     # the ROW coordinate (batch x SKV + 4 blk + r; page x rows_per_page + head x rows_per_head + (4 blk) % PAGE_SIZE + r).
     def _gather_desc(ptr, strides, rows_per_page):
+        # KV_E4M3: the SAME map in the K / V storage dtype -- Float8E4M3FN, box (128 elements, 1 row) = one 128-B SW128 span, the token stride
+        # in 16-B units from the pool's e4m3 element stride, the inner extent in e4m3 elements (the head stride is the pool's own).
         _bs, ss, hs = strides
         rows = cutlass.Int32(num_pages) * cutlass.Int32(rows_per_page) if cutlass.const_expr(PAGED_KV) else cutlass.Int32(n_q_batches) * cutlass.Int32(SKV)
         inner = (cutlass.Int32(KH) - cutlass.Int32(1)) * cutlass.Int32(hs) + cutlass.Int32(TILE_K)
         return tmap.create_tensor_map_tiled(
             global_address=ptr.toint(),
-            dtype=STORAGE_DTYPE,
+            dtype=KV_STORAGE_DTYPE,
             global_dims=(inner, rows),
-            global_strides=(cutlass.Int64(ss) * BPE // 16,),
-            box_dims=(GATHER_BOX_ELEMS, 1),
+            global_strides=(cutlass.Int64(ss) * KV_BPE // 16,),
+            box_dims=(GATHER_BOX_ELEMS_KV, 1),
             swizzle=_tma_swz(CFG.K_SWZ_BYTES),
             l2_promotion=tmap.TensorMapL2Promotion.l2_128b,
         )
@@ -2289,6 +2568,8 @@ def _host(
         cutlass.Int32(B),
         tma_gate_desc,
         use_pdl,
+        k_scale_tensor,
+        v_scale_tensor,
     ).launch(
         grid=grid_shape,
         block=[CFG.THREADS_PER_CTA, 1, 1],
@@ -2328,8 +2609,8 @@ def compile(  # noqa: A001
     return _compile_cached(
         _host,
         P(STORAGE_DTYPE),
-        P(STORAGE_DTYPE),
-        P(STORAGE_DTYPE),
+        P(KV_STORAGE_DTYPE),  # the K / V pools in their STORAGE dtype (e4m3 codes under CFG.KV_E4M3, the activation dtype otherwise)
+        P(KV_STORAGE_DTYPE),
         P(cutlass.Float32) if SPLIT_KV > 1 else P(STORAGE_DTYPE),  # the fp32 partial slab under a split, else the caller's O
         P(cutlass.Float32, 4) if has_lse else None,
         P(cutlass.Int32, 16),
@@ -2353,6 +2634,10 @@ def compile(  # noqa: A001
         P(STORAGE_DTYPE) if CFG.EPILOGUE_GATE else None,
         i64_3,
         bool(use_pdl),
+        # KV_E4M3 (a MODULE specialization): the two 1-element fp32 DEscale pointers exist on that rendering only (None drops the slot from
+        # the bf16 renderings' specialised signature, so their cubins stay byte-identical); the scale VALUES are runtime data, never a key.
+        P(cutlass.Float32, 4) if KV_E4M3 else None,
+        P(cutlass.Float32, 4) if KV_E4M3 else None,
         stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=False),
         options="--enable-tvm-ffi",
         cache_key=_cache_key,
