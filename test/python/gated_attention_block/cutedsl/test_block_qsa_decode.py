@@ -1490,7 +1490,6 @@ _INDEXER_DECLINE_TOKENS = {  # the `indexer_e4m3_cache` row RETIRED 2026-10-21: 
     "indexer_thd": "scores dense [B, S] prompts",
     "indexer_query_rows": "query rows per sequence (at most 64",
     "indexer_page_size": "a power-of-two count of compressed rows",
-    "indexer_e4m3_pool": "in-kernel dequant arm",
     "indexer_shared_list": "selects per row",
     "shared_list_rows": "tail covers at most two blocks",
     "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
@@ -1632,7 +1631,8 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_sources == ("caller", "indexer") and d.index_cache_dtypes == (BF16, torch.float8_e4m3fn) and d.index_head_dims == (128,)
         assert d.index_kv_heads == (1,)  # the e4m3 indexer cache SERVED (2026-10-21): the FlashInfer probe reads two entries
         assert d.index_block_sizes == (4,) and d.index_top_k_range == (4, 512, 4) and d.index_query_rows_max == 64 and d.index_state_rows_extra == 3
-        assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True and d.kv_cache_dtypes == (BF16,)  # the measured part
+        assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True  # the measured part
+        assert d.kv_cache_dtypes == (BF16, torch.float8_e4m3fn)  # e4m3 pools under the indexer too (2026-10-21: the sparse core's in-kernel dequant arm)
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
@@ -1674,11 +1674,12 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
 def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
     """One trip per row of the decode indexer's declines, each on a REAL declaration: the raised text EQUALS the envelope's row and carries
     the row's one shared token -- ``indexer_query_rows`` (S_q 17 at 4 heads; 8 heads at S_q 9), ``indexer_page_size`` (page 48),
-    ``indexer_e4m3_pool``, ``indexer_shared_list``, ``fuse_prepare_rope_tables_unfused``, ``indexer_f16``, ``indexer_head_dim``,
-    ``shared_list_rows`` (the ``indexer_e4m3_cache`` row RETIRED 2026-10-21: the e4m3 indexer cache CONSTRUCTS, with its sample in e4m3); the
-    ring rule (``cap < S_q + 3``), a missing sample, the commit flag, the side caches off their form -- the compressed-key cache sample in the
-    declared dtype BOTH ways, the 16-byte rule at 1 B --, the e4m3 pool with the e4m3 indexer cache, and the samples / flags on a caller-list
-    or a dense declaration -- ``ValueError`` naming them."""
+    ``indexer_shared_list``, ``fuse_prepare_rope_tables_unfused``, ``indexer_f16``, ``indexer_head_dim``, ``shared_list_rows`` (the
+    ``indexer_e4m3_cache`` row RETIRED 2026-10-21: the e4m3 indexer cache CONSTRUCTS, with its sample in e4m3; the ``indexer_e4m3_pool`` row
+    RETIRED 2026-10-21 too: the e4m3 pool CONSTRUCTS under the indexer -- the sparse core's in-kernel dequant arm -- with a bf16 and with an
+    e4m3 indexer cache, both knob readings); the ring rule (``cap < S_q + 3``), a missing sample, the commit flag, the side caches off their
+    form -- the compressed-key cache sample in the declared dtype BOTH ways, the 16-byte rule at 1 B --, and the samples / flags on a
+    caller-list or a dense declaration -- ``ValueError`` naming them."""
     import re
 
     rows = {
@@ -1704,16 +1705,24 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
             with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS[name])) as e:
                 trip()
             assert str(e.value) == env.decode.declines[name], (name, str(e.value))
-        # the e4m3 pool: the sample pools in e4m3 under the attribute -- declined with a bf16 AND with an e4m3 indexer cache (the in-kernel dequant arm)
+        # the e4m3 pool under the indexer: SERVED since 2026-10-21 (the sparse core's in-kernel dequant arm; the former `indexer_e4m3_pool` row is
+        # gone from the envelope) -- the declaration constructs over the e4m3 samples with the sparse stage reading e4m3, both knob readings,
+        # with a bf16 indexer cache here and with the e4m3 indexer cache below (the serving stacks' full fp8 configuration)
         kc, vc = (torch.empty(4, 2, 16, D, dtype=torch.float8_e4m3fn, device=_DEV) for _ in range(2))
-        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_e4m3_pool"])) as e:
-            _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc)
+        for knob in (True, False):
+            e4 = _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc, fuse_prepare=knob)
+            assert e4.kv_cache_e4m3 and e4._sdpa.kv_e4m3 and e4.indexer_decode and e4._indexer_decode is not None and e4.qsa_list_form == "per_row"
+            assert (
+                (e4._prepare is not None and e4._prepare.kv_e4m3 and e4._cache_write is None) if knob else (e4._prepare is None and e4._cache_write is not None)
+            )
         env = GatedAttentionBlockFwd.serving_envelope(_declare_indexer(GEOM_SMALL, 1, 1).geom, BF16, _DEV, device_cc=_SM107)
-        assert str(e.value) == env.decode.declines["indexer_e4m3_pool"]
+        assert "indexer_e4m3_pool" not in env.decode.declines and "indexer_e4m3_cache" not in env.decode.declines
+        assert env.decode.kv_cache_dtypes == (BF16, torch.float8_e4m3fn) and env.decode.index_cache_dtypes == (BF16, torch.float8_e4m3fn)
         e4_over = dict(index_cache_dtype=torch.float8_e4m3fn)
-        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_e4m3_pool"])) as e:
-            _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc, qsa_over=e4_over)
-        assert str(e.value) == env.decode.declines["indexer_e4m3_pool"]
+        # the e4m3 pool WITH the e4m3 indexer cache (the serving stacks' full fp8 configuration): CONSTRUCTS, both arms read e4m3 (2026-10-21)
+        full8 = _declare_indexer(GEOM_SMALL, 1, 1, kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc, sample_v_cache=vc, qsa_over=e4_over)
+        assert full8.kv_cache_e4m3 and full8._sdpa.kv_e4m3 and full8._indexer_decode is not None and full8.index_cache_dtype == torch.float8_e4m3fn
+        assert full8._indexer_decode.fp8
         # INVERTED 2026-10-21: the e4m3 indexer cache CONSTRUCTS over bf16 pools -- with its sample in e4m3 (the declared dtype), refused BOTH ways
         e4 = _declare_indexer(GEOM_SMALL, 1, 1, qsa_over=e4_over)
         assert e4._indexer_decode is not None and e4.index_cache_dtype == torch.float8_e4m3fn and e4._indexer_decode.fp8
@@ -1775,20 +1784,10 @@ def test_decode_indexer_typed_declines_equal_the_envelope_row_by_row():
             _declare(GEOM_SMALL, 1, 1, n_pages=4, index_state_slot_mapping_present=True)
         with pytest.raises(ValueError, match="rope_position_tables_only.*refused rather than silently ignored"):
             _declare(GEOM_SMALL, 1, 1, n_pages=4, rope_position_tables_only=True)
-        # the caller-list block and the e4m3 pool: the per-row list form over e4m3 pools is the gathered cast's decline
+        # the caller-list block and the e4m3 pool: the declared per-row list over e4m3 pools is SERVED (2026-10-21; the gathered cast's decline is gone)
         kc8, vc8 = (torch.empty(4, 2, 16, D, dtype=torch.float8_e4m3fn, device=_DEV) for _ in range(2))
-        with pytest.raises(NotImplementedError, match="index_list_form='per_row'.*in-kernel dequant arm"):
-            _declare(
-                GEOM_SMALL,
-                1,
-                1,
-                n_pages=4,
-                index_list_form="per_row",
-                kv_cache_dtype=torch.float8_e4m3fn,
-                sample_k_cache=kc8,
-                sample_v_cache=vc8,
-                fuse_norm_rope=False,
-            )
+        pr, _ = _declare(GEOM_SMALL, 1, 1, n_pages=4, index_list_form="per_row", kv_cache_dtype=torch.float8_e4m3fn, sample_k_cache=kc8, sample_v_cache=vc8)
+        assert pr.kv_cache_e4m3 and pr._sdpa.kv_e4m3 and pr.qsa_list_form == "per_row" and not pr._sdpa.list_per_sequence
 
 
 def test_decode_indexer_execute_inputs_are_required_and_refused_in_both_directions():

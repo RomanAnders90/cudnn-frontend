@@ -3,49 +3,58 @@
 
 """The gated attention block's e4m3 KV cache (``kv_cache_dtype=torch.float8_e4m3fn``): the serving stacks' ``--kv-cache-dtype fp8``
 recipe -- the pools hold e4m3 codes under per-tensor fp32 DEscales ``execute(k_scale=, v_scale=)`` (value = code x scale), a bf16 Q
-attends over the dequantized rows.  Two served forms, one attribute: (a) the WRITE-THROUGH quantizes the post-RoPE K / V on the way
-into the pools (two per-tensor casts + the bit copy through the pools' bf16 views; no new kernel) on every form that writes through
-over the block's own K / V; (b) the BLOCK-SPARSE DECODE mode (``kv_source="paged"`` on a dense ``[B, S_q <= 4]`` QsaSpec declaration)
-reads the pools through ``kernels/qsa_kv_upcast.py`` (the listed rows gathered and cast back to bf16 into the workspace scratch) and
-the Rubin d256 DECODE tile over that scratch as a plain padded dense SDPA -- the sparse core untouched by fp8.  bf16 Q over an e4m3
-pool only (no fp8-Q form).
+attends over the dequantized rows.  Two forms, one attribute: (a) the WRITE quantizes the post-RoPE K / V on the way into the pools --
+the two-stage write-through (two per-tensor casts + the bit copy through the pools' bf16 views) or, under ``fuse_prepare=True``, the
+prepare launch's e4m3 pool arm (bitwise the two-stage form) -- on every form that writes through; (b) the BLOCK-SPARSE DECODE mode
+(``kv_source="paged"`` on a dense ``[B, S_q]`` QsaSpec declaration, caller lists or the in-block indexer) reads the pools through the
+sparse core's IN-KERNEL dequant arm: the gather warps land the listed e4m3 rows and expand them to the bf16 operand tile in SMEM,
+``k_scale`` folded into the softmax scale and ``v_scale`` into the normaliser -- every list form, ``S_q``, split, LSE and gate placement
+of the bf16 mode, no scratch (the 2026-10-14 gathered cast + decode tile form is retired).  bf16 Q over an e4m3 pool only (no fp8-Q form).
 
-Host cells (any device; the declaration cells even on the CPU): the declaration FACTS (the two e4m3 stages, the forced out-of-place
-norm, the gate as its own launch, the split 1, the appended workspace slots at the END of an otherwise byte-identical carve, the
-stage order, the write-through-only declaration); the typed declines (e5m2, another dtype, the attribute without the write-through,
-``quant``, f16 activations, the dense DECODE form over e4m3 pools -- the gap --, the EXTEND form, ``S_q > 4``, ``return_lse``, a
-split, ``fuse_norm_rope`` / ``inplace_qkv=True``, pools of the wrong dtype both ways); the execute-time form checks on an UNCOMPILED
-block under ``set_sync_debug_mode("error")`` (the scales required under the attribute, refused without it, their form); the
-envelope's ``kv_cache_dtypes``.
+Host cells (any device; the declaration cells even on the CPU): the declaration FACTS (the sparse stage reading e4m3 pools, the
+write-through stage or the e4m3 prepare, the bf16 mode's rules for the gate / the split / the layout, the LSE servable, the carve =
+the bf16 twin's + the three e4m3 slots at the END and no scratch, the stage order, the write-through-only declaration, the in-block
+indexer over e4m3 pools); the typed declines that STAY (e5m2, another dtype, the attribute without the write-through, ``quant``, f16
+activations, the dense DECODE form over e4m3 pools -- the gap --, the EXTEND form, pools of the wrong dtype both ways) and the seven
+limits of the retired form now SERVED (``S_q > 4``, ``return_lse``, a split, ``fuse_norm_rope``, an explicit ``inplace_qkv``, the
+per-row list, the indexer); the execute-time form checks on an UNCOMPILED block under ``set_sync_debug_mode("error")`` (the scales
+required under the attribute, refused without it, their form); the envelope's ``kv_cache_dtypes`` under caller lists AND the indexer.
 
 Rubin cells (``requires_rubin``; one compiled block per cell): the decode ladder against the fp32 oracle ON THE DEQUANTIZED POOL --
 the dense block reference over the WHOLE sequence gives the post-norm / post-RoPE K / V; the PREFIX rows are quantized by torch with
-the per-tensor scales (``scale = amax / 448``) into NaN-filled e4m3 pools, the STEP rows are the block's own quantizing write-through;
-the oracle attends in fp32 over ``bf16(fp32(code) x scale)`` of every row (the step rows' codes computed the way the block's cast
-computes them: ``sat_e4m3(row x (1 / scale))``) with the bf16 post-RoPE Q over ``qsa_visible_mask(..., pos0=)``, then the gate and
-the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) within ``atol 2e-2`` (the sparse module's bar, never
-widened), a dead row (``kv_lens = 0``; a row at a negative position) EXACTLY 0, the pools' step rows BITWISE torch's quantization
-of the block's own normed K rows and V band, the prefix rows and the NULL block untouched, two launches bitwise; REPORTED without a
-gate: the distance to the PRE-quantization bf16 oracle (the serving recipe's own error).  The ladder: ``S_q`` 1 .. 4 (the shared
-list), B 1 / 3 / 4, ``kv_lens`` up to 20000 incl. 2052, a dead entry and a sequence shorter than the step, pages 16 / 32 / 64 on
-HND / unified / NHD pools, ``block_lens`` given / absent, the gate fused (= its own launch here) and separate, the indexer band's
-raw-key write-through (bf16), the 24 / 2 Flash-Next geometry; the MTP residues on a short sequence; the write-through-only PREFILL
-form (the sparse block over its own K / V with e4m3 pools: ``out`` BITWISE the bf16-pool twin's, the pools bitwise the torch cast);
-``get_workspace_size()`` honest (a sentinel past the carve untouched; the scratch inside); CUDA-graph capture of the FIRST execute
-on a NEW stream with no warm-up under ``set_sync_debug_mode("error")``, the replay bitwise eager, and the replay over NEW scales /
+the per-tensor scales (``scale = amax / 448``) into NaN-filled e4m3 pools, the STEP rows are the block's own quantizing write; the
+oracle attends in fp32 over ``bf16(fp32(code) x scale)`` of every row (the step rows' codes computed the way the block's cast computes
+them: ``sat_e4m3(row x (1 / scale))``) with the bf16 post-RoPE Q over ``qsa_visible_mask(..., pos0=)`` (the shared list) or per row,
+then the gate and the out projection -- ``cos(out) > 0.999``, the gated O (the workspace slot) and the LSE within ``atol 2e-2`` (the
+sparse module's bars, never widened), a dead row (``kv_lens = 0``; a row at a negative position) EXACTLY 0 / ``-inf``, the pools' step
+rows BITWISE torch's quantization of the block's own K rows and V band, the prefix rows and the NULL block untouched, two launches
+bitwise; REPORTED without a gate: the distance to the PRE-quantization bf16 oracle (the serving recipe's own error).  The ladder:
+``S_q`` 1 .. 4 shared and 4 / 8 per row, B 1 / 2 / 3 / 4, ``kv_lens`` up to 20000 incl. 2052, a dead entry and a sequence shorter than
+the step, pages 16 / 32 / 64 on HND / unified / NHD pools, ``block_lens`` given / absent, the gate in the core's epilogue, in the split
+combine and separate, splits 1 / 4 / 16 with ``return_lse``, ``fuse_norm_rope``, an explicit ``inplace_qkv``, ``fuse_prepare`` (the
+prepare's e4m3 pool arm), the indexer band's raw-key write-through (bf16), the 24 / 2 Flash-Next geometry; the MTP residues on a
+short sequence; the POWER-OF-TWO pin: at ``k_scale`` / ``v_scale`` in {1, 0.5, 2} the e4m3 block's ``out``, gated O and LSE are
+BITWISE the bf16 block fed pools holding ``bf16(code x scale)`` (the fold's exactness: the kernel's own pin lifted to the block, the
+gate in the combine included); the in-block INDEXER over e4m3 pools (the two-stage oracle: the selection the fp64 top-k of the block's
+own operands up to ties, the attention within budget of the fp32 oracle fed the kernel's list over the dequantized pool; ``fuse_prepare``
+on == off BITWISE on ``out``, the list and the pools, the census 8 vs 13 launches by kernel name; the first execute captured and replayed
+bitwise); the write-through-only PREFILL form in both write forms (``out`` BITWISE the bf16-pool twin's, the pools bitwise the torch cast
+and each other); ``get_workspace_size()`` honest (a sentinel past the carve untouched; no scratch slot); CUDA-graph capture of the FIRST
+execute on a NEW stream with no warm-up under ``set_sync_debug_mode("error")``, the replay bitwise eager, and the replay over NEW scales /
 lengths / tables / lists / slots / inputs bitwise the eager run over them.
 """
 
 import contextlib
 import os
 import sys
+import types
 
 import pytest
 import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block import KV_SOURCE_PAGED, GatedAttentionBlockFwd, GatedAttentionBlockGeometry, QsaSpec, index_k_raw_view
-from cudnn.gated_attention_block.api import KV_CACHE_E4M3, _cols, _plan_workspace, _QuantizedCacheWrite, _UpcastSparseSdpa, _view
+from cudnn.gated_attention_block.api import KV_CACHE_E4M3, _cols, _plan_workspace, _QsaPrepare, _QuantizedCacheWrite, _SparseSdpa, _view
 
 requirement_error = cutedsl_requirement_error("the gated attention block's e4m3 KV-cache tests")
 if requirement_error:
@@ -57,6 +66,7 @@ requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (co
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import test_block_qsa_decode as _qsa  # noqa: E402  (the bf16 decode cases: the indexer case this module turns into its e4m3 twin)
 from gated_block_qsa_reference import full_block_ids, qsa_visible_mask, random_block_ids  # noqa: E402
 from gated_block_reference import RefGeometry, build_rope_tables, gated_attention_block_reference  # noqa: E402
 
@@ -66,7 +76,7 @@ D = 256
 ROPE = 64
 BS = 4  # tokens per selectable block
 COS_OUT = 0.999  # the end-to-end suite's bar on `out`
-ATOL = 2e-2  # the sparse module's bar on O -- never widened here
+ATOL = 2e-2  # the sparse module's bar on O / LSE -- never widened here
 E4M3_MAX = 448.0
 GEOM_SMALL = dict(d_model=512, h_q=8, h_kv=2, d_head=D, rope_dim=ROPE)  # group 4, cheap projections
 GEOM_FLASH_NEXT = dict(d_model=2560, h_q=24, h_kv=2, d_head=D, rope_dim=ROPE)  # Qwen3.8-Flash-Next TP 1 (group 12)
@@ -102,7 +112,7 @@ def _sentinel(dtype):
 
 def _pools(n_pages, h, page, layout, dtype, device=_DEV, fill=float("nan")):
     """Two pools as ``[P, H, page, D]`` views: ``hnd`` (compact), ``nhd`` (by strides), ``unified`` (one ``[P, H, page, 2D]`` content
-    row per token, K at ``+0``, V at ``+D``).  NaN-filled (an e4m3 NaN is the code 0x7f): a gathered unwritten row poisons O."""
+    row per token, K at ``+0``, V at ``+D``).  NaN-filled (an e4m3 NaN is the code 0x7f): a row the core should never read poisons O."""
     mk = lambda *shape: torch.full(shape, fill, device=device, dtype=torch.float32).to(dtype)  # noqa: E731
     if layout == "hnd":
         return tuple(mk(n_pages, h, page, D) for _ in range(2))
@@ -121,7 +131,7 @@ def _quantize(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
 
 
 def _dequantize(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """The gathered cast's arithmetic: ``bf16(fp32(code) x scale)`` -- one fp32 rounding."""
+    """The dequantized value a bf16 pool would hold: ``bf16(fp32(code) x scale)`` -- one fp32 rounding (exact at a power-of-two scale)."""
     return (codes.float() * scale.float()).to(BF16)
 
 
@@ -131,20 +141,38 @@ def _scale_of(x: torch.Tensor) -> torch.Tensor:
     return (amax / E4M3_MAX).reshape(1).to(torch.float32).contiguous()
 
 
-def _geom(geom_kw, top_k=512, index_band=False, **over):
+def _scale_const(v: float) -> torch.Tensor:
+    return torch.tensor([float(v)], dtype=torch.float32, device=_DEV)
+
+
+def _geom(geom_kw, top_k=512, index_band=False, index_list_form=None, **over):
     kw = dict(geom_kw, causal_bottom_right=True)
     kw.update(over)
-    return GatedAttentionBlockGeometry(**kw, qsa=QsaSpec(top_k=top_k, index_band=index_band)), RefGeometry(**kw)
+    return GatedAttentionBlockGeometry(**kw, qsa=QsaSpec(top_k=top_k, index_band=index_band, index_list_form=index_list_form)), RefGeometry(**kw)
 
 
 def _declare(
-    geom_kw, batch, s_q, *, page=16, layout="hnd", n_pages=8, dtype=BF16, pool_dtype=E4M3, top_k=512, index_band=False, geom_over=None, qsa=True, **blk_kw
+    geom_kw,
+    batch,
+    s_q,
+    *,
+    page=16,
+    layout="hnd",
+    n_pages=8,
+    dtype=BF16,
+    pool_dtype=E4M3,
+    top_k=512,
+    index_band=False,
+    index_list_form=None,
+    geom_over=None,
+    qsa=True,
+    **blk_kw,
 ):
     """A declared (not compiled) block on EMPTY tensors: the declaration cells (any device).  ``kv_cache_dtype`` rides ``blk_kw``."""
     kw0 = dict(geom_kw)
     kw0.update(geom_over or {})
     if qsa:
-        geom, _ = _geom(geom_kw, top_k=top_k, index_band=index_band, **(geom_over or {}))
+        geom, _ = _geom(geom_kw, top_k=top_k, index_band=index_band, index_list_form=index_list_form, **(geom_over or {}))
     else:
         geom = GatedAttentionBlockGeometry(**kw0)
     mk = lambda *shape: torch.empty(*shape, dtype=dtype, device=_DEV)  # noqa: E731
@@ -167,64 +195,150 @@ def _declare(
     return blk, dict(k_cache=kc, v_cache=vc, block_table=bt, geom=geom)
 
 
+def _indexer_samples(batch, n_pages=8, page=16, cap=8):
+    """The decode indexer's three side-cache samples (their FORM): the paged compressed-key cache, the ring, the ring block table."""
+    return dict(
+        sample_index_kv_cache=torch.empty(n_pages, page // BS, 1, 128, dtype=BF16, device=_DEV),
+        sample_index_state_cache=torch.empty(batch + 1, cap, 1, 128, dtype=BF16, device=_DEV),
+        sample_index_state_block_table=torch.zeros(batch, 1, dtype=torch.int32, device=_DEV),
+    )
+
+
+def _declare_indexer(batch, s_q, **blk_kw):
+    """A declared (not compiled) decode-INDEXER block over e4m3 pools on EMPTY tensors."""
+    geom = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    kc, vc = _pools(8, geom.h_kv, 16, "hnd", E4M3)
+    kw = dict(
+        paged_kv_page_size=16,
+        kv_source=KV_SOURCE_PAGED,
+        sample_k_cache=kc,
+        sample_v_cache=vc,
+        sample_block_table=torch.zeros(batch, 8, dtype=torch.int32, device=_DEV),
+        kv_cache_dtype=E4M3,
+        **_indexer_samples(batch),
+    )
+    kw.update(blk_kw)
+    return GatedAttentionBlockFwd(
+        mk(batch, s_q, geom.d_model),
+        mk(geom.n_qkvg, geom.d_model),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        mk(batch, s_q, ROPE),
+        mk(batch, s_q, ROPE),
+        mk(geom.d_model, geom.h_q * D),
+        mk(batch, s_q, geom.d_model),
+        geom,
+        **kw,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Host: the declaration facts, the typed declines, the execute form checks, the envelope, the carve
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("s_q", [1, 2, 3, 4])
+@pytest.mark.parametrize("s_q", [1, 2, 3, 4, 8])
 def test_declaration_facts_of_the_e4m3_mode(s_q):
-    """Over e4m3 pools the block-sparse decode declaration builds the quantizing write-through and the gathered-cast stage, norms out
-    of place (``inplace_qkv=None`` reads as False), gates in its own launch whatever ``fuse_gate`` says, runs the tile unsplit, and
-    carves the e4m3 slots at the END of the layout (the twin without the attribute is byte-identical to before)."""
+    """Over e4m3 pools the block-sparse decode declaration builds the quantizing write-through and the SPARSE stage reading e4m3 pools
+    (the in-kernel dequant arm: ``_SparseSdpa.kv_e4m3``, the pool descriptors in e4m3, the two scale operands), and follows the bf16
+    mode's rules -- in place, the gate where the bf16 twin puts it, the fill-rule split, the list form of ``S_q``, the LSE servable --;
+    the carve is the twin's plus ``kc8`` / ``vc8`` / ``kv_inv`` at the END and NO scratch (the twin without the attribute is
+    byte-identical to before); ``fuse_prepare=True`` swaps the write-through for the prepare's e4m3 pool arm."""
     B = 3
     with _no_host_sync():
         blk, env = _declare(GEOM_SMALL, B, s_q, fuse_gate=True)
         twin, _ = _declare(GEOM_SMALL, B, s_q, fuse_gate=True, pool_dtype=BF16, kv_cache_dtype=None)
-    assert blk.kv_cache_dtype == E4M3 and blk.kv_cache_e4m3 and blk.upcast_decode and blk.sparse_decode and blk.qsa_shared_list
-    assert isinstance(blk._sdpa, _UpcastSparseSdpa) and isinstance(blk._cache_write, _QuantizedCacheWrite)
-    assert blk.inplace_qkv is False and blk.fuse_gate is True and blk.gate_fused is False and blk._gate is not None and blk._compact_v is None
-    assert blk.decode_split_kv == 1 and blk.seq_lens_present
-    assert [st.name for st in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write_e4m3", "sdpa_sparse_e4m3", "sigmoid_gate", "out_proj"]
-    items = B * s_q * env["geom"].h_kv
+        lse, _ = _declare(GEOM_SMALL, B, s_q, return_lse=True)
+        fused, _ = _declare(GEOM_SMALL, B, s_q, fuse_prepare=True, fuse_gate=True)
+    assert blk.kv_cache_dtype == E4M3 and blk.kv_cache_e4m3 and blk.sparse_decode and blk.qsa_shared_list is (s_q <= 4) and not hasattr(blk, "upcast_decode")
+    st = blk._sdpa
+    assert isinstance(st, _SparseSdpa) and st.kv_e4m3 and st.paged and st.kv_cache_dtype == E4M3 and isinstance(blk._cache_write, _QuantizedCacheWrite)
+    ops = st._operands()
+    assert ops["k"].dtype == E4M3 and ops["v"].dtype == E4M3 and ops["q"].dtype == BF16
+    assert ops["k_scale"].shape == (1,) and ops["k_scale"].dtype == torch.float32 and ops["v_scale"].shape == (1,)
+    assert twin._sdpa._operands()["k"].dtype == BF16 and twin._sdpa._operands()["k_scale"] is None and not twin._sdpa.kv_e4m3
+    # the bf16 mode's rules, read off the twin
+    assert blk.inplace_qkv is True and blk.gate_fused is twin.gate_fused and blk.decode_split_kv == twin.decode_split_kv and blk.seq_lens_present
+    assert blk.qsa_list_form == twin.qsa_list_form and st.list_per_sequence is twin._sdpa.list_per_sequence and st.split_kv == twin._sdpa.split_kv
+    gate_stage = [] if blk.gate_fused else ["sigmoid_gate"]
+    assert [x.name for x in blk._stages] == ["qkv_gate_proj", "qk_norm_rope", "cache_write_e4m3", "sdpa_sparse"] + gate_stage + ["out_proj"]
+    assert lse._sdpa.want_lse and lse._sdpa.kv_e4m3 and lse.return_lse
+    assert fused.fuse_prepare is True and isinstance(fused._prepare, _QsaPrepare) and fused._prepare.kv_e4m3 and fused._cache_write is None
+    assert [x.name for x in fused._stages] == ["qkv_gate_proj", "qsa_prepare", "sdpa_sparse"] + ([] if fused.gate_fused else ["sigmoid_gate"]) + ["out_proj"]
+    # the carve: the twin's slots, then kc8 / vc8 / kv_inv; no gathered-cast scratch
     lay, lay0 = blk._layout(), twin._layout()
-    assert lay.kc8 >= 0 and lay.vc8 >= 0 and lay.kv_inv >= 0 and lay.kv_gathered >= 0 and lay.kv_len_t >= 0
-    assert lay.kv_len_t - lay.kv_gathered >= items * 2 * 2176 * 256 * 2 and lay.total_bytes > lay.kv_len_t
-    assert lay0.kc8 == lay0.vc8 == lay0.kv_inv == lay0.kv_gathered == lay0.kv_len_t == -1
-    # the twin keeps the in-place carve (no compact q / k / v); the e4m3 mode's compact slots precede the appended e4m3 slots
-    assert twin.inplace_qkv is True and lay0.q == -1 and lay.q >= 0 and lay.k >= 0 and lay.proj == lay0.proj == 0
-    assert lay.kc8 > max(lay.q, lay.k, lay.v, lay.o)
-    # the write-through-only declaration (the prefill form over the block's own K / V): the e4m3 write without the gathered scratch
+    assert (lay.proj, lay.q, lay.k, lay.v, lay.o) == (lay0.proj, lay0.q, lay0.k, lay0.v, lay0.o) and lay.q == -1 and lay.proj == 0
+    assert lay.kc8 == lay0.total_bytes and lay.vc8 > lay.kc8 and lay.kv_inv > lay.vc8 and lay.total_bytes > lay.kv_inv
+    assert lay0.kc8 == lay0.vc8 == lay0.kv_inv == -1
+    assert getattr(lay, "kv_gathered", -1) == -1 and getattr(lay, "kv_len_t", -1) == -1
+    assert (
+        lay.total_bytes - lay0.total_bytes == lay.total_bytes - lay.kc8
+    )  # the three e4m3 slots are the whole difference (the Rubin sentinel cell reads get_workspace_size)
+    # the write-through-only declaration (the prefill form over the block's own K / V): the e4m3 write, the sparse stage over bf16 operands
     with _no_host_sync():
         pre, _ = _declare(
             GEOM_SMALL, 2, 8, kv_source="self", sample_k_cache=None, sample_v_cache=None, sample_block_table=None, geom_over=dict(causal_bottom_right=False)
         )
-    assert pre.kv_cache_e4m3 and not pre.upcast_decode and isinstance(pre._cache_write, _QuantizedCacheWrite) and pre.inplace_qkv is True
+    assert pre.kv_cache_e4m3 and isinstance(pre._cache_write, _QuantizedCacheWrite) and pre.inplace_qkv is True
+    assert isinstance(pre._sdpa, _SparseSdpa) and not pre._sdpa.kv_e4m3 and pre._sdpa.kv_cache_dtype is None and not pre._sdpa.paged
     lp = pre._layout()
-    assert lp.kc8 >= 0 and lp.vc8 >= 0 and lp.kv_inv >= 0 and lp.kv_gathered == -1 and lp.kv_len_t == -1
+    assert lp.kc8 >= 0 and lp.vc8 >= 0 and lp.kv_inv >= 0
     # the dense (no QsaSpec) prefill with the e4m3 write-through is served too
     with _no_host_sync():
         dense, _ = _declare(GEOM_SMALL, 2, 8, kv_source="self", sample_k_cache=None, sample_v_cache=None, sample_block_table=None, qsa=False)
     assert dense.kv_cache_e4m3 and isinstance(dense._cache_write, _QuantizedCacheWrite) and dense.qsa is None
 
 
+def test_declaration_facts_of_the_indexer_over_e4m3_pools():
+    """``QsaSpec(index_source="indexer")`` over e4m3 pools CONSTRUCTS (served since 2026-10-21): the sparse stage reads e4m3 pools, the
+    indexer's decode step is built as over bf16 pools (it reads the compressed-key cache, never the pools), ``fuse_prepare`` on gives the
+    prepare's e4m3 pool arm and off the quantizing write-through, the carve is the bf16 declaration's plus the three e4m3 slots."""
+    with _no_host_sync():
+        on = _declare_indexer(2, 4, fuse_prepare=True, fuse_gate=True, return_lse=True)
+        off = _declare_indexer(2, 4, fuse_prepare=False, fuse_gate=True, return_lse=True)
+        twin = _declare_indexer(
+            2,
+            4,
+            fuse_prepare=False,
+            fuse_gate=True,
+            return_lse=True,
+            kv_cache_dtype=None,
+            sample_k_cache=_pools(8, 2, 16, "hnd", BF16)[0],
+            sample_v_cache=_pools(8, 2, 16, "hnd", BF16)[1],
+        )
+    for b in (on, off):
+        assert b.indexer_decode and b.kv_cache_e4m3 and b._sdpa.kv_e4m3 and b._indexer_decode is not None and b.qsa_list_form == "per_row"
+        assert b.return_lse and b._sdpa.want_lse and b.decode_split_kv == twin.decode_split_kv and b.gate_fused is twin.gate_fused
+    assert on._prepare is not None and on._prepare.kv_e4m3 and on._prepare.decode_arms and on._cache_write is None
+    assert off._prepare is None and isinstance(off._cache_write, _QuantizedCacheWrite)
+    assert [x.name for x in on._stages] == ["qkv_gate_proj", "qsa_prepare", "qsa_indexer", "sdpa_sparse"] + ([] if on.gate_fused else ["sigmoid_gate"]) + [
+        "out_proj"
+    ]
+    assert [x.name for x in off._stages] == ["qkv_gate_proj", "qk_norm_rope", "qsa_indexer", "cache_write_e4m3", "sdpa_sparse"] + (
+        [] if off.gate_fused else ["sigmoid_gate"]
+    ) + ["out_proj"]
+    lay, lay0 = off._layout(), twin._layout()
+    assert lay.kc8 >= 0 and lay.vc8 > lay.kc8 and lay.kv_inv > lay.vc8 and lay0.kc8 == -1 and getattr(lay, "kv_gathered", -1) == -1
+    # the e4m3 slots sit before the decode indexer's five (which stay at the very END): the indexer slots shift by exactly the e4m3 slots' size
+    assert (lay.proj, lay.o) == (lay0.proj, lay0.o) and lay.ix_q > lay.kv_inv and lay.ix_q - lay0.ix_q == lay.total_bytes - lay0.total_bytes
+
+
 def test_the_carve_without_the_attribute_is_byte_identical_and_the_e4m3_slots_append():
     g, _ = _geom(GEOM_SMALL)
     base = _plan_workspace(g, 2, 4, BF16, False, False, True)
-    same = _plan_workspace(g, 2, 4, BF16, False, False, True, kv_cache_e4m3=False, upcast_items=0)
-    assert base == same and base.kc8 == -1 and base.kv_gathered == -1
-    e4 = _plan_workspace(g, 2, 4, BF16, False, False, False, kv_cache_e4m3=True, upcast_items=2 * 4 * g.h_kv)
-    oop = _plan_workspace(g, 2, 4, BF16, False, False, False)
-    assert (e4.proj, e4.q, e4.k, e4.v, e4.o) == (oop.proj, oop.q, oop.k, oop.v, oop.o) and e4.kc8 == oop.total_bytes
-    assert e4.vc8 - e4.kc8 >= 2 * 4 * g.h_kv * D and e4.kv_len_t - e4.kv_gathered == 2 * 4 * g.h_kv * 2 * 2176 * 256 * 2 and e4.total_bytes > e4.kv_len_t
+    assert base == _plan_workspace(g, 2, 4, BF16, False, False, True, kv_cache_e4m3=False) and base.kc8 == -1
+    e4 = _plan_workspace(g, 2, 4, BF16, False, False, True, kv_cache_e4m3=True)
+    assert (e4.proj, e4.q, e4.k, e4.v, e4.o) == (base.proj, base.q, base.k, base.v, base.o) and e4.kc8 == base.total_bytes
+    assert e4.vc8 - e4.kc8 >= 2 * 4 * g.h_kv * D and e4.kv_inv - e4.vc8 >= 2 * 4 * g.h_kv * D and e4.total_bytes >= e4.kv_inv + 8
+    assert getattr(e4, "kv_gathered", -1) == -1 and getattr(e4, "kv_len_t", -1) == -1  # no gathered-cast scratch: the core reads the pools in-kernel
     with pytest.raises(ValueError, match="form of the bf16 pipeline"):
         _plan_workspace(g, 2, 4, BF16, False, False, False, fp8=True, kv_cache_e4m3=True)
-    with pytest.raises(ValueError, match="upcast_items belongs to the e4m3 KV cache"):
-        _plan_workspace(g, 2, 4, BF16, False, False, False, upcast_items=4)
 
 
 def test_typed_declines_of_the_e4m3_mode():
-    """Every decline by name, device-free (the declaration never touches the device); the mirror images included."""
+    """Every decline by name, device-free (the declaration never touches the device), the mirror images included -- and the seven limits of
+    the retired gathered-cast form now SERVED through the in-kernel arm (each a constructing declaration whose sparse stage reads e4m3)."""
     dec = _declare
     # the attribute's own rows
     with pytest.raises(NotImplementedError, match="float8_e5m2.*e4m3 KV cache is the one served"):
@@ -237,7 +351,7 @@ def test_typed_declines_of_the_e4m3_mode():
         dec(GEOM_SMALL, 2, 1, kv_cache_dtype=F16, pool_dtype=BF16)
     with pytest.raises(ValueError, match="belongs to the paged KV-cache write-through"):
         dec(GEOM_SMALL, 2, 8, paged_kv_page_size=0, kv_source="self", sample_k_cache=None, sample_v_cache=None, sample_block_table=None, qsa=False)
-    with pytest.raises(NotImplementedError, match="f16 activations over an e4m3 cache are a follow-up|activations: the gathered cast"):
+    with pytest.raises(NotImplementedError, match="e4m3 arm expands the pools to bf16 operand tiles.*f16 activations over an e4m3 cache are a follow-up"):
         dec(GEOM_SMALL, 2, 1, dtype=F16)
     # the pools' dtype both ways (the declaration samples)
     with pytest.raises(ValueError, match="sample_k_cache must be torch.float8_e4m3fn"):
@@ -277,24 +391,36 @@ def test_typed_declines_of_the_e4m3_mode():
             save_for_backward=True,
             inplace_qkv=False,
         )
-    # over the pools: the dense DECODE form (the gap), the EXTEND form, S_q > 4, the LSE, a split, the in-place knobs
+    # over the pools: the two declines that stay -- the dense DECODE form (the gap) and the EXTEND form
     with pytest.raises(NotImplementedError, match="dense geometry \\(the DECODE form\\).*in-kernel dequant arm"):
         dec(GEOM_SMALL, 2, 1, qsa=False, geom_over=dict(is_causal=True, causal_bottom_right=True))
     with pytest.raises(NotImplementedError, match="EXTEND form over e4m3 pools"):
         _declare_packed_extend()
-    with pytest.raises(NotImplementedError, match="SHARED-list form, S_q <= 4"):
-        dec(GEOM_SMALL, 2, 5)
-    with pytest.raises(NotImplementedError, match="return_lse=True with kv_cache_dtype"):
-        dec(GEOM_SMALL, 2, 2, return_lse=True)
-    with pytest.raises(NotImplementedError, match="decode_split_kv=4 with kv_cache_dtype"):
-        dec(GEOM_SMALL, 2, 2, decode_split_kv=4)
-    with pytest.raises(NotImplementedError, match="fuse_norm_rope=True with kv_cache_dtype"):
-        dec(GEOM_SMALL, 2, 2, fuse_norm_rope=True)
-    with pytest.raises(NotImplementedError, match="inplace_qkv=True with kv_cache_dtype"):
-        dec(GEOM_SMALL, 2, 2, inplace_qkv=True)
-    # the split 1 and inplace_qkv=False are accepted spellings of the mode's own facts
-    blk, _ = dec(GEOM_SMALL, 2, 2, decode_split_kv=1, inplace_qkv=False)
-    assert blk.decode_split_kv == 1 and blk.inplace_qkv is False
+    # the seven limits of the retired form, SERVED since 2026-10-21 (the in-kernel arm): each constructs with the sparse stage reading e4m3
+    served = [
+        ("S_q 5 (the per-row list past the shared cap)", 5, {}),
+        ("return_lse", 2, dict(return_lse=True)),
+        ("a split", 2, dict(decode_split_kv=4)),
+        ("fuse_norm_rope", 2, dict(fuse_norm_rope=True)),
+        ("inplace_qkv=True explicit", 2, dict(inplace_qkv=True)),
+        ("inplace_qkv=False", 2, dict(inplace_qkv=False)),
+        ("the declared per-row list at S_q 4", 4, dict(index_list_form="per_row")),
+        ("fuse_prepare", 2, dict(fuse_prepare=True)),
+    ]
+    with _no_host_sync():
+        for label, s_q, kw in served:
+            blk, _ = dec(GEOM_SMALL, 2, s_q, **kw)
+            assert isinstance(blk._sdpa, _SparseSdpa) and blk._sdpa.kv_e4m3 and blk.kv_cache_e4m3 and blk.sparse_decode, label
+        assert dec(GEOM_SMALL, 2, 2, decode_split_kv=4)[0].decode_split_kv == 4 and dec(GEOM_SMALL, 2, 2, return_lse=True)[0]._sdpa.want_lse
+        assert (
+            dec(GEOM_SMALL, 2, 2, inplace_qkv=False)[0].inplace_qkv is False and dec(GEOM_SMALL, 2, 4, index_list_form="per_row")[0].qsa_list_form == "per_row"
+        )
+        assert dec(GEOM_SMALL, 2, 5)[0].qsa_list_form == "per_row" and dec(GEOM_SMALL, 2, 2, fuse_norm_rope=True)[0].fuse_norm_rope_effective
+        # the in-block indexer over e4m3 pools: served (the former `indexer_e4m3_pool` row is gone from the envelope)
+        ix = _declare_indexer(1, 1)
+        assert ix.indexer_decode and ix._sdpa.kv_e4m3
+    env = GatedAttentionBlockFwd.serving_envelope(ix.geom, BF16, _DEV, device_cc=(10, 7)).decode
+    assert "indexer_e4m3_pool" not in env.declines and env.kv_cache_dtypes == (BF16, E4M3)
 
 
 def _declare_packed_extend():
@@ -394,18 +520,27 @@ def test_execute_form_checks_of_the_e4m3_mode():
         per_token_ids = torch.full((B * s_q, 512), -1, dtype=torch.int32, device=_DEV)  # the prefill form's list (the index check runs first)
         with pytest.raises(ValueError, match="k_scale, v_scale: the paged KV-cache inputs belong to a block declared with paged_kv_page_size > 0"):
             plain.execute(mk(B, s_q, g.d_model), **dict(common, block_ids=per_token_ids, slot_mapping=None, kv_lens=None, k_scale=one, v_scale=one))
+        # the sparse stage alone holds the scales to its declaration both ways (the block never hands them to a stage over bf16 operands)
+        with pytest.raises(ValueError, match="k_scale / v_scale are the e4m3 pools' per-tensor DEscales"):
+            plain._sdpa._impl = plain._sdpa._compiled = True  # past the plan guard without a plan: the form checks run first
+            plain._sdpa.execute(
+                mk(B, s_q, g.h_q, D), mk(B, s_q, g.h_kv, D), mk(B, s_q, g.h_kv, D), mk(B, s_q, g.h_q, D), block_ids=per_token_ids, k_scale=one, v_scale=one
+            )
 
 
 def test_the_envelope_names_the_pool_dtypes():
-    """``decode.kv_cache_dtypes``: the activation dtype always; e4m3 on a QsaSpec geometry with bf16 activations only."""
+    """``decode.kv_cache_dtypes``: the activation dtype always; e4m3 on a QsaSpec geometry with bf16 activations -- caller lists AND the
+    in-block indexer (since 2026-10-21); never on a dense geometry or under f16."""
     g, _ = _geom(GEOM_SMALL)
+    ix = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
     dense = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True)
     for cc in ((10, 7), (10, 0)):
         env = GatedAttentionBlockFwd.serving_envelope(g, BF16, _DEV, device_cc=cc)
         assert env.decode.kv_cache_dtypes == (BF16, E4M3) and env.decode.sparse_core
+        assert GatedAttentionBlockFwd.serving_envelope(ix, BF16, _DEV, device_cc=cc).decode.kv_cache_dtypes == (BF16, E4M3)
         assert GatedAttentionBlockFwd.serving_envelope(g, F16, _DEV, device_cc=cc).decode.kv_cache_dtypes == (F16,)
         assert GatedAttentionBlockFwd.serving_envelope(dense, BF16, _DEV, device_cc=cc).decode.kv_cache_dtypes == (BF16,)
-    assert any("kv_cache_dtype" in r for r in env.decode.requires)
+    assert any("kv_cache_dtype" in r and "in-kernel" in r.lower() for r in env.decode.requires)
 
 
 # ---------------------------------------------------------------------------
@@ -418,17 +553,54 @@ def _rope_tables(n_pos, dtype, ref_geom):
     return cos, sin  # [1, n_pos, ROPE]
 
 
+def _dequantized_ref(ref, k_scale, v_scale):
+    """The dense reference with its K / V replaced by the dequantized e4m3 codes (what the kernel sees after the fold at a power-of-two
+    scale, and up to the fold's fp32 roundings otherwise): ``bf16(fp32(sat_e4m3(row x (1 / scale))) x scale)``."""
+    return types.SimpleNamespace(q=ref.q, gate=ref.gate, k=_dequantize(_quantize(ref.k, k_scale), k_scale), v=_dequantize(_quantize(ref.v, v_scale), v_scale))
+
+
 class _Fp8Case:
     """One e4m3-cache sparse DECODE step over a batch of sequences with lengths ``kv_lens`` (0 = a dead entry; a length below ``s_q``
     leaves the rows with a negative position dead): the whole-sequence bf16 reference per entry, per-tensor DEscales calibrated on
-    the reference K / V of every live entry, the NaN-filled e4m3 pools holding the torch-quantized PREFIX rows, the block table (page
-    0 = the NULL block), the slot mapping of the step's tokens, ONE list per sequence at the step-0 position, and two fp32 oracles
-    of the step's gated O and ``out``: on the DEQUANTIZED rows (the gate) and on the pre-quantization bf16 rows (reported)."""
+    the reference K / V of every live entry (or the given constants: the power-of-two pin), the NaN-filled e4m3 pools holding the
+    torch-quantized PREFIX rows, the block table (page 0 = the NULL block), the slot mapping of the step's tokens, ONE list per sequence
+    at the step-0 position (the shared form) or one per row, and two fp32 oracles of the step's gated O, LSE and ``out``: on the
+    DEQUANTIZED rows (the gate) and on the pre-quantization bf16 rows (reported)."""
 
-    def __init__(self, geom_kw, s_q, kv_lens, *, page=16, layout="hnd", seed=0, top_k=512, block_lens=True, fuse_gate=False, index_band=False, n_pages=None):
+    def __init__(
+        self,
+        geom_kw,
+        s_q,
+        kv_lens,
+        *,
+        page=16,
+        layout="hnd",
+        seed=0,
+        top_k=512,
+        block_lens=True,
+        fuse_gate=False,
+        index_band=False,
+        n_pages=None,
+        index_list_form=None,
+        split=None,
+        return_lse=False,
+        fuse_norm_rope=False,
+        inplace_qkv=None,
+        fuse_prepare=None,
+        scales=None,
+    ):
         self.s_q, self.kv_lens, self.page, self.layout, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, top_k
         self.block_lens_given, self.fuse_gate, self.index_band = bool(block_lens), bool(fuse_gate), bool(index_band)
-        self.geom, self.ref_geom = _geom(geom_kw, top_k=top_k, index_band=index_band)
+        self.return_lse, self.split, self.fuse_norm_rope, self.inplace_qkv, self.fuse_prepare = (
+            bool(return_lse),
+            split,
+            bool(fuse_norm_rope),
+            inplace_qkv,
+            fuse_prepare,
+        )
+        self.index_list_form = index_list_form
+        self.shared = (self.s_q <= 4) if index_list_form is None else (index_list_form == "shared")
+        self.geom, self.ref_geom = _geom(geom_kw, top_k=top_k, index_band=index_band, index_list_form=index_list_form)
         geom, ref_geom, dtype = self.geom, self.ref_geom, BF16
         self.dtype = dtype
         h_q, h_kv, d_model = geom.h_q, geom.h_kv, geom.d_model
@@ -458,7 +630,10 @@ class _Fp8Case:
             live = pos >= 0
             self.live_rows[b] = live
             pos0 = torch.tensor([L - s_q], device=_DEV)
-            ids_b, lens_b = random_block_ids(pos0, top_k, BS, generator=g, kv_lens=torch.tensor([L], device=_DEV), shuffle=True)
+            if self.shared:
+                ids_b, lens_b = random_block_ids(pos0, top_k, BS, generator=g, kv_lens=torch.tensor([L], device=_DEV), shuffle=True)
+            else:
+                ids_b, lens_b = random_block_ids(pos, top_k, BS, generator=g, kv_lens=torch.tensor([L], device=_DEV).expand(s_q), shuffle=True)
             ids_rows.append(ids_b)
             lens_rows.append(lens_b)
             if L == 0:
@@ -472,14 +647,18 @@ class _Fp8Case:
             self.h[b, live] = h_full[0, p_live]
             self.cos[b, live] = cos_t[0, p_live]
             self.sin[b, live] = sin_t[0, p_live]
-        # the per-tensor DEscales, calibrated on every live entry's whole-sequence K / V (a static serving calibration)
-        all_k = torch.cat([r[0].k[0].reshape(-1) for r in refs.values()]) if refs else torch.ones(1, device=_DEV)
-        all_v = torch.cat([r[0].v[0].reshape(-1) for r in refs.values()]) if refs else torch.ones(1, device=_DEV)
-        self.k_scale, self.v_scale = _scale_of(all_k), _scale_of(all_v)
+        # the per-tensor DEscales: calibrated on every live entry's whole-sequence K / V (a static serving calibration), or the constants given
+        if scales is None:
+            all_k = torch.cat([r[0].k[0].reshape(-1) for r in refs.values()]) if refs else torch.ones(1, device=_DEV)
+            all_v = torch.cat([r[0].v[0].reshape(-1) for r in refs.values()]) if refs else torch.ones(1, device=_DEV)
+            self.k_scale, self.v_scale = _scale_of(all_k), _scale_of(all_v)
+        else:
+            self.k_scale, self.v_scale = _scale_const(scales[0]), _scale_const(scales[1])
         # the two oracles per entry: on the DEQUANTIZED rows (prefix AND step rows through the e4m3 codes) and on the bf16 rows
         self.ref_out = torch.zeros(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.ref_o_gated = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
         self.ref_o_gated_bf16 = torch.zeros(B, s_q, h_q, D, dtype=dtype, device=_DEV)
+        self.ref_lse = torch.full((B, h_q, s_q), float("-inf"), dtype=torch.float32, device=_DEV)
         self.ref_codes = {}  # b -> (K codes [L, h_kv, D], V codes): the prefix rows go into the pools; the step rows pin the write-through
         for b, (ref, pos, live, ids_b, lens_b) in refs.items():
             L = self.kv_lens[b]
@@ -487,13 +666,14 @@ class _Fp8Case:
             self.ref_codes[b] = (k_codes, v_codes)
             kd, vd = _dequantize(k_codes, self.k_scale), _dequantize(v_codes, self.v_scale)
             p_live = pos[live]
-            rows = ids_b.expand(s_q, top_k)
-            lens_arg = lens_b.expand(s_q) if block_lens else None
-            allowed = qsa_visible_mask(rows, lens_arg, pos, L, L, BS, top_k=top_k, pos0=L - s_q)[live]
+            rows = ids_b.expand(s_q, top_k) if self.shared else ids_b
+            lens_arg = (lens_b.expand(s_q) if self.shared else lens_b) if block_lens else None
+            allowed = qsa_visible_mask(rows, lens_arg, pos, L, L, BS, top_k=top_k, pos0=(L - s_q) if self.shared else None)[live]
             q_rows = ref.q[0][p_live].float()
             gate_rows = ref.gate[0][p_live].float()
             for which, (kk_all, vv_all, o_dst) in (("deq", (kd, vd, self.ref_o_gated)), ("bf16", (ref.k[0], ref.v[0], self.ref_o_gated_bf16))):
                 o = torch.zeros(int(live.sum()), h_q, D, dtype=torch.float32, device=_DEV)
+                lse = torch.full((h_q, int(live.sum())), float("-inf"), dtype=torch.float32, device=_DEV)
                 for hh in range(h_q):
                     kk, vv = kk_all[:, hh // G].float(), vv_all[:, hh // G].float()
                     sc = (q_rows[:, hh] @ kk.t()) * scale
@@ -506,13 +686,15 @@ class _Fp8Case:
                     den_safe = torch.where(dead, torch.ones_like(den), den)
                     oc = (p @ vv) / den_safe[:, None]
                     o[:, hh] = torch.where(dead[:, None], torch.zeros_like(oc), oc)
+                    lse[hh] = torch.where(dead, torch.full_like(den, float("-inf")), safe + torch.log(den))
                 o16 = o.to(dtype)  # the oracle's single rounding of O, then the gate in fp32, then one rounding
                 og = (o16.float() * torch.sigmoid(gate_rows)).to(dtype)
                 o_dst[b, live] = og
                 if which == "deq":
                     self.ref_out[b, live] = (og.reshape(-1, h_q * D).float() @ self.w["w_o"].float().t()).to(dtype)
-        self.block_ids = torch.stack([x.reshape(top_k) for x in ids_rows]).contiguous()
-        self.block_lens = torch.stack([x.reshape(()) for x in lens_rows]).contiguous()
+                    self.ref_lse[b, :, live] = lse
+        self.block_ids = torch.stack([x.reshape(top_k) if self.shared else x.reshape(s_q, top_k) for x in ids_rows]).contiguous()
+        self.block_lens = torch.stack([x.reshape(()) if self.shared else x.reshape(s_q) for x in lens_rows]).contiguous()
         assert self.block_ids.dtype == torch.int32 and self.block_lens.dtype == torch.int32
         # pages: block 0 reserved (NULL); each live entry gets ceil(L / P) pages from a permutation of 1 .. n_pages - 1; -1 past them
         need = sum(-(-L // page) for L in self.kv_lens)
@@ -551,12 +733,20 @@ class _Fp8Case:
             sample_block_table=self.block_table,
             fuse_gate=fuse_gate,
             kv_cache_dtype=E4M3,
+            return_lse=self.return_lse,
+            decode_split_kv=split,
+            fuse_norm_rope=self.fuse_norm_rope,
         )
+        if inplace_qkv is not None:
+            self.blk_kw["inplace_qkv"] = inplace_qkv
+        if fuse_prepare is not None:
+            self.blk_kw["fuse_prepare"] = fuse_prepare
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
+        self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if self.return_lse else None
         self.blk = GatedAttentionBlockFwd(
             self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], self.cos, self.sin, self.w["w_o"], self.out, self.geom, **self.blk_kw
         )
-        assert isinstance(self.blk._sdpa, _UpcastSparseSdpa) and self.blk.upcast_decode and self.blk.inplace_qkv is False and self.blk.gate_fused is False
+        assert isinstance(self.blk._sdpa, _SparseSdpa) and self.blk._sdpa.kv_e4m3 and self.blk.sparse_decode and self.blk.qsa_shared_list is self.shared
         self.ws = None
 
     def compile(self):
@@ -570,6 +760,7 @@ class _Fp8Case:
         *,
         out=None,
         ws=None,
+        lse=None,
         h=None,
         cos=None,
         sin=None,
@@ -593,6 +784,7 @@ class _Fp8Case:
             self.w["w_o"],
             out,
             self.ws if ws is None else ws,
+            lse=(self.lse if lse is None else lse) if self.return_lse else None,
             block_ids=self.block_ids if ids is None else ids,
             block_lens=(self.block_lens if lens is None else lens) if self.block_lens_given else None,
             k_cache=self.k_cache,
@@ -611,50 +803,66 @@ class _Fp8Case:
         if self.ws is None:
             self.compile()
         self.out.fill_(_sentinel(self.dtype))
+        if self.lse is not None:
+            self.lse.fill_(_sentinel(self.dtype))
         self.execute()
         torch.cuda.synchronize()
         return self.out
 
     def views(self, ws=None):
-        """The compact normed Q and K (out of place), the slab's GATE and V bands, the O slot, the slab -- what the e4m3 mode writes."""
+        """The post-norm-RoPE Q and K (the slab bands in place, the compact slots out of place), the slab's GATE and V bands, the O slot, the
+        slab -- what the e4m3 mode reads and writes."""
         ws = self.ws if ws is None else ws
         g, lay = self.geom, self.blk._ws
         B, S = self.blk.batch, self.blk.seq_len
         t = B * S
         proj = _view(ws, lay.proj, (t, g.n_qkvg), self.dtype)
-        _o_q, o_g, _o_k, o_v = g.qkvg_offsets[:4]
-        q = _view(ws, lay.q, (t, g.h_q, g.d_head), self.dtype).view(B, S, g.h_q, g.d_head)
-        k = _view(ws, lay.k, (t, g.h_kv, g.d_head), self.dtype).view(B, S, g.h_kv, g.d_head)
+        o_q, o_g, o_k, o_v = g.qkvg_offsets[:4]
+        q = (_cols(proj, o_q, g.h_q, g.d_head) if lay.q < 0 else _view(ws, lay.q, (t, g.h_q, g.d_head), self.dtype)).view(B, S, g.h_q, g.d_head)
+        k = (_cols(proj, o_k, g.h_kv, g.d_head) if lay.k < 0 else _view(ws, lay.k, (t, g.h_kv, g.d_head), self.dtype)).view(B, S, g.h_kv, g.d_head)
         gate = _cols(proj, o_g, g.h_q, g.d_head).view(B, S, g.h_q, g.d_head)
         v = _cols(proj, o_v, g.h_kv, g.d_head).view(B, S, g.h_kv, g.d_head)
         o = _view(ws, lay.o, (t, g.h_q, g.d_head), self.dtype).view(B, S, g.h_q, g.d_head)
         return q, gate, k, v, o, proj
 
     def label(self):
-        return f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} e4m3 p{self.page} {self.layout} gate={'fused->launch' if self.fuse_gate else 'launch'} lens={self.kv_lens}]"
+        form = f"{'shared' if self.shared else 'per-row'}{'' if self.index_list_form is None else ' (declared)'}"
+        return (
+            f"[{self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} {form} e4m3 p{self.page} {self.layout} split={self.blk.decode_split_kv} "
+            f"gate={'fused' if self.blk.gate_fused else 'launch'} lse={self.return_lse} fuse_prepare={self.blk.fuse_prepare} lens={self.kv_lens}]"
+        )
 
-    def check(self, out=None, ws=None, *, what="out"):
+    def check(self, out=None, ws=None, lse=None, *, what="out"):
         """The standard assertions: finite, no sentinel, dead rows exact, within the budget vs the oracle on the DEQUANTIZED pool (out, the
-        gated O slot), the pools' step rows BITWISE torch's quantization of the block's own K rows and V band, the prefix rows and
+        gated O slot, the LSE), the pools' step rows BITWISE torch's quantization of the block's own K rows and V band, the prefix rows and
         the NULL block untouched; the distance to the bf16 oracle printed (no gate)."""
         out = self.out if out is None else out
         ws = self.ws if ws is None else ws
+        lse = self.lse if lse is None else lse
         sent = _sentinel(self.dtype)
         live = self.live_rows
         dead = ~live
         q, gate, k, v, o, proj = self.views(ws)
         assert torch.isfinite(out.float()).all(), f"{what}: non-finite out"
         assert not (out.float() == sent).any(), f"{what}: a sentinel survived in out"
-        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the decode tile never wrote keeps the workspace fill)"
+        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the sparse core never wrote keeps the workspace fill)"
         if dead.any():
             assert (out[dead] == 0).all() and (o[dead] == 0).all(), f"{what}: a dead row's out and O must be exactly 0"
         c = _cos(out[live], self.ref_out[live])
         d_out = float((out[live].float() - self.ref_out[live].float()).abs().max())
         d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max())
         d_o_bf16 = float((o[live].float() - self.ref_o_gated_bf16[live].float()).abs().max())
+        d_lse = 0.0
+        if self.return_lse:
+            assert lse is not None and not (lse == sent).any(), f"{what}: a sentinel survived in LSE"
+            dead_bhs = dead[:, None, :].expand_as(lse)
+            if dead.any():
+                assert torch.isinf(lse[dead_bhs]).all() and (lse[dead_bhs] < 0).all(), f"{what}: a dead row's LSE must be -inf exactly"
+            d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
+            assert d_lse <= ATOL, f"{what}: LSE off the oracle on the dequantized pool by {d_lse} (budget {ATOL})"
         assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
         assert d_o <= ATOL, f"{what}: gated O off the oracle on the dequantized pool by {d_o} (budget {ATOL})"
-        # the quantizing write-through: the step's live rows are torch's e4m3 codes of the block's own normed K rows / V band, bitwise
+        # the quantizing write: the step's live rows are torch's e4m3 codes of the block's own normed K rows / V band, bitwise
         slot = self.slot_mapping
         lv = slot >= 0
         s_ = slot[lv].long()
@@ -677,41 +885,168 @@ class _Fp8Case:
             assert torch.equal(_bits(self.index_cache[s_ // self.page, s_ % self.page, :]), _bits(raw.reshape(-1, raw.shape[-1])[lv]))
             assert (~torch.isnan(self.index_cache.float())).all(-1).sum().item() == int(lv.sum())
         print(
-            f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| vs the DEQUANTIZED oracle {d_o:.4e} (budget {ATOL}); "
+            f"\n{self.label()} {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| vs the DEQUANTIZED oracle {d_o:.4e} (budget {ATOL}) max|d LSE| {d_lse:.2e}; "
             f"vs the PRE-quantization bf16 oracle {d_o_bf16:.4e} (reported, no gate); dead rows {int(dead.sum())}; k_scale {float(self.k_scale):.4e} v_scale {float(self.v_scale):.4e}"
         )
-        return dict(cos=c, d_out=d_out, d_o=d_o, d_o_bf16=d_o_bf16, dead=int(dead.sum()))
+        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, d_o_bf16=d_o_bf16, dead=int(dead.sum()))
 
 
 def _two_launches(case: _Fp8Case, what: str):
     a = case.run().clone()
     o_a = case.views()[4].clone()
+    lse_a = None if case.lse is None else case.lse.clone()
     b = case.run().clone()
     o_b = case.views()[4].clone()
     assert torch.equal(_bits(a), _bits(b)) and torch.equal(_bits(o_a), _bits(o_b)), f"{what}: two launches are not bitwise"
+    if lse_a is not None:
+        assert torch.equal(lse_a, case.lse), f"{what}: two launches are not bitwise on LSE"
     return case.check(what=what)
 
 
-# (geometry, S_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed)
+# (geometry, S_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed, index_list_form, split, return_lse, fuse_norm_rope, inplace_qkv, fuse_prepare)
 _LADDER = [
-    pytest.param(GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", False, True, False, 1, id="Sq1-B4-p16-hnd-dead-entry-gate-launch"),
-    pytest.param(GEOM_SMALL, 4, (300, 0, 1000, 77), 64, "nhd", True, False, False, 2, id="Sq4-B4-p64-nhd-no-block-lens-fuse-gate"),
     pytest.param(
-        GEOM_SMALL, 3, (2, 20000, 7), 32, "unified", True, True, False, 3, id="Sq3-B3-p32-unified-shorter-than-the-step-20000"
+        GEOM_SMALL, 1, (2052, 8192, 0, 4097), 16, "hnd", False, True, False, 1, None, None, False, False, None, None, id="Sq1-B4-p16-hnd-dead-entry-gate-launch"
+    ),
+    pytest.param(
+        GEOM_SMALL,
+        4,
+        (300, 0, 1000, 77),
+        64,
+        "nhd",
+        True,
+        False,
+        False,
+        2,
+        None,
+        1,
+        False,
+        False,
+        None,
+        None,
+        id="Sq4-B4-p64-nhd-no-block-lens-fuse-gate-epilogue",
+    ),
+    pytest.param(
+        GEOM_SMALL,
+        3,
+        (2, 20000, 7),
+        32,
+        "unified",
+        True,
+        True,
+        False,
+        3,
+        None,
+        None,
+        False,
+        False,
+        None,
+        None,
+        id="Sq3-B3-p32-unified-shorter-than-the-step-20000",
     ),  # a 2-token sequence under a 3-row step: one row at a negative position (a 1-token sequence would hand the fp32 reference a K = 1 matmul, which torch 2.10 routes to a Triton kernel this node cannot build for sm_107a)
-    pytest.param(GEOM_FLASH_NEXT, 1, (4096,), 16, "hnd", True, True, False, 4, id="Sq1-B1-flash-next-24-2-p16"),
-    pytest.param(GEOM_SMALL, 3, (8192, 2052), 16, "hnd", False, True, True, 5, id="Sq3-B2-p16-index-band-raw-key-write-through"),
+    pytest.param(GEOM_FLASH_NEXT, 1, (4096,), 16, "hnd", True, True, False, 4, None, None, False, False, None, None, id="Sq1-B1-flash-next-24-2-p16"),
+    pytest.param(
+        GEOM_SMALL, 3, (8192, 2052), 16, "hnd", False, True, True, 5, None, None, False, False, None, None, id="Sq3-B2-p16-index-band-raw-key-write-through"
+    ),
+    # the limits of the retired gathered-cast form, SERVED through the in-kernel arm (2026-10-21)
+    pytest.param(
+        GEOM_SMALL,
+        4,
+        (300, 0, 2052, 77),
+        16,
+        "hnd",
+        True,
+        True,
+        False,
+        6,
+        "per_row",
+        4,
+        True,
+        False,
+        None,
+        None,
+        id="Sq4-B4-per-row-declared-split4-lse-gate-combine",
+    ),
+    pytest.param(
+        GEOM_SMALL, 8, (300, 100), 16, "hnd", False, True, False, 7, None, 1, True, False, None, None, id="Sq8-B2-per-token-extend-with-prefix-unsplit-lse"
+    ),
+    pytest.param(
+        GEOM_SMALL,
+        4,
+        (8191, 8190, 8189, 8188),
+        16,
+        "hnd",
+        True,
+        True,
+        False,
+        8,
+        None,
+        16,
+        True,
+        True,
+        None,
+        None,
+        id="Sq4-B4-every-residue-split16-lse-fuse-norm-rope",
+    ),
+    pytest.param(
+        GEOM_SMALL,
+        2,
+        (8192, 2052, 0, 77),
+        64,
+        "nhd",
+        True,
+        True,
+        False,
+        9,
+        None,
+        None,
+        False,
+        False,
+        True,
+        True,
+        id="Sq2-B4-p64-nhd-inplace-explicit-fuse-prepare",
+    ),
+    pytest.param(
+        GEOM_SMALL, 2, (4097, 300), 16, "hnd", False, False, False, 10, None, 2, True, False, False, None, id="Sq2-B2-out-of-place-split2-lse-no-block-lens"
+    ),
 ]
 
 
 @requires_rubin
-@pytest.mark.parametrize("geom_kw, s_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed", _LADDER)
-def test_e4m3_decode_matches_the_oracle_on_the_dequantized_pool(geom_kw, s_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed):
-    """The e4m3 decode ladder (module docstring): every cell within the budget vs the step-0-anchored oracle on the DEQUANTIZED pool,
-    dead rows exact, the write-through rows the torch cast bitwise, two launches bitwise; the bf16-oracle distance reported."""
-    case = _Fp8Case(geom_kw, s_q, kv_lens, page=page, layout=layout, seed=seed, fuse_gate=fuse_gate, block_lens=block_lens, index_band=index_band)
+@pytest.mark.parametrize(
+    "geom_kw, s_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed, index_list_form, split, return_lse, fuse_norm_rope, inplace_qkv, fuse_prepare",
+    _LADDER,
+)
+def test_e4m3_decode_matches_the_oracle_on_the_dequantized_pool(
+    geom_kw, s_q, kv_lens, page, layout, fuse_gate, block_lens, index_band, seed, index_list_form, split, return_lse, fuse_norm_rope, inplace_qkv, fuse_prepare
+):
+    """The e4m3 decode ladder (module docstring): every cell within the budget vs the step-0-anchored (shared) or per-row oracle on the
+    DEQUANTIZED pool, the LSE too, dead rows exact, the write rows the torch cast bitwise, two launches bitwise; the bf16-oracle distance
+    reported.  The sparse core's in-kernel arm serves every row (the kernel template is the sparse one, never the decode tile)."""
+    case = _Fp8Case(
+        geom_kw,
+        s_q,
+        kv_lens,
+        page=page,
+        layout=layout,
+        seed=seed,
+        fuse_gate=fuse_gate,
+        block_lens=block_lens,
+        index_band=index_band,
+        index_list_form=index_list_form,
+        split=split,
+        return_lse=return_lse,
+        fuse_norm_rope=fuse_norm_rope,
+        inplace_qkv=inplace_qkv,
+        fuse_prepare=fuse_prepare,
+    )
     case.compile()
-    assert case.blk.decode_split_kv == 1 and case.blk._sdpa._impl.kernel_template == "decode_d256_f16"
+    tp = case.blk._sdpa._impl.template_params()
+    assert tp.kv_dtype == 0 and tp.paged_kv and tp.bottom_right and case.blk._sdpa._impl.kv_e4m3
+    if split is not None:
+        assert case.blk.decode_split_kv == split
+    if fuse_prepare:
+        assert case.blk._prepare is not None and case.blk._prepare.kv_e4m3 and case.blk._cache_write is None
     _two_launches(case, "ladder")
 
 
@@ -727,42 +1062,131 @@ def test_mtp_rows_over_e4m3_pools_share_the_step0_list(r):
     _two_launches(case, f"mtp r={r}")
 
 
+# (S_q, index_list_form, split, return_lse, fuse_gate, scales)
+_POW2 = [
+    pytest.param(1, None, 4, True, True, (1.0, 1.0), id="Sq1-shared-split4-lse-gate-combine-scales-1-1"),
+    pytest.param(1, None, 4, True, True, (0.5, 2.0), id="Sq1-shared-split4-lse-gate-combine-scales-0.5-2"),
+    pytest.param(4, "per_row", 1, True, False, (0.5, 2.0), id="Sq4-per-row-unsplit-lse-gate-launch-scales-0.5-2"),
+    pytest.param(2, None, 1, False, True, (2.0, 0.5), id="Sq2-shared-unsplit-gate-epilogue-scales-2-0.5"),
+]
+
+
 @requires_rubin
-def test_get_workspace_size_is_honest_and_holds_the_gathered_scratch():
-    """The gathered scratch, the e4m3 staging rows and the inverse scales sit inside ``get_workspace_size()``; nothing past the size is
-    written: a sentinel tail survives an execute; the decode tile's own scratch is 0 (unsplit)."""
-    case = _Fp8Case(GEOM_SMALL, 2, (4096, 512, 0), page=16, seed=31, fuse_gate=True)
+@pytest.mark.parametrize("s_q, index_list_form, split, return_lse, fuse_gate, scales", _POW2)
+def test_e4m3_at_a_power_of_two_scale_is_bitwise_the_bf16_block_fed_the_dequantized_pool(s_q, index_list_form, split, return_lse, fuse_gate, scales):
+    """The fold's exactness lifted from the kernel to the block: at ``k_scale`` / ``v_scale`` powers of two the e4m3 block's ``out``, gated O
+    and LSE are BITWISE the bf16 block's over pools holding ``bf16(code x scale)`` -- EVERY row the e4m3 run read: the torch-quantized
+    prefix and the step rows the e4m3 block itself wrote (copied dequantized into the bf16 twin's pools, which then writes nothing:
+    ``slot_mapping`` all ``-1``).  The gate in the split combine, in the epilogue and as its own launch; the shared and the per-row list."""
+    case = _Fp8Case(
+        GEOM_SMALL,
+        s_q,
+        (2052, 300, 4097),
+        page=16,
+        seed=20 + s_q,
+        scales=scales,
+        split=split,
+        return_lse=return_lse,
+        fuse_gate=fuse_gate,
+        index_list_form=index_list_form,
+    )
+    case.compile()
+    out8 = case.run().clone()
+    o8 = case.views()[4].clone()
+    lse8 = None if case.lse is None else case.lse.clone()
+    case.check(what="e4m3 at a power-of-two scale")
+    geom, h_kv = case.geom, case.geom.h_kv
+    k16, v16 = _pools(case.n_pages, h_kv, case.page, case.layout, BF16)
+    k16.copy_(_dequantize(case.k_cache, case.k_scale))  # exact: a code times a power of two is a bf16 value; NaN rows stay NaN
+    v16.copy_(_dequantize(case.v_cache, case.v_scale))
+    out16 = torch.empty_like(case.out)
+    lse16 = torch.empty_like(case.lse) if case.lse is not None else None
+    twin = GatedAttentionBlockFwd(
+        case.h,
+        case.w["w_qkvg"],
+        case.w["w_q_norm"],
+        case.w["w_k_norm"],
+        case.cos,
+        case.sin,
+        case.w["w_o"],
+        out16,
+        geom,
+        paged_kv_page_size=case.page,
+        kv_source=KV_SOURCE_PAGED,
+        sample_k_cache=k16,
+        sample_v_cache=v16,
+        sample_block_table=case.block_table,
+        fuse_gate=fuse_gate,
+        return_lse=return_lse,
+        decode_split_kv=split,
+    )
+    assert not twin.kv_cache_e4m3 and not twin._sdpa.kv_e4m3 and twin.decode_split_kv == case.blk.decode_split_kv and twin.gate_fused is case.blk.gate_fused
+    assert twin.check_support()
+    twin.compile()
+    ws16 = torch.full((twin.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+    out16.fill_(_sentinel(BF16))
+    twin.execute(
+        case.h,
+        case.w["w_qkvg"],
+        case.w["w_q_norm"],
+        case.w["w_k_norm"],
+        case.cos,
+        case.sin,
+        case.w["w_o"],
+        out16,
+        ws16,
+        lse=lse16,
+        block_ids=case.block_ids,
+        block_lens=case.block_lens,
+        k_cache=k16,
+        v_cache=v16,
+        block_table=case.block_table,
+        kv_lens=case.kv_lens_t,
+        slot_mapping=torch.full_like(case.slot_mapping, -1),  # the twin writes nothing: its pools already hold the dequantized step rows
+    )
+    torch.cuda.synchronize()
+    lay16 = twin._ws
+    o16 = _view(ws16, lay16.o, (case.blk.batch * s_q, geom.h_q, D), BF16).view_as(o8)
+    assert torch.equal(_bits(out16), _bits(out8)), "out: the e4m3 block differs from the bf16 block fed the dequantized pool at a power-of-two scale"
+    assert torch.equal(_bits(o16), _bits(o8)), "the gated O differs"
+    if lse8 is not None:
+        assert torch.equal(lse16, lse8), "the LSE differs"
+    print(f"\n{case.label()}: out / O / LSE BITWISE the bf16 block over the dequantized pool at k_scale {scales[0]} v_scale {scales[1]}")
+
+
+@requires_rubin
+def test_get_workspace_size_is_honest_and_holds_no_scratch():
+    """The e4m3 staging rows, the inverse scales and (under a split) the sparse core's fp32 partials sit inside ``get_workspace_size()``;
+    nothing past the size is written: a sentinel tail survives an execute; there is no gathered-cast scratch any more (the carve of an
+    e4m3 declaration is the bf16 twin's plus the three e4m3 slots)."""
+    case = _Fp8Case(GEOM_SMALL, 2, (4096, 512, 0), page=16, seed=31, fuse_gate=True, split=4, return_lse=True)
     case.compile()
     blk = case.blk
     lay = blk._layout()
-    assert blk._sdpa.scratch_workspace_bytes() == 0 and blk.get_workspace_size() >= lay.total_bytes
-    assert lay.kv_len_t - lay.kv_gathered == 3 * 2 * 2 * 2 * 2176 * 256 * 2
+    assert blk._sdpa.scratch_workspace_bytes() > 0 and blk.get_workspace_size() >= lay.total_bytes + blk._sdpa.scratch_workspace_bytes()
+    assert getattr(lay, "kv_gathered", -1) == -1 and getattr(lay, "kv_len_t", -1) == -1 and lay.kv_inv > lay.vc8 > lay.kc8 >= 0
+    twin, _ = _declare(GEOM_SMALL, 3, 2, pool_dtype=BF16, kv_cache_dtype=None, fuse_gate=True, decode_split_kv=4, return_lse=True)
+    assert blk.get_workspace_size() - twin.get_workspace_size() == lay.total_bytes - twin._layout().total_bytes  # the three e4m3 slots only
     need = blk.get_workspace_size()
     ws = torch.empty(need + 65536, dtype=torch.uint8, device=_DEV)
     ws[need:].fill_(0xA5)
     ws[:need].fill_(0x7F)
     out = torch.empty_like(case.out)
-    case.execute(out=out, ws=ws)
+    lse = torch.empty_like(case.lse)
+    case.execute(out=out, ws=ws, lse=lse)
     torch.cuda.synchronize()
     assert (ws[need:] == 0xA5).all(), "bytes past get_workspace_size() were written"
-    case.check(out, ws, what="sentinel-tailed workspace")
-    # the scratch was filled: every row past an item's count is 0.0 (zero_fill="full"), nothing kept the 0x7F7F fill
-    items = 3 * 2 * case.geom.h_kv
-    scratch = _view(ws, lay.kv_gathered, (items, 2, 2176, 256), BF16)
-    kv_len_t = _view(ws, lay.kv_len_t, (items,), torch.int32)
-    assert torch.isfinite(scratch.float()).all() and int(kv_len_t.max()) <= 2054 and int(kv_len_t.min()) == 0
-    for i in range(items):
-        n = int(kv_len_t[i])
-        assert (scratch[i, :, n:] == 0).all(), f"item {i}: a row past kv_len_t={n} is not zero"
+    case.check(out, ws, lse, what="sentinel-tailed workspace")
     inv = _view(ws, lay.kv_inv, (2,), torch.float32)
     assert torch.equal(inv, torch.reciprocal(torch.cat([case.k_scale, case.v_scale])))
 
 
 @requires_rubin
-def test_the_quantizing_write_through_on_the_prefill_form_matches_the_torch_cast_and_leaves_out_unchanged():
-    """The write-through-only form (the sparse block over its OWN K / V with e4m3 pools, ``kv_source="self"``): the pools' rows are
-    torch's e4m3 codes of the block's post-RoPE K / V BITWISE, and ``out`` is BITWISE the bf16-pool twin's (the write-through never
-    changes attention); padded slots (-1) write nothing, every unwritten slot still NaN."""
+def test_the_quantizing_write_on_the_prefill_form_matches_the_torch_cast_in_both_write_forms_and_leaves_out_unchanged():
+    """The write-only form (the sparse block over its OWN K / V with e4m3 pools, ``kv_source="self"``), in BOTH write forms -- the two-stage
+    write-through and the fused prepare's e4m3 pool arm (``fuse_prepare=True``): the pools' rows are torch's e4m3 codes of the block's
+    post-RoPE K / V BITWISE (and equal to each other), ``out`` is BITWISE the bf16-pool twin's (the write never changes attention);
+    padded slots (-1) write nothing, every unwritten slot still NaN."""
     B, S, page = 2, 64, 16
     geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(top_k=512))
     g = torch.Generator(device=_DEV).manual_seed(77)
@@ -778,10 +1202,14 @@ def test_the_quantizing_write_through_on_the_prefill_form_matches_the_torch_cast
     n_pages = -(-(B * S) // page) + 2
     k_scale, v_scale = torch.tensor([0.0123], device=_DEV), torch.tensor([0.0456], device=_DEV)
     runs = {}
-    for tag, pool_dtype, attr, scales in (("e4m3", E4M3, E4M3, dict(k_scale=k_scale, v_scale=v_scale)), ("bf16", BF16, None, {})):
+    for tag, pool_dtype, attr, scales, fused in (
+        ("e4m3", E4M3, E4M3, dict(k_scale=k_scale, v_scale=v_scale), False),
+        ("e4m3-prepare", E4M3, E4M3, dict(k_scale=k_scale, v_scale=v_scale), True),
+        ("bf16", BF16, None, {}, False),
+    ):
         kc, vc = _pools(n_pages, geom.h_kv, page, "hnd", pool_dtype)
         out = torch.empty(B, S, geom.d_model, dtype=BF16, device=_DEV)
-        blk = GatedAttentionBlockFwd(h, w_qkvg, ones, ones, cos, sin, w_o, out, geom, paged_kv_page_size=page, kv_cache_dtype=attr)
+        blk = GatedAttentionBlockFwd(h, w_qkvg, ones, ones, cos, sin, w_o, out, geom, paged_kv_page_size=page, kv_cache_dtype=attr, fuse_prepare=fused)
         assert blk.check_support()
         blk.compile()
         ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
@@ -792,18 +1220,22 @@ def test_the_quantizing_write_through_on_the_prefill_form_matches_the_torch_cast
         _o_q, _o_g, o_k, o_v = geom.qkvg_offsets[:4]
         runs[tag] = (out.clone(), kc, vc, _cols(proj, o_k, geom.h_kv, D).clone(), _cols(proj, o_v, geom.h_kv, D).clone(), blk)
     out8, kc8, vc8, k_rows, v_rows, blk8 = runs["e4m3"]
+    out8p, kc8p, vc8p, k_rows_p, v_rows_p, blk8p = runs["e4m3-prepare"]
     out16, kc16, vc16, k_rows16, v_rows16, _ = runs["bf16"]
-    assert isinstance(blk8._cache_write, _QuantizedCacheWrite) and blk8.inplace_qkv is True and not blk8.upcast_decode
-    assert torch.equal(_bits(out8), _bits(out16)), "the e4m3 write-through changed the block's own attention"
+    assert isinstance(blk8._cache_write, _QuantizedCacheWrite) and blk8.inplace_qkv is True and not blk8._sdpa.kv_e4m3
+    assert blk8p._prepare is not None and blk8p._prepare.kv_e4m3 and blk8p._cache_write is None and not blk8p._sdpa.kv_e4m3
+    assert torch.equal(_bits(out8), _bits(out16)) and torch.equal(_bits(out8p), _bits(out16)), "the e4m3 write changed the block's own attention"
     assert torch.equal(_bits(k_rows), _bits(k_rows16)) and torch.equal(_bits(v_rows), _bits(v_rows16))
+    assert torch.equal(_bits(k_rows_p), _bits(k_rows16)) and torch.equal(_bits(v_rows_p), _bits(v_rows16)), "the prepare's slab rows differ"
     lv = slots >= 0
     s_ = slots[lv].long()
     assert torch.equal(_bits(kc8[s_ // page, :, s_ % page, :]), _bits(_quantize(k_rows[lv], k_scale)))
     assert torch.equal(_bits(vc8[s_ // page, :, s_ % page, :]), _bits(_quantize(v_rows[lv], v_scale)))
+    assert torch.equal(_bits(kc8p), _bits(kc8)) and torch.equal(_bits(vc8p), _bits(vc8)), "the prepare's e4m3 pools differ from the two-stage write-through's"
     assert torch.equal(_bits(kc16[s_ // page, :, s_ % page, :]), _bits(k_rows[lv]))
-    for pool in (kc8, vc8):
+    for pool in (kc8, vc8, kc8p, vc8p):
         assert int((~torch.isnan(pool.float())).all(-1).sum()) == int(lv.sum()) * geom.h_kv, "an unwritten or padded slot moved"
-    print(f"\nprefill write-through e4m3: {int(lv.sum())} of {B * S} tokens written, out bitwise the bf16-pool twin, pools bitwise the torch cast")
+    print(f"\nprefill write e4m3: {int(lv.sum())} of {B * S} tokens written, out bitwise the bf16-pool twin, pools bitwise the torch cast in both write forms")
 
 
 def _written(pool):
@@ -816,8 +1248,8 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_scales_lengt
     ``set_sync_debug_mode("error")`` (no host sync in the path: scales, lengths, tables, lists and slots are device data; the inverse
     scales are a device op on the capture stream); the capture launches nothing, the replay is BITWISE a fresh eager run; new
     ``k_scale`` / ``v_scale`` / ``kv_lens`` / ``block_table`` / ``block_ids`` / ``block_lens`` / ``slot_mapping`` / ``h`` / RoPE rows
-    through the captured tensors replay bitwise the eager run over them."""
-    case = _Fp8Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=41, fuse_gate=True)  # fresh: never executed
+    through the captured tensors replay bitwise the eager run over them -- the scales are execute inputs read in-kernel, never a plan constant."""
+    case = _Fp8Case(GEOM_SMALL, 2, (300, 0, 1000, 77), page=16, seed=41, fuse_gate=True, split=4, return_lse=True)  # fresh: never executed
     case.blk.check_support()
     case.blk.compile()
     case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
@@ -838,15 +1270,17 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_scales_lengt
         assert torch.isnan(case.out).all() and _written(case.k_cache) == k_before, "the capture launched work"
         graph.replay()
         torch.cuda.synchronize()
-        replayed = case.out.clone()
-        case.check(replayed, what="replay")
+        replayed, lse_replayed = case.out.clone(), case.lse.clone()
+        case.check(replayed, lse=lse_replayed, what="replay")
         case.out.fill_(float("nan"))
         case.execute()
         torch.cuda.synchronize()
-        assert torch.equal(_bits(case.out), _bits(replayed)), "the replay of the captured first execute differs from the eager run"
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(
+            case.lse, lse_replayed
+        ), "the replay of the captured first execute differs from the eager run"
         # a NEW step through the captured tensors: new scales (a recalibration), new lengths / table / lists / slots / h / RoPE rows -- the
         # oracle of the new step through a sibling case over the same shapes
-        sib = _Fp8Case(GEOM_SMALL, 2, (301, 0, 1000, 77), page=16, seed=43, fuse_gate=True, n_pages=case.n_pages)
+        sib = _Fp8Case(GEOM_SMALL, 2, (301, 0, 1000, 77), page=16, seed=43, fuse_gate=True, split=4, return_lse=True, n_pages=case.n_pages)
         assert sib.block_table.shape == case.block_table.shape and sib.k_cache.shape == case.k_cache.shape
         assert not torch.equal(sib.k_scale, case.k_scale)
         case.k_cache.copy_(sib.k_cache)
@@ -864,10 +1298,11 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_scales_lengt
         case.w["w_qkvg"].copy_(sib.w["w_qkvg"])
         case.w["w_o"].copy_(sib.w["w_o"])
         case.prefix_bits = (_bits(case.k_cache).clone(), _bits(case.v_cache).clone())
-        case.ref_out, case.ref_o_gated, case.ref_o_gated_bf16, case.live_rows, case.kv_lens = (
+        case.ref_out, case.ref_o_gated, case.ref_o_gated_bf16, case.ref_lse, case.live_rows, case.kv_lens = (
             sib.ref_out,
             sib.ref_o_gated,
             sib.ref_o_gated_bf16,
+            sib.ref_lse,
             sib.live_rows,
             sib.kv_lens,
         )
@@ -875,14 +1310,241 @@ def test_capture_of_the_first_execute_replays_bitwise_and_takes_new_scales_lengt
         torch.cuda.synchronize()
         graph.replay()
         torch.cuda.synchronize()
-        replayed2 = case.out.clone()
-        case.check(replayed2, what="replay over new scales / lengths / table / lists / slots / inputs")
+        replayed2, lse_replayed2 = case.out.clone(), case.lse.clone()
+        case.check(replayed2, lse=lse_replayed2, what="replay over new scales / lengths / table / lists / slots / inputs")
         case.out.fill_(float("nan"))
         case.execute()
         torch.cuda.synchronize()
-        assert torch.equal(
-            _bits(case.out), _bits(replayed2)
+        assert torch.equal(_bits(case.out), _bits(replayed2)) and torch.equal(
+            case.lse, lse_replayed2
         ), "the replay over new scales / lengths / tables / lists / slots differs from the eager run over them"
+    finally:
+        graph.reset()
+
+
+# ---------------------------------------------------------------------------
+# Rubin: the in-block indexer over e4m3 pools (the bf16 indexer case turned into its e4m3 twin)
+# ---------------------------------------------------------------------------
+
+
+class _IndexerE4m3Case(_qsa._IndexerCase):
+    """The decode-INDEXER case of ``test_block_qsa_decode`` over e4m3 pools: the same inputs, references, side caches, table and slots as
+    the bf16 case; the pools' prefix rows quantized by torch with per-tensor scales calibrated on the whole-sequence K / V, the oracle's
+    K / V the DEQUANTIZED codes (the indexer's selection oracle is unchanged: it reads the compressed-key cache), the block declared with
+    ``kv_cache_dtype=torch.float8_e4m3fn`` over the e4m3 samples; ``execute`` hands the scales over; ``check`` pins the pools' step
+    rows as the torch cast."""
+
+    def __init__(self, *args, scales=None, **kw):
+        super().__init__(*args, **kw)
+        h_kv = self.geom.h_kv
+        if scales is None:
+            all_k = torch.cat([r.k[0].reshape(-1) for r in self.refs.values()]) if self.refs else torch.ones(1, device=_DEV)
+            all_v = torch.cat([r.v[0].reshape(-1) for r in self.refs.values()]) if self.refs else torch.ones(1, device=_DEV)
+            self.k_scale, self.v_scale = _scale_of(all_k), _scale_of(all_v)
+        else:
+            self.k_scale, self.v_scale = _scale_const(scales[0]), _scale_const(scales[1])
+        k8, v8 = _pools(self.n_pages, h_kv, self.page, self.layout, E4M3)
+        k8.copy_(_quantize(self.k_cache, self.k_scale))  # the bf16 prefix rows -> codes; NaN rows -> the NaN code
+        v8.copy_(_quantize(self.v_cache, self.v_scale))
+        self.k_cache, self.v_cache = k8, v8
+        self.prefix_bits = (_bits(k8).clone(), _bits(v8).clone())
+        self.refs = {b: _dequantized_ref(r, self.k_scale, self.v_scale) for b, r in self.refs.items()}
+        self.blk_kw = dict(self.blk_kw, sample_k_cache=k8, sample_v_cache=v8, kv_cache_dtype=E4M3)
+        tables = (None, None) if self.rope_tables_only else (self.cos, self.sin)
+        self.blk = GatedAttentionBlockFwd(
+            self.h, self.w["w_qkvg"], self.w["w_q_norm"], self.w["w_k_norm"], *tables, self.w["w_o"], self.out, self.geom, **self.blk_kw
+        )
+        assert self.blk.kv_cache_e4m3 and self.blk._sdpa.kv_e4m3 and self.blk.indexer_decode and self.blk._indexer_decode is not None
+
+    def execute(self, **kw):
+        kw.setdefault("k_scale", self.k_scale)
+        kw.setdefault("v_scale", self.v_scale)
+        return super().execute(**kw)
+
+    def check(self, out=None, ws=None, lse=None, *, what="out"):
+        """``_Case.check`` with the pools' step rows pinned as torch's e4m3 codes of the slab's K / V rows."""
+        out = self.out if out is None else out
+        ws = self.ws if ws is None else ws
+        lse = self.lse if lse is None else lse
+        sent = _sentinel(self.dtype)
+        live = self.live_rows
+        dead = ~live
+        q, gate, k, v, o, proj = self.slab_views(ws)
+        assert torch.isfinite(out.float()).all() and not (out.float() == sent).any(), f"{what}: out non-finite or a sentinel survived"
+        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O"
+        if dead.any():
+            assert (out[dead] == 0).all() and (o[dead] == 0).all(), f"{what}: a dead row's out and O must be exactly 0"
+        c = _cos(out[live], self.ref_out[live])
+        d_out = float((out[live].float() - self.ref_out[live].float()).abs().max())
+        d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max())
+        d_lse = 0.0
+        if self.return_lse:
+            assert lse is not None and not (lse == sent).any(), f"{what}: a sentinel survived in LSE"
+            dead_bhs = dead[:, None, :].expand_as(lse)
+            if dead.any():
+                assert torch.isinf(lse[dead_bhs]).all() and (lse[dead_bhs] < 0).all(), f"{what}: a dead row's LSE must be -inf exactly"
+            d_lse = float((lse[~dead_bhs] - self.ref_lse[~dead_bhs]).abs().max()) if live.any() else 0.0
+            assert d_lse <= ATOL, f"{what}: LSE off the oracle on the dequantized pool by {d_lse} (budget {ATOL})"
+        assert c > COS_OUT, f"{what}: cos(out) {c} <= {COS_OUT}"
+        assert d_o <= ATOL, f"{what}: gated O off the oracle on the dequantized pool by {d_o} (budget {ATOL})"
+        slot = self.slot_mapping
+        lv = slot >= 0
+        s_ = slot[lv].long()
+        kf, vf = k.reshape(-1, self.geom.h_kv, D), v.reshape(-1, self.geom.h_kv, D)
+        assert torch.equal(_bits(self.k_cache[s_ // self.page, :, s_ % self.page, :]), _bits(_quantize(kf[lv], self.k_scale))), f"{what}: K pool rows"
+        assert torch.equal(_bits(self.v_cache[s_ // self.page, :, s_ % self.page, :]), _bits(_quantize(vf[lv], self.v_scale))), f"{what}: V pool rows"
+        for pool, before in zip((self.k_cache, self.v_cache), self.prefix_bits):
+            now = _bits(pool)
+            touched = (now != before).any(dim=-1).any(dim=1)
+            written = set((int(p) for p in (s_ // self.page * self.page + s_ % self.page).tolist()))
+            assert all(int(pg) * self.page + int(off) in written for pg, off in touched.nonzero()), f"{what}: a pool row outside the step's slots moved"
+            assert not touched[0].any(), f"{what}: the NULL block moved"
+        print(
+            f"\n{self.label()} e4m3 {what}: cos(out) {c:.6f} max|d out| {d_out:.4e} max|d O_gated| {d_o:.4e} max|d LSE| {d_lse:.2e} dead rows {int(dead.sum())}"
+        )
+        return dict(cos=c, d_out=d_out, d_o=d_o, d_lse=d_lse, dead=int(dead.sum()))
+
+
+def _launch_names(run):
+    """The CUDA kernel launches of one callable under ``torch.profiler`` (memset / memcpy listed apart), or ``None`` when the profiler
+    records no CUDA activity (CUPTI absent -- the ONLY failure swallowed; the caller skips explicitly)."""
+    from torch.profiler import ProfilerActivity, profile
+
+    prof = profile(activities=[ProfilerActivity.CUDA])
+    try:
+        prof.start()
+    except Exception:  # noqa: BLE001 -- CUPTI unavailable on this box: the bitwise pins stand on their own
+        return None
+    try:
+        run()
+        torch.cuda.synchronize()
+    finally:
+        prof.stop()
+    names = [e.name for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
+    if not names:
+        return None
+    kern = [n for n in names if "memset" not in n.lower() and "memcpy" not in n.lower()]
+    return kern, [n for n in names if n not in kern]
+
+
+# (S_q, kv_lens, split, fuse_prepare, seed)
+_INDEXER_E4M3 = [
+    pytest.param(1, (2052, 8192), 4, True, 201, id="Sq1-B2-split4-fused-prepare"),
+    pytest.param(4, (2052, 8192), None, False, 202, id="Sq4-B2-default-split-unfused"),
+    pytest.param(4, (300, 0, 8191, 77), 4, True, 203, id="Sq4-B4-dead-entry-shorter-than-the-step-split4-fused"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("s_q, kv_lens, split, fuse_prepare, seed", _INDEXER_E4M3)
+def test_indexer_decode_over_e4m3_pools_matches_the_two_stage_oracle(s_q, kv_lens, split, fuse_prepare, seed):
+    """The in-block indexer's decode step over e4m3 pools: the selection the fp64 top-k of the block's own operands up to ties (the first
+    stage, unchanged: the indexer reads the compressed-key cache), the attention within budget of the fp32 oracle fed the kernel's list
+    over the DEQUANTIZED pool (the second stage), the ring / cache rows bitwise, the pools' step rows the torch cast, two launches bitwise,
+    both knob readings (the prepare's e4m3 pool arm and the quantizing write-through)."""
+    case = _IndexerE4m3Case(GEOM_SMALL, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare)
+    case.compile()
+    assert case.blk.fuse_prepare is fuse_prepare and (case.blk._prepare is not None) is fuse_prepare
+    if fuse_prepare:
+        assert case.blk._prepare.kv_e4m3 and case.blk._cache_write is None
+    else:
+        assert isinstance(case.blk._cache_write, _QuantizedCacheWrite)
+    _qsa._two_launches_indexer(case, f"indexer e4m3 fuse_prepare={fuse_prepare}")
+
+
+@requires_rubin
+def test_fused_prepare_over_e4m3_pools_is_bitwise_the_two_stage_write_through():
+    """The indexer form over e4m3 pools with ``fuse_prepare`` ON vs OFF on the same inputs: ``out``, the LSE, the list AND the pools BITWISE
+    (the prepare's e4m3 pool arm computes the two-stage write-through's codes op for op); the census by kernel name under
+    ``set_sync_debug_mode("error")``: the fused chain is five launches shorter (the norm + RoPE, the two casts and the bit copy folded
+    into the prepare), no memset / memcpy on either path."""
+    on = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 8192), page=16, seed=211, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    off = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 8192), page=16, seed=211, split=4, fuse_gate=True, return_lse=True, fuse_prepare=False)
+    on.compile()
+    off.compile()
+    on.run()
+    off.run()
+    on.check_selection("fused")
+    off.check_selection("unfused")
+    on.check(what="fused")
+    off.check(what="unfused")
+    assert torch.equal(_bits(on.out), _bits(off.out)) and torch.equal(on.lse, off.lse), "fused vs unfused differ on out / LSE"
+    assert torch.equal(on.kernel_ids(), off.kernel_ids()), "the lists differ"
+    assert torch.equal(_bits(on.k_cache), _bits(off.k_cache)) and torch.equal(_bits(on.v_cache), _bits(off.v_cache)), "the e4m3 pools differ"
+    assert torch.equal(_bits(on.index_kv_cache), _bits(off.index_kv_cache)) and torch.equal(_bits(on.index_state_cache), _bits(off.index_state_cache))
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        census_on, census_off = _launch_names(on.execute), _launch_names(off.execute)
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    if census_on is None or census_off is None:
+        pytest.skip("the CUDA profiler recorded no kernel activity on this box (CUPTI unavailable); the bitwise pins stand")
+    kern_on, other_on = census_on
+    kern_off, other_off = census_off
+    print(
+        f"\ncensus fused {len(kern_on)}: {[n.split('_tensorptr')[0][:60] for n in kern_on]}\ncensus unfused {len(kern_off)}: {[n.split('_tensorptr')[0][:60] for n in kern_off]}"
+    )
+    assert not other_on and not other_off, f"memset / memcpy on the execute path: {other_on} {other_off}"
+    assert len(kern_off) - len(kern_on) == 5 and sum("qsa_prepare" in n for n in kern_on) == 1 and not any("qsa_prepare" in n for n in kern_off)
+    assert (len(kern_on), len(kern_off)) == (8, 13), (len(kern_on), len(kern_off))
+
+
+@requires_rubin
+def test_indexer_e4m3_first_execute_captures_and_replays_bitwise_over_new_scales():
+    """The indexer form over e4m3 pools captured on its FIRST execute (no warm-up; ``set_sync_debug_mode("error")``), the replay bitwise a
+    fresh eager run; new scales through the captured tensors (a recalibration) replay bitwise the eager run over them -- the scales are
+    read in-kernel, never a plan constant."""
+    case = _IndexerE4m3Case(GEOM_SMALL, 1, (2052, 300), page=16, seed=221, split=4, fuse_gate=True, return_lse=True, fuse_prepare=True)
+    case.prime_prefix()
+    case.blk.check_support()
+    case.blk.compile()
+    case.ws = torch.full((case.blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device=_DEV)
+    case.out.fill_(float("nan"))
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                case.execute()
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert torch.isnan(case.out).all(), "the capture launched work"
+        graph.replay()
+        torch.cuda.synchronize()
+        case.oracle_from_list()
+        replayed, ids_r, lse_r = case.out.clone(), case.kernel_ids().clone(), case.lse.clone()
+        case.check_selection("replay")
+        case.check(what="replay")
+        case.out.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed)) and torch.equal(case.kernel_ids(), ids_r) and torch.equal(case.lse, lse_r)
+        # new scales (a recalibration by 2x): the pools' prefix rows re-quantized by torch to the new scales, the oracle refreshed
+        k_new, v_new = case.k_scale * 2.0, case.v_scale * 0.5
+        k8, v8 = _pools(case.n_pages, case.geom.h_kv, case.page, case.layout, E4M3)
+        k8.copy_(_quantize(_dequantize(case.k_cache, case.k_scale), k_new))
+        v8.copy_(_quantize(_dequantize(case.v_cache, case.v_scale), v_new))
+        case.k_cache.copy_(k8)
+        case.v_cache.copy_(v8)
+        case.k_scale.copy_(k_new)
+        case.v_scale.copy_(v_new)
+        case.prefix_bits = (_bits(case.k_cache).clone(), _bits(case.v_cache).clone())
+        case.refs = {b: _dequantized_ref(types.SimpleNamespace(q=r.q, gate=r.gate, k=r.k, v=r.v), k_new, v_new) for b, r in case.refs.items()}
+        case.out.fill_(float("nan"))
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+        case.oracle_from_list()
+        replayed2, lse2 = case.out.clone(), case.lse.clone()
+        case.check(what="replay over new scales")
+        case.out.fill_(float("nan"))
+        case.execute()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(case.out), _bits(replayed2)) and torch.equal(case.lse, lse2), "the replay over new scales differs from the eager run"
     finally:
         graph.reset()
 

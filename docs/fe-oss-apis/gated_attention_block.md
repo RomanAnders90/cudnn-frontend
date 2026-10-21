@@ -71,8 +71,8 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   (2026-10-21: the fused step +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells, bitwise), `False` on every other
   part until measured, and `False` out of place (`inplace_qkv=False`) on every part -- the AUTO reading is never True where an explicit
   True is declined); `fuse_norm_rope` together with it is a typed decline (pick one), as are `thd=True` and
-  `kv_source="paged"` on a DENSE geometry (the prepare kernel's packed arm and the dense DECODE form's are follow-ups) and
-  `kv_cache_dtype=torch.float8_e4m3fn` (the e4m3 cache's write-through quantizes in its own stage); a geometry with `rope_dim=0`
+  `kv_source="paged"` on a DENSE geometry (the prepare kernel's packed arm and the dense DECODE form's are follow-ups); under
+  `kv_cache_dtype=torch.float8_e4m3fn` the launch's K / V pool arm quantizes on the way in (bitwise the two-stage write-through); a geometry with `rope_dim=0`
   (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
   `use_pdl=True` launches the fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.
   See "Serving: write-through".
@@ -360,7 +360,7 @@ over as they are: never read back, never converted, never reallocated, graph-cap
 | `seq_lens` (block) / `seq_kv_lens` (core) | int32 `[B]`, optional and declared (`seq_lens_present=True`) | the KV length of every sequence; a query sees `min(pos + 1, seq_lens[b])` tokens; `0` = a dead sequence |
 | `paged_kv_page_size` (`P`, a declaration attribute) | a positive multiple of 16 -- so 4 divides P and a 4-token block never straddles a page | the write-through: pools `k_cache` / `v_cache` `[num_pages, H_kv, P, D]` (HND compact or NHD by strides) and `slot_mapping [T]` int32 / int64 (flat slot `page x P + offset`; a negative slot writes nothing) -- the next section |
 | `block_table`, `kv_lens` | int32 `(B, max_pages)`; int32 `[B]` = the logical KV length INCLUDING the step's new tokens | the paged-READ inputs (decode, and chunked prefill over a cached prefix): REQUIRED under `kv_source="paged"` -- the block-sparse DECODE / extend-with-prefix mode (below, and "Serving: the decode form") |
-| `kv_cache_dtype` (a declaration attribute) | `None` (= the activation dtype: bf16 / f16 pools) or `torch.float8_e4m3fn` with per-tensor fp32 `k_scale` / `v_scale` at execute (1-element CUDA tensors, value = code x scale) | the pool's dtype: a bf16 Q over a bf16 pool, or a bf16 Q over an e4m3 pool with the attribute (numerics-changing, hence an attribute) -- the quantizing write-through on the prefill forms, the gathered cast + the d256 decode tile on the block-sparse decode mode at `S_q <= 4` ("Serving: the e4m3 KV cache" below); an fp8 Q is not a served form |
+| `kv_cache_dtype` (a declaration attribute) | `None` (= the activation dtype: bf16 / f16 pools) or `torch.float8_e4m3fn` with per-tensor fp32 `k_scale` / `v_scale` at execute (1-element CUDA tensors, value = code x scale) | the pool's dtype: a bf16 Q over a bf16 pool, or a bf16 Q over an e4m3 pool with the attribute (numerics-changing, hence an attribute) -- the quantizing write-through (or the fused prepare's pool arm) on the write forms, the sparse core's in-kernel dequant arm on the block-sparse decode mode -- every list form, `S_q`, split, LSE, the in-block indexer included ("Serving: the e4m3 KV cache" below); an fp8 Q is not a served form |
 | `return_lse` -> `lse` | fp32 `[B, H_q, S_q]`, optional | `max + log(sum)` in natural log over the query's visible keys; `-inf` on a row with no visible key |
 
 **The count rule -- which entries of a row are read.** For a query at position `pos` of its sequence (dense: the row
@@ -601,7 +601,7 @@ How a stack's vocabulary maps onto it (the shim is a renaming, not a conversion)
 | vLLM's packed `[num_tokens, 2052]` buffer of token ids with the trailing count column | not a served form (the token-id arm is a follow-up) -- keep the block-id output of the top-k |
 | `slot_mapping` / `out_cache_loc` | `slot_mapping` (flat slot = page x P + offset; negative = no write) |
 | the page table at the stack's page granularity, `seq_lens` | `block_table`, `kv_lens` (the paged-READ mode: `kv_source="paged"`, the pools and the table as declaration samples -- the table CONTIGUOUS) |
-| `k_scale` / `v_scale` (the per-layer DEscales of an fp8 KV cache; device tensors) | `kv_cache_dtype=torch.float8_e4m3fn` at declaration, `execute(k_scale=, v_scale=)` as 1-element fp32 CUDA tensors (read on device; a host float is refused) |
+| `k_scale` / `v_scale` (the per-layer DEscales of an fp8 KV cache; device tensors) | `kv_cache_dtype=torch.float8_e4m3fn` at declaration, `execute(k_scale=, v_scale=)` as 1-element fp32 CUDA tensors (read on device -- the write quantizes with the IEEE-RN reciprocal, the sparse core folds them in-kernel; a host float is refused) |
 | the open tail, the causal mask, the per-row `visible_blocks` clamp | nothing -- the kernel derives all three from the position and the KV length |
 | the output gate | nothing -- stage (5) is the block's (`sigmoid(gate)` after the dead-row select); a split merge is internal |
 
@@ -677,9 +677,10 @@ the installed version, before the kernel module is imported.
 
 `fuse_prepare=True` needs the attribute (a `ValueError` without it), the in-place pipeline (`inplace_qkv=True`, a `ValueError`
 otherwise) and not `fuse_norm_rope` (a typed `NotImplementedError`: the norm + RoPE already live in the projection epilogue
-there); `thd=True`, `kv_source="paged"` on a DENSE geometry (the DECODE form) and `kv_cache_dtype=torch.float8_e4m3fn` together with it
-are typed `NotImplementedError`s naming the knob (the prepare kernel's packed arm and the dense DECODE form's are follow-ups; the e4m3
-cache's write-through quantizes in its own stage; on the block-sparse DECODE mode over the pools the knob is SERVED -- "The in-block
+there); `thd=True` and `kv_source="paged"` on a DENSE geometry (the DECODE form)
+are typed `NotImplementedError`s naming the knob (the prepare kernel's packed arm and the dense DECODE form's are follow-ups); under
+`kv_cache_dtype=torch.float8_e4m3fn` the launch's K / V pool arm quantizes (`sat_e4m3(row x (1 / scale))`, the scales read on device), bitwise
+the two-stage write-through; on the block-sparse DECODE mode over the pools the knob is SERVED -- "The in-block
 indexer's DECODE step over the pools" below); `rope_dim=0` with the knob is a `ValueError` at `check_support`, with or without `qk_norm`, naming the zero-width RoPE table
 operands: the fused launch binds `cos` / `sin` as `[T, rope_dim]` operands and its artifact is traced with one-column tables, so a
 `[T, 0]` table is not an operand it takes.  The fused stage takes `use_pdl` as the two stages it replaces do (the attribute and the
@@ -980,44 +981,51 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace, seq_le
 
 ### Serving: the e4m3 KV cache (`kv_cache_dtype`)
 
-**The e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`, 2026-10-14; bf16 activations).** The serving stacks' `--kv-cache-dtype fp8`
+**The e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`; bf16 activations).** The serving stacks' `--kv-cache-dtype fp8`
 recipe: the pools hold e4m3 codes under per-tensor fp32 DEscales `execute(k_scale=, v_scale=)` (value = code x scale; 1-element fp32
 CUDA tensors read on device -- vLLM's per-layer `k_scale` / `v_scale`), a bf16 Q attends over the dequantized rows.  A declaration
 ATTRIBUTE beside `paged_kv_page_size` (it changes the write-through's numerics), never a knob; `kv_cache_dtype=None` (or the
-activation dtype) is the bf16 / f16 pool as before.  Two served forms, one attribute:
+activation dtype) is the bf16 / f16 pool as before.  Two forms, one attribute:
 
-* **The quantizing WRITE-THROUGH** on every form that writes through over the block's own K / V (the dense prefill, QsaSpec or dense;
-  the packed prefill is a typed decline until its accept cell lands): after norm + RoPE the post-RoPE K / V rows are quantized per
-  tensor -- `code = sat_e4m3(row x (1 / scale))`, one fp32 product and one rounding, the FP8 pipeline's own cast kernel over the slab
-  band -- into two compact e4m3 workspace slots and bit-copied into the e4m3 pools through their bf16 views (three launches where the
-  bf16 write-through runs one; no new kernel).  The raw indexer key keeps its bf16 pool.  `out` is bitwise the bf16-pool block's (the
-  write-through never changes attention); the pool rows are bitwise `(row.float() * (1 / scale)).clamp(-448, 448).to(torch.float8_e4m3fn)`.
-* **The block-sparse DECODE mode over e4m3 pools** (`kv_source="paged"` on a dense `[B, S_q <= 4]` QsaSpec declaration -- the shared
-  list): stage (4) is the gathered cast + the Rubin d256 DECODE tile -- `kernels/qsa_kv_upcast.py` reads, per (token, KV head) item,
-  the sequence's listed 4-token blocks and the open tail over `[0, kv_lens[b])` through `block_table[b]`, dequantizes each e4m3 row
-  (`bf16(fp32(code) x scale)`) and writes the visible rows COMPACTED in list order into the workspace scratch `[B x S_q x H_kv, 2, 2176,
-  256]` bf16 plus a per-item length (0 = a dead item); the decode tile then runs over that scratch as a plain padded dense SDPA (no
-  causal mask -- the gathered rows ARE the visible set -- the per-item length on the KV side only, the group packed, unsplit).  The
-  sparse core is never taught fp8.  The mode norms + rotates OUT of place (the tile's per-item Q is a view of the compact normed Q alone:
-  `inplace_qkv=None` reads as False there, `fuse_norm_rope` is declined) and gates in its own launch (`blk.gate_fused` False whatever
-  `fuse_gate` says); `get_workspace_size()` grows by the scratch (2.2 MB per item) and holds it.
+* **The quantizing WRITE** on every form that writes through over the block's own K / V (the dense prefill, QsaSpec or dense; the
+  decode step's own rows; the packed prefill is a typed decline until its accept cell lands): after norm + RoPE the post-RoPE K / V rows
+  are quantized per tensor -- `code = sat_e4m3(fp32(row) x fp32(1 / scale))`, one fp32 product and one round-to-nearest-even rounding,
+  saturating at 448, the reciprocal an IEEE-RN division on device -- either by the two-stage write-through (the FP8 pipeline's own cast
+  kernel over the slab band into two compact e4m3 workspace slots, bit-copied into the e4m3 pools through their bf16 views: three
+  launches where the bf16 write-through runs one) or, under `fuse_prepare=True`, by the prepare launch's K / V pool arm from the same
+  registers that wrote the slab (one launch; bitwise the two-stage form).  The raw indexer key keeps its bf16 pool.  `out` is bitwise the
+  bf16-pool block's on the prefill forms (the write never changes the step's own attention); the pool rows are bitwise
+  `(row.float() * (1 / scale)).clamp(-448, 448).to(torch.float8_e4m3fn)`.
+* **The block-sparse DECODE mode over e4m3 pools** (`kv_source="paged"` on a dense `[B, S_q]` QsaSpec declaration, caller lists or
+  the in-block indexer): stage (4) is the sparse core's IN-KERNEL dequant arm.  The gather warps land each listed 4-token block's
+  e4m3 rows (two 128-byte boxes per row instead of two 256-byte ones) in the upper half of the bf16 operand stage and expand them in
+  place to the bf16 tile (`cvt.rn.bf16x2.e4m3x2`: exact, every e4m3 value is a bf16 value), so the MMA, the softmax and the epilogue
+  are the bf16 core's; `k_scale` is folded into the softmax scale and `v_scale` into the normaliser (the split's fp32 partials carry
+  it; the LSE is the log-sum-exp over the dequantized K).  At a power-of-two scale the step is BITWISE the bf16 block fed pools holding
+  `bf16(code x scale)`; at a generic scale it differs from that block by the two fp32 roundings of the folds.  No scratch, no extra
+  launch, no change to the list form, the split, the LSE or the gate placement: every form of the bf16 mode -- the shared and the
+  per-row list at any `S_q`, the split-KV combine, `return_lse`, `fuse_gate` in the epilogue or the combine, `fuse_norm_rope` /
+  `inplace_qkv`, `fuse_prepare` -- serves e4m3 pools, the in-block indexer's decode step included (it reads the compressed-key cache,
+  never the pools).  The 2026-10-14 form (the listed rows gathered and cast into a 2.2 MB-per-item workspace scratch, then the d256
+  decode tile; `S_q <= 4`, no LSE, unsplit, out-of-place norm) is retired: `get_workspace_size()` of an e4m3 declaration shrinks by
+  that scratch, every other layout is byte-identical.
 
 Typed declines (each pinned by `test_block_qsa_fp8_kv.py`): `torch.float8_e5m2` (by name) and any other dtype; the attribute without
-`paged_kv_page_size`; `quant` / `save_for_backward` with it (the write-through's own rows); f16 activations; over the pools the EXTEND
-form and the dense DECODE form (the paged THD body and the decode tile read bf16 / f16 pools: a dense e4m3 pool needs the tile's in-kernel
-dequant arm -- a follow-up), `S_q > 4` (the per-token list form: 2.2 MB of scratch per item), `return_lse` (the tile over the scratch
-writes item-major Stats), `decode_split_kv > 1` (unsplit over at most 17 KV tiles per item), `fuse_norm_rope` and an explicit
-`inplace_qkv=True`; pools of the wrong dtype at declaration and at execute (both ways); `k_scale` / `v_scale` missing under the
-attribute or given without it.  `serving_envelope(...).decode.kv_cache_dtypes` names the pool dtypes served at a geometry / dtype
-(`(bf16, e4m3)` on a QsaSpec geometry with bf16 activations, the activation dtype alone otherwise).  Validated on Rubin against the fp32
-oracle ON THE DEQUANTIZED POOL (the prefix rows quantized by torch with the per-tensor scales, the step rows the block's own write;
-the gated O within atol 2e-2, `cos(out) > 0.999`, dead rows exact, the pools' step rows bitwise the torch cast, two launches bitwise;
-the distance to the pre-quantization bf16 oracle reported, no gate): `S_q` 1 .. 4, B 1 / 3 / 4, `kv_lens` up to 20000 with dead and
-shorter-than-the-step entries, pages 16 / 32 / 64 on HND / unified / NHD pools, `block_lens` given / absent, the indexer band's raw-key
-write-through, the 24 / 2 Flash-Next geometry, the MTP residues, the write-through-only prefill form, the workspace sentinel, the
-CUDA-graph replay over new scales / lengths / tables / lists / slots / inputs.  Performance: none claimed (functional cells only); the
-unfused e4m3 decode step runs 9 launches against the bf16 mode's 5 -- the quantizing write inside the projection epilogue, the reciprocal
-inside the write kernel and the in-kernel dequant are the levers a later change measures.
+`paged_kv_page_size`; `quant` / `save_for_backward` with it (the write-through's own rows); f16 activations (one bf16 operand tile per
+plan); over the pools the EXTEND form and the dense DECODE form (the paged THD body and the decode tile read bf16 / f16 pools: their
+in-kernel dequant arms are follow-ups); pools of the wrong dtype at declaration and at execute (both ways); `k_scale` / `v_scale`
+missing under the attribute or given without it.  `serving_envelope(...).decode.kv_cache_dtypes` names the pool dtypes served at a
+geometry / dtype (`(bf16, e4m3)` on a QsaSpec geometry with bf16 activations, caller lists or the indexer; the activation dtype alone
+otherwise).  Validated on Rubin against the fp32 oracle ON THE DEQUANTIZED POOL (the prefix rows quantized by torch with the per-tensor
+scales, the step rows the block's own write; the gated O and the LSE within atol 2e-2, `cos(out) > 0.999`, dead rows exact, the pools'
+step rows bitwise the torch cast, two launches bitwise; the distance to the pre-quantization bf16 oracle reported, no gate) and, at a
+power-of-two scale, bitwise the bf16 block over the dequantized pools: `S_q` 1 .. 8, B 1 / 2 / 3 / 4, `kv_lens` up to 20000 with dead
+and shorter-than-the-step entries, pages 16 / 32 / 64 on HND / unified / NHD pools, `block_lens` given / absent, the shared and the
+per-row list, splits 1 / 4 / 16 with `return_lse`, the gate fused and separate, `fuse_norm_rope` / `inplace_qkv`, the indexer band's
+raw-key write-through, the 24 / 2 Flash-Next geometry, the MTP residues, the in-block indexer's decode step (the selection oracle
+unchanged; `fuse_prepare` on == off bitwise on `out`, the list and the pools), the multi-step decode with the pools carried, the
+write-through-only prefill form in both write forms, the workspace sentinel, the CUDA-graph replay over new scales / lengths / tables /
+lists / slots / inputs.  Performance: the serving-perf cells of the decode program measure it; none is claimed here.
 
 ### Serving: the extend form (`kv_source="paged"`, `token_capacity`)
 
@@ -1247,7 +1255,7 @@ per form (`extend`: `ExtendEnvelope`, `decode`: `DecodeEnvelope` -- `served`, th
 decline of the form in `declines`), `page_sizes` (16 / 32 / 64 / 128), `pool_layouts` (the three stride patterns), the decode
 route per `(group, S_q)` (`decode.routes` for `S_q` 1 .. 33 -- the served envelope and its first decline --, `decode.route(s_q)`
 for any step, `decode.max_s_q` = `decode.max_rows` = 32 / `decode.claimed_max_s_q` = 4, `decode.policy` / `decode.q_tile_max`; the
-policy and the width cap the record reads are `serving_envelope(..., decode_route_policy=, decode_q_tile_max=)`'s), the pool dtypes (`dtypes`: bf16 / f16 -- an e4m3 pool is not served), the part and the CuTe DSL facts
+policy and the width cap the record reads are `serving_envelope(..., decode_route_policy=, decode_q_tile_max=)`'s), the pool dtypes (`dtypes`: bf16 / f16 activations; `kv_cache_dtypes` adds e4m3 pools on a QsaSpec geometry with bf16 activations), the part and the CuTe DSL facts
 (`device_cc`, `cutedsl_ok` / `cutedsl_reason`) -- derived from the same
 helpers the declaration and `check_support` run, so no decline is reachable at `execute` that the record did not predict (the
 execute-time refusals are the caller's malformed tensors, form-checked by name). It never raises for a device the block does
@@ -1337,7 +1345,7 @@ compressed-key cache served at decode since 2026-10-21, "At decode over the pool
 `index_head_dims` (`(128,)`), `index_kv_heads` (`(1,)`), `index_block_sizes` (`(4,)`), `index_top_k_range` (`(4, 512, 4)`),
 `index_query_rows_max` (64: `S_q x next_pow2(index_heads)` rows per sequence), `index_state_rows_extra` (3: `cap >= S_q + 3`),
 `index_page_sizes` (`(16, 32, 64, 128)`: `P / 4` a power of two), `fuse_prepare_default`; `decode.kv_cache_dtypes` is `(bf16,)`
-under the indexer (the e4m3 pools wait for the sparse core's in-kernel dequant arm: `indexer_e4m3_pool`).  Typed declines by
+under the indexer -- e4m3 pools included (`kv_cache_dtype`; the sparse core's in-kernel dequant arm).  Typed declines by
 row name (`decode.declines`, each the text the declaration raises): `indexer_query_rows`, `indexer_page_size`,
 `indexer_e4m3_pool`, `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`, `indexer_head_dim`, `indexer_thd`
 (the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served); `use_pdl=True` under the indexer keeps
@@ -1762,9 +1770,9 @@ side-stream wgrad GEMMs, sized to their plans, appended last). At S=32K, B=1, 39
   compressed-key cache + the ring + its table as samples; "The in-block indexer's DECODE step over the pools" above); the packed form is
   a typed decline.
 - The e4m3 KV cache (`kv_cache_dtype=torch.float8_e4m3fn`): bf16 activations with `paged_kv_page_size > 0`; the quantizing write-through
-  on the dense prefill forms (QsaSpec or dense) and the block-sparse DECODE mode over e4m3 pools at `S_q <= 4` (the gathered cast + the
-  d256 decode tile, out-of-place norm, the gate as its own launch, unsplit, no LSE); `execute(k_scale=, v_scale=)` 1-element fp32 CUDA
-  tensors; the packed prefill, the EXTEND form, the dense DECODE form, `S_q > 4`, `return_lse`, a split, `fuse_norm_rope`, f16, e5m2 and
+  (or the fused prepare's pool arm) on the dense prefill forms (QsaSpec or dense) and the block-sparse DECODE mode over e4m3 pools at every
+  list form / `S_q` / split / LSE / gate placement, the in-block indexer included (the sparse core's in-kernel dequant arm);
+  `execute(k_scale=, v_scale=)` 1-element fp32 CUDA tensors; the packed prefill, the EXTEND form, the dense DECODE form, f16, e5m2 and
   `quant` with it are typed declines ("Serving: the e4m3 KV cache" above).
 - FP8 / MXFP8: the UNFUSED pipelines train (`save_for_backward=True` writes the bf16 record described above), the fp4
   modes of the MXFP8 pipeline included; the fully fused quantized pipelines are inference only. The backward is bf16 / fp16

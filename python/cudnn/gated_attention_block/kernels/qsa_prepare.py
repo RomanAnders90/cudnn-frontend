@@ -68,6 +68,16 @@ out of ``qk_norm_rope``):
   rows, the block table's width times the page; dense: ``NB x pool``), so a conforming stack never meets the ceiling with a position
   its cache holds, and the in-kernel clamp serves only the dead rows of a padding sequence (whose rotation nothing consumes).
 
+* ``kv_cache_dtype=torch.float8_e4m3fn`` (``compile_qsa_prepare``, appended 2026-10-21; the block's e4m3 KV cache): the K / V POOL arm
+  writes e4m3 CODES -- the K pool row takes the SAME bf16-rounded packed words the slab receives, re-expands them to fp32, multiplies by
+  ``1 / k_scale`` (``div.rn.f32`` of the 1-element device tensor, read once per lane; NEVER an approximate reciprocal) and packs them with
+  ``cvt.rn.satfinite.e4m3x2.f32`` (RN, saturating at 448) into ONE 8-B store per lane; the V row the same from its raw words with ``1 /
+  v_scale``.  That is ``sat_e4m3(fp32(bf16 row) x fp32(1 / scale))`` op for op -- the FP8 pipeline's per-tensor cast over the slab band
+  (``kernels/quantize.py``) that the two-stage quantizing write-through runs -- so the fused e4m3 write is BITWISE the two-stage form.  The
+  slab's K row stays bf16, the raw-key ring is never quantized, the compressed-key cache's dtype is its own key (``index_cache_dtype``).
+  The pools' strides are then in e4m3 ELEMENTS (the thread's byte offset halves).  The scales are REQUIRED at execute with the arm and
+  REFUSED without it.
+
 Table forms -- two, because two kinds of position are involved: ``cos`` / ``sin`` ``[T, rope_dim]`` are the attention's own
 PER-TOKEN rows (the block's contract: row ``t`` is token ``t``'s position), read by the Q / K and the indexer-query rows;
 ``cos_pos`` / ``sin_pos`` ``[1 or B, S_pos, rope_dim]`` are POSITION-indexed (the step form's contract), read by the compress
@@ -109,8 +119,17 @@ from cutlass.cute.runtime import make_fake_stream
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.frost.device import current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
-from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, rmsnorm_rstd, rope_rotate_half
-from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v4
+from cudnn.frost.tile_dsl.pointwise import (
+    div_rn_f32,
+    f16x2_to_f32,
+    fp32_to_fp16,
+    fp32_to_fp8x2,
+    opaque_f32_zero,
+    pack_fp8x2_pairs,
+    rmsnorm_rstd,
+    rope_rotate_half,
+)
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v2, ld_global_v4, st_global, st_global_v2, st_global_v4
 
 from ..cache_write_contract import QsaPrepareIndexArms, check_pool, check_slot_mapping  # the arms record: re-exported for this kernel's callers
 from .cache_write import _fake_pool, _fake_slot
@@ -124,6 +143,7 @@ from .qk_norm_rope import (
     validate_shape,
     vec_chunks,
 )
+from .quantize import check_scalar_slot, require_fp8_cvt
 from .qsa_compress import (
     DEFAULT_POOL,
     SLOT_CAPACITY,
@@ -237,6 +257,21 @@ def _rope_row_addrs(
     return c_addr, s_addr
 
 
+@cute.jit
+def _e4m3_words(words, inv_scale: cutlass.Float32, dtype):
+    """A thread's 8 elements -- four packed 16-bit words in memory order -- as two words of 8 e4m3 codes: per element
+    ``sat_e4m3(fp32(x) x inv_scale)`` -- ``f16x2_to_f32`` (exact), ONE fp32 RN multiply, ``cvt.rn.satfinite.e4m3x2.f32`` (RN, saturating at
+    448): the quantize kernel's chain op for op (``kernels/quantize.py::quantize_rows``), the low element of every pair in the low byte, so
+    the fused e4m3 pool row is BITWISE the two-stage write-through's."""
+    vals = []
+    for w in words:
+        lo, hi = f16x2_to_f32(w, dtype=dtype)
+        vals.append(lo * inv_scale)
+        vals.append(hi * inv_scale)
+    pairs = [fp32_to_fp8x2(vals[2 * i], vals[2 * i + 1], dtype=cutlass.Float8E4M3FN) for i in range(4)]
+    return [pack_fp8x2_pairs(pairs[0], pairs[1]), pack_fp8x2_pairs(pairs[2], pairs[3])]
+
+
 @cute.kernel
 def frost_qsa_prepare(
     mQ: cute.Tensor,  # [T, H_q,  D] in: the slab's Q band (token stride symbolic)
@@ -268,6 +303,10 @@ def frost_qsa_prepare(
     mBlockTable: Optional[cute.Tensor],  # [B, max_pages] int32: the MAIN block table (the paged form), or None
     mStateTable: Optional[cute.Tensor],  # [B, 1] int32: the ring's block table (the paged form), or None
     mRingSlots: Optional[cute.Tensor],  # [T] int32 / int64 (the slot dtype): the stack's own ring slots (paged, ring_slots), or None
+    mKScale: Optional[
+        cute.Tensor
+    ],  # [1] fp32: the K pool's per-tensor DEscale -- the K / V pools then hold e4m3 CODES (kv_cache_dtype); None = bf16 / f16 pools
+    mVScale: Optional[cute.Tensor],  # [1] fp32: the V pool's (given together with mKScale)
     n_tok: cutlass.Int32,  # T
     s_q: cutlass.Int32,  # rows per sequence (T = B * S_q); only the compress arm reads it
     n_slots: cutlass.Int64,  # P * page_size of the SMALLER K / V pool: a slot outside [0, n_slots) writes nothing
@@ -305,6 +344,7 @@ def frost_qsa_prepare(
     has_n_commit = cutlass.const_expr(mNCommit is not None)
     paged = cutlass.const_expr(mBlockTable is not None)
     has_ring_slots = cutlass.const_expr(mRingSlots is not None)
+    kv_e4m3 = cutlass.const_expr(mKScale is not None)  # the K / V pools hold e4m3 codes: their strides are in e4m3 elements, the rows quantized on the way in
     table_dtype = mCosPos.element_type if cutlass.const_expr(mCos is None) else mCos.element_type  # the RoPE-table arm reads the position-indexed tables
     warps_per_cta = cutlass.const_expr(threads_per_cta // _WARP)
     lanes_a = cutlass.const_expr(lanes_per_row(d))
@@ -377,7 +417,14 @@ def frost_qsa_prepare(
         p0 = cutlass.Int64(mVPool.stride[0]) if is_v else cutlass.Int64(mKPool.stride[0])
         p1 = cutlass.Int64(mVPool.stride[1]) if is_v else cutlass.Int64(mKPool.stride[1])
         p2 = cutlass.Int64(mVPool.stride[2]) if is_v else cutlass.Int64(mKPool.stride[2])
-        pool_addr = pool_base + (page.to(cutlass.Int64) * p0 + head64 * p1 + off.to(cutlass.Int64) * p2) * bpe
+        bpe_pool = cutlass.Int64(1) if cutlass.const_expr(kv_e4m3) else bpe  # an e4m3 pool's strides are in 1-B elements
+        pool_addr = pool_base + (page.to(cutlass.Int64) * p0 + head64 * p1 + off.to(cutlass.Int64) * p2) * bpe_pool
+        if cutlass.const_expr(kv_e4m3):
+            # the two reciprocals, IEEE RN (div.rn.f32, never rcp.approx: the two-stage write-through's torch.reciprocal is correctly rounded and the
+            # pin is bitwise); the 1.0 opaque so the asm operand stays a register (frost-tile-dsl.md section 7)
+            one_f = opaque_f32_zero() + cutlass.Float32(1.0)
+            inv_k = div_rn_f32(one_f, ld_global(mKScale.iterator.toint(), cutlass.Float32))
+            inv_v = div_rn_f32(one_f, ld_global(mVScale.iterator.toint(), cutlass.Float32))
         # The RoPE-table arm: the row's step position on EVERY lane (the rotation reads the table at it) and the store gates -- a row at
         # or past the table has no rotation (the clamp in _rope_row_addrs is memory safety only): its Q / K slab row and its K pool row
         # are NOT written, and the compress arm reports it -2; the V row is a position-free bit copy, stored as in the per-token form.
@@ -447,11 +494,18 @@ def frost_qsa_prepare(
         if store_kpool:
             for c in cutlass.range_constexpr(chunks_a):
                 coff = cutlass.Int64((c * lanes_a) * ACCESS_BYTES) + lane_off
-                st_global_v4(pool_addr + coff, out_words[c], cutlass.Int32)
+                if cutlass.const_expr(kv_e4m3):
+                    # the K pool row: the SAME bf16-rounded words the slab receives, quantized (the thread's 8 codes = one 8-B store at half the byte offset)
+                    st_global_v2(pool_addr + coff // cutlass.Int64(2), _e4m3_words(out_words[c], inv_k, mQo.element_type), cutlass.Int32)
+                else:
+                    st_global_v4(pool_addr + coff, out_words[c], cutlass.Int32)
         if live & is_v:
             for c in cutlass.range_constexpr(chunks_a):
                 coff = cutlass.Int64((c * lanes_a) * ACCESS_BYTES) + lane_off
-                st_global_v4(pool_addr + coff, raw_words[c], cutlass.Int32)
+                if cutlass.const_expr(kv_e4m3):
+                    st_global_v2(pool_addr + coff // cutlass.Int64(2), _e4m3_words(raw_words[c], inv_v, mV.element_type), cutlass.Int32)
+                else:
+                    st_global_v4(pool_addr + coff, raw_words[c], cutlass.Int32)
     elif wid < n_attn_warps + n_qi_warps:
         # ---------------- the indexer-query arm: qsa_compress.py at pool = 1, batch = token, block = head -------------------
         if cutlass.const_expr(has_qi):
@@ -722,6 +776,8 @@ def qsa_prepare_launch(
     block_table: Optional[cute.Tensor],
     state_table: Optional[cute.Tensor],
     ring_slots: Optional[cute.Tensor],
+    k_scale: Optional[cute.Tensor],
+    v_scale: Optional[cute.Tensor],
     n_tok: cutlass.Int32,
     s_q: cutlass.Int32,
     n_slots: cutlass.Int64,
@@ -777,6 +833,8 @@ def qsa_prepare_launch(
         block_table,
         state_table,
         ring_slots,
+        k_scale,
+        v_scale,
         n_tok,
         s_q,
         n_slots,
@@ -828,6 +886,27 @@ class QsaPrepareRecipe(NamedTuple):
     index: Optional[QsaPrepareIndexArms]
     threads_per_cta: int
     index_cache_dtype: object = None  # appended: the indexer queries' / compressed-key cache's dtype -- None = the io dtype, float8_e4m3fn = the e4m3 store arm
+    kv_cache_dtype: object = None  # appended: the K / V pools' dtype -- None = the activation dtype, torch.float8_e4m3fn = e4m3 codes (the scales at execute)
+
+    @property
+    def kv_e4m3(self) -> bool:
+        return self.kv_cache_dtype is not None and self.kv_cache_dtype == torch.float8_e4m3fn
+
+    @property
+    def pool_dtype(self):
+        return torch.float8_e4m3fn if self.kv_e4m3 else self.dtype
+
+
+def check_kv_cache_dtype(kv_cache_dtype, dtype) -> bool:
+    """The K / V pools' dtype against the kernel's contract: ``None`` or the activation dtype = the bf16 / f16 pools (False);
+    ``torch.float8_e4m3fn`` = the quantizing pool arm (True; the per-tensor scales at execute); any other dtype a ``ValueError``."""
+    if kv_cache_dtype is None or kv_cache_dtype == dtype:
+        return False
+    if kv_cache_dtype == torch.float8_e4m3fn:
+        return True
+    raise ValueError(
+        f"kv_cache_dtype must be None / the activation dtype {dtype} (bf16 / f16 pools) or torch.float8_e4m3fn (e4m3 pools under per-tensor scales), got {kv_cache_dtype}"
+    )
 
 
 def compile_qsa_prepare(
@@ -846,6 +925,7 @@ def compile_qsa_prepare(
     const_head_counts: bool = True,
     use_pdl: bool = False,
     index_cache_dtype=None,
+    kv_cache_dtype=None,
 ) -> QsaPrepareRecipe:
     """Build the artifact from SHAPES ALONE -- no device allocation, no launch (the block calls it from ``compile()``).
 
@@ -853,11 +933,17 @@ def compile_qsa_prepare(
     switch); ``index`` names the indexer arms to trace (``None`` = no indexer band: the attention rows and the K / V pools
     only); ``index_cache_dtype`` (appended) names the indexer queries' and the compressed-key cache's dtype -- ``None`` = the io
     dtype, ``torch.float8_e4m3fn`` = the e4m3 store arm of the query and the compress arms (module docstring; bf16 io only; sm_89+ --
-    an older part is a typed ``NotImplementedError`` naming the instruction).  Every flag is in the cache key.
+    an older part is a typed ``NotImplementedError`` naming the instruction); ``kv_cache_dtype`` (appended) the K / V POOLS' dtype --
+    ``None`` = the activation dtype (the artifact traced byte for byte as before), ``torch.float8_e4m3fn`` = the quantizing pool arm
+    (e4m3 codes under the per-tensor ``k_scale`` / ``v_scale`` bound at execute; the fp8 cvt's device floor gated first, Rule 7).
+    Every flag is in the cache key.
     """
     too_old = cutedsl_requirement_error("qsa_prepare")
     if too_old is not None:
         raise NotImplementedError(too_old)
+    kv_e4m3 = check_kv_cache_dtype(kv_cache_dtype, dtype)
+    if kv_e4m3:
+        require_fp8_cvt("qsa_prepare")  # the e4m3 pool arm's cvt.rn.satfinite needs sm_89+: declined by name before the trace
     ix = index if (index is not None and index.any) else None
     validate_prepare_shape(d, rope_dim, page_size, threads_per_cta, None if ix is None else ix.head_dim, DEFAULT_POOL if ix is None else ix.pool)
     if dtype not in _IO_DTYPES:
@@ -901,6 +987,7 @@ def compile_qsa_prepare(
         bool(use_pdl),
         current_device(),
         str(cache_dtype) if cache_dtype != dtype else None,  # appended: the e4m3 store arm is its own artifact
+        str(kv_cache_dtype),
     )
     if key not in compiled_cache:
         tok = cute.sym_int()
@@ -908,7 +995,8 @@ def compile_qsa_prepare(
         bands = [fake_rowmajor_dynamic_token_stride(dtype, tok, h, d) for h in (h_q, h_kv, h_kv, h_q, h_kv)]  # q, k, v, q_out, k_out
         weights = [_fake(dtype, (d,), (0,)) for _ in range(2)] if apply_norm else [None, None]
         tables = [None, None] if (ix is not None and ix.rope_table) else [_fake(dtype, (tok, table_dim), (1, 0)) for _ in range(2)]
-        pools = [_fake_pool(dtype, h_kv, page_size, d) for _ in range(2)]
+        pools = [_fake_pool(torch.float8_e4m3fn if kv_e4m3 else dtype, h_kv, page_size, d) for _ in range(2)]
+        scales = [_fake(torch.float32, (1,), (0,)) for _ in range(2)] if kv_e4m3 else [None, None]  # the e4m3 pools' DEscales (None drops the slots)
         slot = _fake_slot(slot_dtype)
         ik_src = ik_pool = iq_src = iq_out = w_iq = ring = comp = w_ik = cos_pos = sin_pos = pos0 = n_commit = cslot = None
         kv_lens = block_table = state_table = ring_slots = None
@@ -966,6 +1054,7 @@ def compile_qsa_prepare(
             block_table,
             state_table,
             ring_slots,
+            *scales,
             cutlass.Int32(0),  # n_tok      ) runtime values: the literals pin
             cutlass.Int32(1),  # s_q        ) their TYPE at trace time only
             cutlass.Int64(0),  # n_slots    )
@@ -1006,6 +1095,7 @@ def compile_qsa_prepare(
         index=ix,
         threads_per_cta=int(threads_per_cta),
         index_cache_dtype=cache_dtype,
+        kv_cache_dtype=torch.float8_e4m3fn if kv_e4m3 else None,
     )
 
 
@@ -1058,6 +1148,8 @@ def run_qsa_prepare(
     block_table: Optional[torch.Tensor] = None,
     index_state_block_table: Optional[torch.Tensor] = None,
     index_state_slot_mapping: Optional[torch.Tensor] = None,
+    k_scale: Optional[torch.Tensor] = None,
+    v_scale: Optional[torch.Tensor] = None,
 ) -> None:
     """The lowered launch: contract checks and address arithmetic only -- no conversion, no allocation, no device read.
 
@@ -1082,7 +1174,9 @@ def run_qsa_prepare(
     positions (``pos0`` / ``kv_lens`` are device data: no host bound without a sync) are checked IN-KERNEL against the table: a row at
     ``pos0 + j >= S_pos`` is reported ``-2`` in ``compressed_slot`` and none of its rotated outputs (its Q / K rows, its K pool row, its
     indexer queries), its ring row or its block is written -- check ``compressed_slot`` for ``-2`` before consuming a step's outputs
-    (the existing capacity report; no silently clamped rotation).
+    (the existing capacity report; no silently clamped rotation).  ``k_scale`` / ``v_scale`` (appended): the e4m3 pools' per-tensor
+    DEscales (1-element fp32 CUDA tensors, read on device) -- REQUIRED on a recipe that traced the e4m3 pool arm (``kv_cache_dtype=
+    torch.float8_e4m3fn``: the pools are then e4m3) and REFUSED on one that did not (both directions typed).
     """
     t = int(q.shape[0])
     if t < 1:
@@ -1118,8 +1212,21 @@ def run_qsa_prepare(
                         f"{nm} must be a contiguous [T={t}, {r.rope_dim}] per-token table, got shape {tuple(tb.shape)} strides {tuple(tb.stride())}"
                     )
                 _check_row_tensor(nm, tb, dtype=r.dtype, last_dim=r.rope_dim)
-    check_pool(k_cache, "k_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=r.dtype)
-    check_pool(v_cache, "v_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=r.dtype)
+    check_pool(k_cache, "k_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=r.pool_dtype)
+    check_pool(v_cache, "v_cache", h=r.h_kv, page_size=r.page_size, d=r.d, dtype=r.pool_dtype)
+    if r.kv_e4m3:
+        for nm, x in (("k_scale", k_scale), ("v_scale", v_scale)):
+            if x is None:
+                raise ValueError(
+                    f"this artifact traced the e4m3 K / V pool arm (kv_cache_dtype=torch.float8_e4m3fn): {nm} must be bound at execute (the pool's per-tensor "
+                    "DEscale, a 1-element fp32 CUDA tensor read on device; no silent fallback)"
+                )
+            check_scalar_slot(nm, x)
+    elif k_scale is not None or v_scale is not None:
+        raise ValueError(
+            "k_scale / v_scale: this artifact traced bf16 / f16 K / V pools (kv_cache_dtype=None) and would silently ignore them -- compile the e4m3 "
+            "recipe (kv_cache_dtype=torch.float8_e4m3fn), or pass None"
+        )
     check_slot_mapping(slot_mapping, "slot_mapping", t=t)
     if slot_mapping.dtype != r.slot_dtype:
         raise ValueError(f"slot_mapping is {slot_mapping.dtype} but this artifact was compiled for {r.slot_dtype}; the slot dtype is fixed per artifact")
@@ -1318,6 +1425,8 @@ def run_qsa_prepare(
         block_table,
         index_state_block_table,
         index_state_slot_mapping,
+        k_scale,
+        v_scale,
         cutlass.Int32(t),
         cutlass.Int32(s_q),
         cutlass.Int64(n_slots),
@@ -1344,15 +1453,19 @@ def moved_bytes(
     index: Optional[QsaPrepareIndexArms] = None,
     pool: int = DEFAULT_POOL,
     index_cache_bytes: Optional[int] = None,
+    pool_elem_bytes: Optional[int] = None,
 ) -> int:
     """HBM traffic of one launch -- the denominator for an SOL number.  Q read + written; K read + written twice (the slab
     and the pool); V read + written (the pool); the slot per token; with the band: the raw key read once per job (pool,
     ring, its own block -- ``pool`` rows per completing row, counted as one row per token on average) and written to the
     pool and the ring, the indexer queries read + written.  The tables and the norm weights are L2-resident and excluded,
     as in the sibling kernels' counts.  ``index_cache_bytes`` (appended; ``None`` = ``elem_bytes``) is the element size of the
-    indexer queries' output and the compressed-key cache (1 under the e4m3 store arm): the rows the launch WRITES there."""
+    indexer queries' output and the compressed-key cache (1 under the e4m3 store arm): the rows the launch WRITES there;
+    ``pool_elem_bytes`` (appended): the K / V pools' element size (1 under the e4m3 pool arm; the activation's otherwise) -- the two
+    pool writes are counted at it."""
     cache_bytes = elem_bytes if index_cache_bytes is None else int(index_cache_bytes)
-    total = (2 * t * h_q + 3 * t * h_kv + 2 * t * h_kv) * d * elem_bytes + t * slot_bytes
+    pe = elem_bytes if pool_elem_bytes is None else int(pool_elem_bytes)
+    total = (2 * t * h_q + 2 * t * h_kv + t * h_kv) * d * elem_bytes + 2 * t * h_kv * d * pe + t * slot_bytes
     if index is not None and index.any:
         d_i = index.head_dim
         if index.raw_pool:

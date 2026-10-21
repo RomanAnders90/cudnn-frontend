@@ -2104,10 +2104,30 @@ def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
 # ---------------------------------------------------------------------------- the in-block indexer's DECODE step over the pools (2026-10-21)
 
 
-def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16):
+def _e4m3_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The block's quantizing write as torch computes it: ``sat_e4m3(fp32(row) x fp32(1 / scale))`` (one fp32 product, one RN rounding)."""
+    return (x.float() * torch.reciprocal(scale.float())).clamp(-448.0, 448.0).to(E4M3)
+
+
+def _e4m3_dequant(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return (codes.float() * scale.float()).to(BF16)
+
+
+def _dequantized_ref(ref, k_scale, v_scale):
+    """The dense reference with K / V replaced by the dequantized e4m3 codes (what the sparse core's in-kernel arm attends over)."""
+    import types
+
+    return types.SimpleNamespace(
+        q=ref.q, gate=ref.gate, k=_e4m3_dequant(_e4m3_quant(ref.k, k_scale), k_scale), v=_e4m3_dequant(_e4m3_quant(ref.v, v_scale), v_scale)
+    )
+
+
+def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16, kv_cache_dtype=None):
     """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools; the geometry's ``index_cache_dtype`` names the
     cache's dtype -- ``icache`` is in it) at ``[1, s_q]`` on EMPTY step inputs -- the prefill's weights, the K / V pools + the three side
-    caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace."""
+    caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace.  ``kv_cache_dtype`` (appended):
+    ``torch.float8_e4m3fn`` declares e4m3 K / V pools (the sparse core's in-kernel dequant arm; the prepare's or the write-through's
+    quantizing write)."""
     mk = lambda *shape, dt=dtype: torch.empty(*shape, dtype=dt, device="cuda")  # noqa: E731
     blk = GatedAttentionBlockFwd(
         mk(1, s_q, geom.d_model),
@@ -2130,17 +2150,25 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
         return_lse=True,
         fuse_gate=True,
         fuse_prepare=fuse_prepare,
+        kv_cache_dtype=kv_cache_dtype,
     )
-    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.index_cache_dtype == icache.dtype and blk.check_support()
+    assert (
+        blk.indexer_decode
+        and blk.fuse_prepare is fuse_prepare
+        and blk.index_cache_dtype == icache.dtype
+        and blk.kv_cache_e4m3 is (kv_cache_dtype == E4M3)
+        and blk.check_support()
+    )
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
     return blk, ws
 
 
 @requires_rubin
+@pytest.mark.parametrize("pool", ["bf16", "e4m3"])
 @pytest.mark.parametrize("cache_dtype", [None, E4M3], ids=["bf16", "e4m3"])
 @pytest.mark.parametrize("fuse_prepare", [False, True], ids=["unfused", "fused"])
-def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, cache_dtype):
+def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, cache_dtype, pool):
     """The multi-step decode on ONE token stream: a 301-token prompt through the PREFILL form of the in-block indexer (``index_k_compressed``
     out, the K / V written through into the pools), its 75 compressed rows scattered into the paged compressed-key cache and the ring
     primed from the prompt's raw band (the slab's), then EIGHT decode steps over the pools with the ring / cache / pools CARRIED between
@@ -2158,7 +2186,10 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     (its e4m3 ``index_k_compressed`` rows = the per-tensor cast of the bf16 rows), those rows prime the paged e4m3 cache, the decode steps
     STORE e4m3 directly (the compress kernels' e4m3 store arm: the e4m3 cast of the bf16 row) -- and after EVERY step the cache's rows are
     BITWISE a from-scratch e4m3 compress of the accepted stream (``compile_qsa_compress(out_dtype=e4m3)``), possible only because the prefill
-    form, the step form and the fused prepare share ONE rounding convention; the ring stays bf16."""
+    form, the step form and the fused prepare share ONE rounding convention; the ring stays bf16.
+    ``pool="e4m3"`` (2026-10-21): the same chain over e4m3 K / V pools -- the prompt's rows quantized by torch under per-tensor scales
+    calibrated on them, every step's rows written quantized by the block (the prepare's e4m3 pool arm or the quantizing write-through) and
+    BITWISE the torch cast of the slab's K / V, the attention within budget of the oracle fed the kernel's list over the DEQUANTIZED pool."""
     import test_block_qsa_decode as _qsa
     from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
 
@@ -2255,7 +2286,32 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     assert torch.equal(
         bits_c(compress(k_raw_all[None, : nb0 * BS])[0]), bits_c(kbar0)
     ), "the prefill's compressed rows are not the from-scratch compress of its raw band (one rounding convention: the prefill form's cast == the kernel's e4m3 store)"
-    common = dict(ps=ps, k_cache=k_cache, v_cache=v_cache, table=table, icache=icache, ring=ring, ring_table=ring_table, fuse_prepare=fuse_prepare)
+    # the e4m3 pools (pool="e4m3"): the prompt's K / V rows the prefill wrote, quantized by torch under per-tensor scales calibrated on them (the
+    # serving stack's static calibration), into NaN-filled e4m3 pools; the decode steps write their own rows quantized and read every row
+    # through the sparse core's in-kernel dequant arm
+    e4m3 = pool == "e4m3"
+    scales = {}
+    if e4m3:
+        kf, vf = k_cache.float(), v_cache.float()
+        k_scale = (kf[~torch.isnan(kf)].abs().amax() / 448.0).reshape(1).contiguous()
+        v_scale = (vf[~torch.isnan(vf)].abs().amax() / 448.0).reshape(1).contiguous()
+        k8 = torch.full((n_pages, h_kv, ps, D_), float("nan"), device="cuda", dtype=torch.float32).to(E4M3)
+        v8 = torch.full((n_pages, h_kv, ps, D_), float("nan"), device="cuda", dtype=torch.float32).to(E4M3)
+        k8.copy_(_e4m3_quant(k_cache, k_scale))
+        v8.copy_(_e4m3_quant(v_cache, v_scale))
+        k_cache, v_cache = k8, v8
+        scales = dict(k_scale=k_scale, v_scale=v_scale)
+    common = dict(
+        ps=ps,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        table=table,
+        icache=icache,
+        ring=ring,
+        ring_table=ring_table,
+        fuse_prepare=fuse_prepare,
+        kv_cache_dtype=E4M3 if e4m3 else None,
+    )
     blk1, ws1 = _decode_indexer_block(geom, inp, 1, **common)
     blk4, ws4 = _decode_indexer_block(geom, inp, 4, **common)
     assert blk1._indexer_decode.n_blocks_max == blk4._indexer_decode.n_blocks_max == max_pages * rpp
@@ -2301,9 +2357,10 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
             index_state_block_table=ring_table,
             cos_pos=cos_all,
             sin_pos=sin_all,
+            **scales,
         )
         torch.cuda.synchronize()
-        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare}"
+        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare} pool={pool}"
         # the counts rule (a completing row sees its own block), the list form
         counts = blk._indexer_decode.views(ws, blk._ws)["counts"].view(s_q)
         want = ((pos + 1) // BS).clamp(max=blk._indexer_decode.n_blocks_max).to(torch.int32)
@@ -2331,14 +2388,17 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         for j in range(s_q):
             assert torch.equal(_bits(ring[1, (pos0 + j) % cap, 0]), _bits(raw[j])), f"{label}: ring row of position {pos0 + j}"
         kb_, vb_ = _cols(proj, geom.qkvg_offsets[2], h_kv, D_), _cols(proj, geom.qkvg_offsets[3], h_kv, D_)
+        want_k, want_v = (_e4m3_quant(kb_, k_scale), _e4m3_quant(vb_, v_scale)) if e4m3 else (kb_, vb_)  # e4m3: the torch cast of the slab's rows
+        pbits = _bits8 if e4m3 else _bits
         for j in range(s_q):
             pg, off = slot_of(pos0 + j) // ps, slot_of(pos0 + j) % ps
-            assert torch.equal(_bits(k_cache[pg, :, off]), _bits(kb_[j])) and torch.equal(
-                _bits(v_cache[pg, :, off]), _bits(vb_[j])
+            assert torch.equal(pbits(k_cache[pg, :, off]), pbits(want_k[j])) and torch.equal(
+                pbits(v_cache[pg, :, off]), pbits(want_v[j])
             ), f"{label}: pool row {pos0 + j}"
-        # the two-stage oracle's second stage: every row's attention over the kernel's own list, then the gate and the out projection
+        # the two-stage oracle's second stage: every row's attention over the kernel's own list (over the DEQUANTIZED pool under e4m3), then
+        # the gate and the out projection
         allowed = qsa_visible_mask(ids, None, pos, Lf, Lf, BS, top_k=top_k, pos0=None)
-        og, ref_lse = _qsa._attend(ref, allowed, pos, geom.scale, BF16, h_q, G)
+        og, ref_lse = _qsa._attend(_dequantized_ref(ref, k_scale, v_scale) if e4m3 else ref, allowed, pos, geom.scale, BF16, h_q, G)
         o = _view(ws, lay.o, (s_q, h_q, D_), BF16)
         ref_out = (og.reshape(s_q, h_q * D_).float() @ inp["w_o"].float().t()).to(BF16)
         assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all(), f"{label}: non-finite"

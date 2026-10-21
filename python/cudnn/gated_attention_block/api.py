@@ -541,8 +541,9 @@ _KV_SOURCES = (KV_SOURCE_SELF, KV_SOURCE_PAGED)
 # cache holds e4m3 CODES under ONE fp32 per-tensor DEscale per operand (``execute(k_scale=, v_scale=)``: value = code x scale) and a
 # bf16 Q attends over the dequantized rows.  NUMERICS-CHANGING (the cached K / V are rounded to e4m3), so an attribute, never a
 # knob: it changes the write-through (the rows are quantized on the way in, ``code = sat_e4m3(row x (1 / scale))``) and, on the
-# block-sparse decode mode, stage (4) (the listed rows are gathered and cast back to bf16 by ``kernels/qsa_kv_upcast.py`` and the
-# bf16 d256 DECODE tile runs over that scratch; the sparse core is never taught fp8).  bf16 Q over an e4m3 pool ONLY: an fp8 Q is
+# block-sparse decode mode, stage (4) (the sparse core reads the e4m3 pools through its IN-KERNEL dequant arm: the rows expanded to
+# bf16 operand tiles in SMEM, ``k_scale`` folded into the softmax scale and ``v_scale`` into the normaliser -- no gathered cast, no
+# scratch; every list form, S_q, split, LSE and gate placement of the bf16 mode, the in-block indexer included).  bf16 Q over an e4m3 pool ONLY: an fp8 Q is
 # a different function (the per-tensor FP8 SDPA rows take e4m3 Q / K / V together) and is not a form of this block.
 KV_CACHE_E4M3 = torch.float8_e4m3fn
 INDEX_CACHE_E4M3 = torch.float8_e4m3fn  # the fp8 INDEXER cache's element type (QsaSpec.index_cache_dtype): plain e4m3, no scales
@@ -1029,8 +1030,9 @@ class DecodeEnvelope:
     _geometry: Optional["GatedAttentionBlockGeometry"] = None
     sparse_core: bool = False  # appended: stage (4) is the index-list sparse core over the pools (a QsaSpec geometry)
     # appended (2026-10-14): the POOL dtypes this form serves at this geometry / activation dtype -- the activation dtype always; plus
-    # torch.float8_e4m3fn (``kv_cache_dtype``: the gathered cast + the decode tile, S_q <= 4, no LSE) on a QsaSpec geometry with bf16
-    # activations.  An e4m3 pool on a DENSE geometry is a typed decline (the decode tile reads bf16 / f16 pools).
+    # torch.float8_e4m3fn (``kv_cache_dtype``: the sparse core's in-kernel dequant arm -- every list form, S_q, split, LSE and gate
+    # placement of the bf16 mode, the in-block indexer included) on a QsaSpec geometry with bf16 activations.  An e4m3 pool on a DENSE
+    # geometry is a typed decline (the decode tile reads bf16 / f16 pools).
     kv_cache_dtypes: Tuple[torch.dtype, ...] = ()
     # appended (2026-10-15): the route policy ``routes`` / ``route()`` were read under (``serving_envelope(decode_route_policy=)``) and
     # the CLAIMED bound (``DECODE_CLAIMED_MAX_S_Q``; ``max_s_q`` is the DECLARED one).
@@ -5357,6 +5359,14 @@ def _sparse_record_torch_dtypes(rec) -> Tuple[torch.dtype, ...]:
     return tuple(to_torch_dtype(dt) for dt in sorted(rec.dtypes, key=str))
 
 
+def _sparse_record_kv_cache_torch_dtypes(rec) -> Tuple[torch.dtype, ...]:
+    """The record's ``kv_cache_dtypes`` (the K / V STORAGE dtypes the core serves: the activation dtypes and, since 2026-10-21, e4m3 for the
+    paged pools) as torch dtypes, in a stable order."""
+    from cudnn.sdpa.graph_analyzer import to_torch_dtype
+
+    return tuple(to_torch_dtype(dt) for dt in sorted(rec.kv_cache_dtypes, key=str))
+
+
 def _check_qsa_geometry_against_record(geom: GatedAttentionBlockGeometry, dtype: torch.dtype) -> None:
     """A ``QsaSpec`` geometry's claims on the sparse core against the adapter's record -- the head dim (``d_shapes``), the
     block size, the ``top_k`` range, the GQA group the core packs on its N tile, the activation dtype -- as typed
@@ -5449,8 +5459,11 @@ class _SparseSdpa(_Stage):
     split (the adapter's own routing), so ``fuse_gate`` is honoured either way.  ``execute(block_table=, kv_lens=, k_cache=,
     v_cache=)`` are REQUIRED on the paged declaration and REFUSED on the prefill form; ``seq_lens`` is REFUSED over the pools
     (the KV length is ``kv_lens``, bound to the KV side only: every row of the step is live unless its position is
-    negative).  Never together with ``thd`` (the core serves packed sequences and paged pools one at a time -- the block's
-    serving table declines the packed form by name).
+    negative).  ``kv_cache_dtype=torch.float8_e4m3fn`` (appended 2026-10-21; the paged read only) declares e4m3 POOLS: the
+    adapter's in-kernel dequant arm reads the codes under the per-tensor fp32 DEscales bound at ``execute(k_scale=, v_scale=)``
+    (``k_scale`` folded into the softmax scale, ``v_scale`` into the normaliser; at a power-of-two scale bitwise the bf16 core over
+    pools holding ``bf16(code x scale)``), every list form / split / LSE / gate placement unchanged.  Never together with ``thd``
+    (the core serves packed sequences and paged pools one at a time -- the block's serving table declines the packed form by name).
 
     Not here (typed declines at the block's declaration, each naming its feature): ``causal_bottom_right`` on the block's
     OWN K / V (the diagonal is the paged mode's); the quantized pipelines and training; THD together with the in-block
@@ -5495,6 +5508,10 @@ class _SparseSdpa(_Stage):
         # and the split combine's pair (SparseGqaFwdDslSm107(use_pdl=True)); the block's resolved switch; THD x use_pdl is the adapter's typed
         # decline (the block declines it at declaration first, carrying the adapter's one statement of the fact, `pdl_decline_reason`).
         use_pdl: bool = False,
+        # APPENDED (2026-10-21; kv_source="paged" only): the POOLS' dtype -- None = the activation dtype (the pools as before);
+        # torch.float8_e4m3fn = e4m3 codes under the per-tensor fp32 DEscales bound at execute(k_scale=, v_scale=), read by the sparse
+        # core's in-kernel dequant arm (the adapter's `kv_cache_dtype`; a declaration attribute, never a knob).
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
@@ -5546,6 +5563,8 @@ class _SparseSdpa(_Stage):
         self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
         self.list_per_sequence = bool(list_per_sequence)
         self.split_kv = int(split_kv)
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_e4m3 = kv_cache_dtype is not None and kv_cache_dtype == KV_CACHE_E4M3
         if self.paged:
             rec = self._record()
             if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
@@ -5576,6 +5595,23 @@ class _SparseSdpa(_Stage):
                 )
             if self.split_kv > 1 and not rec.split_kv:
                 raise NotImplementedError(f"{self.name}: split_kv={self.split_kv} -- the sparse adapter's record declines the KV split")
+            if kv_cache_dtype is not None and not self.kv_e4m3 and kv_cache_dtype != self.dtype:
+                raise ValueError(f"{self.name}: kv_cache_dtype must be None, the activation dtype ({self.dtype}) or torch.float8_e4m3fn, got {kv_cache_dtype}")
+            if self.kv_e4m3:
+                # the e4m3 pools: the RECORD's claim (a record that drops the arm declines here by name) and the bf16 Q the arm expands to
+                if KV_CACHE_E4M3 not in _sparse_record_kv_cache_torch_dtypes(rec):
+                    raise NotImplementedError(
+                        f"{self.name}: kv_cache_dtype=torch.float8_e4m3fn -- the sparse adapter's record declines e4m3 pools (the kernel body does not carry the arm)"
+                    )
+                if self.dtype != torch.bfloat16:
+                    raise NotImplementedError(
+                        f"{self.name}: kv_cache_dtype=torch.float8_e4m3fn needs bf16 activations (the arm expands the pools to one bf16 operand tile under a "
+                        f"bf16 Q), got {self.dtype}"
+                    )
+        elif kv_cache_dtype is not None:
+            raise ValueError(
+                f"{self.name}: kv_cache_dtype belongs to kv_source='paged' (the pools' dtype); over the block's own K / V the operands are the activation dtype"
+            )
         elif (
             self.paged_page_size
             or k_cache_desc is not None
@@ -5614,8 +5650,10 @@ class _SparseSdpa(_Stage):
         if self.paged:
             # The pools AS SAMPLED (the serving stack's layout and strides, compiled into the gather maps; the bound tensors must match
             # them exactly) and the WHOLE block table at the sample's row stride (contiguous: the core bulk-reads it).
+            pool_dtype = KV_CACHE_E4M3 if self.kv_e4m3 else self.dtype  # e4m3 pools: the codes' dtype (the sampled strides are in e4m3 elements)
+
             def pool(desc: TensorDesc) -> SparseOperandDesc:
-                return SparseOperandDesc(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), self.dtype, self.device)
+                return SparseOperandDesc(tuple(int(x) for x in desc.shape), tuple(int(x) for x in desc.stride), pool_dtype, self.device)
 
             k_desc, v_desc = pool(self.k_cache_desc), pool(self.v_cache_desc)
             bt = self.block_table_desc
@@ -5637,6 +5675,9 @@ class _SparseSdpa(_Stage):
             seq_kv_lens=lens if self.thd else (SparseOperandDesc((b,), (1,), torch.int32, self.device) if self.seq_lens_present else None),
             seq_q_lens=lens,
             block_table=table,
+            # the e4m3 pools' per-tensor DEscales: 1-element fp32 operands bound at execute (None drops them from the plan)
+            k_scale=SparseOperandDesc((1,), (1,), torch.float32, self.device) if self.kv_e4m3 else None,
+            v_scale=SparseOperandDesc((1,), (1,), torch.float32, self.device) if self.kv_e4m3 else None,
         )
 
     def check_support(self) -> None:
@@ -5681,6 +5722,10 @@ class _SparseSdpa(_Stage):
             split_kv=self.split_kv,
             # the programmatic-dependent-launch form of the core and its combine (the block's resolved switch; the adapter declines THD x PDL)
             use_pdl=self.use_pdl,
+            # The e4m3 pools (kv_cache_dtype): the adapter's in-kernel dequant arm and its two scale operands (None on bf16 / f16 pools).
+            kv_cache_dtype=self.kv_cache_dtype if self.kv_e4m3 else None,
+            k_scale=ops["k_scale"],
+            v_scale=ops["v_scale"],
         )
         self._impl.check_support()
 
@@ -5745,6 +5790,10 @@ class _SparseSdpa(_Stage):
         kv_lens: Optional[torch.Tensor] = None,
         k_cache: Optional[torch.Tensor] = None,
         v_cache: Optional[torch.Tensor] = None,
+        # APPENDED (kv_source="paged" with kv_cache_dtype=torch.float8_e4m3fn, both REQUIRED there, REFUSED otherwise): the e4m3 pools'
+        # per-tensor fp32 DEscales (1-element CUDA tensors, read on device by the sparse core's in-kernel dequant arm).
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """Hand the block's BSHD views over AS THEY ARE (no transpose, no copy) plus the index tensors viewed flat.  The
         dense stage's gate / quantization operands have no sparse arm and are refused rather than ignored; the LSE and the
@@ -5796,11 +5845,19 @@ class _SparseSdpa(_Stage):
                 block_table=block_table,
                 gate=gate,
                 workspace=workspace if self.split_kv > 1 else None,
+                # the e4m3 pools' DEscales (the adapter holds them to the declaration both ways: required under the attribute, refused without)
+                k_scale=None if k_scale is None else k_scale.reshape(1),
+                v_scale=None if v_scale is None else v_scale.reshape(1),
             )
             return
         if any(x is not None for x in paged_args):
             raise ValueError(
                 f"{self.name}: block_table / kv_lens / k_cache / v_cache are consumed under kv_source='paged' only; this stage was declared kv_source='self'"
+            )
+        if k_scale is not None or v_scale is not None:
+            raise ValueError(
+                f"{self.name}: k_scale / v_scale are the e4m3 pools' per-tensor DEscales (kv_source='paged' with kv_cache_dtype=torch.float8_e4m3fn); this "
+                "stage reads the block's own K / V in the activation dtype -- refused rather than silently ignored"
             )
         if self.thd:
             if seq_lens is None:
@@ -6263,6 +6320,9 @@ class _QsaPrepare(_Stage):
         use_pdl: bool = False,
         index_arms=None,  # appended: the QsaPrepareIndexArms record the block builds (None = the band's raw-key pool arm alone, as before)
         index_cache_dtype=None,  # appended: the indexer cache dtype of the decode arms (None = the activation dtype; e4m3 = the e4m3 store arm)
+        # appended (2026-10-21): the K / V pools' dtype -- None = the activation dtype (the pools as before); torch.float8_e4m3fn = the launch's
+        # quantizing pool arm (sat_e4m3(row x (1 / scale)) with the per-tensor DEscales bound at execute, bitwise _QuantizedCacheWrite)
+        kv_cache_dtype: Optional[torch.dtype] = None,
     ) -> None:
         self.geom = geometry
         self.batch = int(batch)
@@ -6277,6 +6337,8 @@ class _QsaPrepare(_Stage):
         self.use_pdl = bool(use_pdl)
         self.index_band = bool(geometry.index_band)
         self._arms = index_arms
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_e4m3 = kv_cache_dtype is not None and kv_cache_dtype == KV_CACHE_E4M3
         self._recipes = None  # {slot dtype: recipe}
 
     def _index_arms(self):
@@ -6306,6 +6368,14 @@ class _QsaPrepare(_Stage):
         g = self.geom
         if self.dtype not in (torch.bfloat16, torch.float16):
             raise NotImplementedError(f"{self.name}: bf16 / f16 only (the activation dtype of the slab and the pools), got {self.dtype}")
+        if self.kv_cache_dtype is not None:
+            # the pools' dtype against the kernel's contract (the e4m3 pool arm: the block's bf16-activation rule ran at declaration) and, under
+            # the arm, the fp8 cvt's device floor -- typed here, before the trace (Rule 7)
+            from .kernels.qsa_prepare import check_kv_cache_dtype
+            from .kernels.quantize import require_fp8_cvt
+
+            if check_kv_cache_dtype(self.kv_cache_dtype, self.dtype):
+                require_fp8_cvt(f"{self.name} (the e4m3 K / V pool arm)")
         if g.rope_dim == 0:
             # Every rope_dim == 0 geometry, with or without qk_norm: the kernel binds cos / sin as [T, rope_dim] operands and its artifact
             # is traced with one-column tables (`table_dim = rope_dim if rope_dim else 1`), so the [T, 0] tables execute would hand it are
@@ -6342,6 +6412,7 @@ class _QsaPrepare(_Stage):
                 threads_per_cta=_ELEMENTWISE_THREADS,
                 use_pdl=self.use_pdl,
                 index_cache_dtype=self.index_cache_dtype,
+                kv_cache_dtype=self.kv_cache_dtype if self.kv_e4m3 else None,  # the e4m3 pool arm (a compile key; the scales are execute inputs)
             )
             for slot_dtype in (torch.int32, torch.int64)
         }
@@ -6360,6 +6431,7 @@ class _QsaPrepare(_Stage):
             slot_bytes=_itemsize(slot_dtype),
             index=self._index_arms(),
             index_cache_bytes=_itemsize(self.index_cache_dtype),
+            pool_elem_bytes=1 if self.kv_e4m3 else None,  # the e4m3 pools' rows are 1-B elements
         )
 
     def execute(
@@ -6391,6 +6463,10 @@ class _QsaPrepare(_Stage):
         block_table: Optional[torch.Tensor] = None,  # [B, max_pages] int32: the MAIN block table (the compressed-key cache's pages)
         index_state_block_table: Optional[torch.Tensor] = None,  # [B, 1] int32: the ring block per sequence
         index_state_slot_mapping: Optional[torch.Tensor] = None,  # [T] of slot_mapping's dtype iff the ring-slots arm was declared
+        # APPENDED (the e4m3 KV cache; REQUIRED on a stage built with kv_cache_dtype=torch.float8_e4m3fn, REFUSED otherwise -- the kernel's
+        # runner holds both directions): the pools' per-tensor fp32 DEscales, 1-element CUDA tensors read on device (1 / scale in IEEE RN).
+        k_scale: Optional[torch.Tensor] = None,
+        v_scale: Optional[torch.Tensor] = None,
     ) -> None:
         """``cos`` / ``sin`` are ``None`` under the RoPE-table arm (``rope_table`` in the arms record: every rotation reads ``cos_pos`` /
         ``sin_pos`` at the row's device-derived position); the kernel's runner holds every arm to its artifact in both directions."""
@@ -6452,6 +6528,8 @@ class _QsaPrepare(_Stage):
             index_k_raw_src=index_src,
             index_k_raw_pool=index_cache,
             stream=stream,
+            k_scale=k_scale,
+            v_scale=v_scale,
             **(
                 dict(
                     decode_kw,
@@ -6501,9 +6579,10 @@ def _check_qsa_indexer_geometry(
     dtype the scorer packs, its head dim, the packed form; then, on the PREFILL form, the prefill scorer's head groups (read off the
     DSA tree behind the DSL floor), and on the PAGED form (``paged``, appended: the decode step over the pools) the decode scorer's
     own rows instead -- its query-row envelope at ``s_q`` (``S_q x next_pow2(index_heads) <= 64``), the page's power-of-two row count
-    (``page_size``), the e4m3 pool (``kv_cache_dtype``) and the shared list form -- all DSL-free (the e4m3 indexer CACHE is served there
-    since 2026-10-21: the compress arms' e4m3 store, the paged scorer's e4m3 read arm); (the
-    scorer's host facts live in ``cudnn.QSA.selection_paged``, never the kernel module).  Called at declaration
+    (``page_size``) and the shared list form -- all DSL-free (the scorer's host facts live in ``cudnn.QSA.selection_paged``, never the
+    kernel module).  The e4m3 indexer CACHE is served there since 2026-10-21 (the compress arms' e4m3 store, the paged scorer's e4m3 read arm)
+    and so is the e4m3 POOL (the sparse core's in-kernel dequant arm): ``kv_cache_dtype`` (appended) stays in the signature and is
+    UNREAD.  Called at declaration
     (``GatedAttentionBlockFwd._check_qsa_declaration``) and again by the stage's ``check_support`` so the stage stays honest on its own."""
     from cudnn.frost.buffers import cutedsl_requirement_error
 
@@ -6530,8 +6609,6 @@ def _check_qsa_indexer_geometry(
                 validate_params(h_i=q.index_heads, s_q=1, page_size=int(page_size), units_per_warp=1)
             except ValueError as exc:
                 raise NotImplementedError(texts["indexer_page_size"]) from exc
-        if kv_cache_dtype == KV_CACHE_E4M3:
-            raise NotImplementedError(texts["indexer_e4m3_pool"])
         if q.index_list_form == QSA_INDEX_LIST_FORM_SHARED:
             raise NotImplementedError(texts["indexer_shared_list"])
         return
@@ -7788,8 +7865,8 @@ _SPARSE_DECODE_REQUIRES = (
     "kv_source='paged'",
     "geometry.is_causal=True, geometry.causal_bottom_right=True, window_left=-1, window_right in (-1, 0), qsa=QsaSpec(index_source='caller' | 'indexer'), d_head=256",
     "sample_k_cache / sample_v_cache (the pools' [num_pages, H_kv, P, D] shape / dtype / strides) and sample_block_table ([B, max_pages] int32, CONTIGUOUS: the sparse core binds the whole table)",
-    "index_source='indexer' (the in-block indexer's DECODE step over the pools; bf16, index_band=True, S_q x next_pow2(index_heads) <= 64, a power-of-two page, bf16 main pools "
-    "and raw-key ring; the compressed-key cache bf16 or e4m3 per QsaSpec.index_cache_dtype): the three side-cache samples at declaration -- sample_index_kv_cache [num_pages, P / 4, 1, 128] (the paged compressed-key cache on the MAIN block "
+    "index_source='indexer' (the in-block indexer's DECODE step over the pools; bf16, index_band=True, S_q x next_pow2(index_heads) <= 64, a power-of-two page, bf16 or "
+    "e4m3 main pools (kv_cache_dtype) and a bf16 raw-key ring; the compressed-key cache bf16 or e4m3 per QsaSpec.index_cache_dtype): the three side-cache samples at declaration -- sample_index_kv_cache [num_pages, P / 4, 1, 128] (the paged compressed-key cache on the MAIN block "
     "table), sample_index_state_cache [num_ring_blocks, cap >= S_q + 3, 1, 128] (the raw-key ring), sample_index_state_block_table [B, 1] int32 -- and at execute "
     "index_kv_cache, index_state_cache, index_state_block_table, cos_pos / sin_pos [1 or B, >= max_pages x P, rope_dim] (the position-indexed tables), w_iq_norm / w_ik_norm; "
     "index_state_slot_mapping [T] iff index_state_slot_mapping_present, cos / sin None iff rope_position_tables_only; the list comes back through block_ids_out / block_lens_out "
@@ -7803,9 +7880,10 @@ _SPARSE_DECODE_REQUIRES = (
     "decode_split_kv=None (the fill rule: ceil(SMs / (B x H_kv x S_q)) chunks, at most min(16, ceil((top_k + 1) / 32)); where that fill leaves a second wave of SMs, "
     "the wave rule's split: the fewest waves x (tiles per chunk + 1) under the same cap) or an int in [1, ceil((top_k + 1) / 32)]: performance only",
     "execute(block_table=, kv_lens=, k_cache=, v_cache=, slot_mapping=, block_ids=[, block_lens=]) with seq_lens=None (kv_lens binds the KV side only; a row at a negative position is dead)",
-    "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations, S_q <= 4, return_lse=False, decode_split_kv None / 1, fuse_norm_rope=False, "
-    "inplace_qkv None / False: the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- the write-through quantizes, the step reads through the "
-    "gathered cast + the d256 decode tile)",
+    "kv_cache_dtype=None (bf16 / f16 pools) or torch.float8_e4m3fn (bf16 activations): the pools' e4m3 codes under per-tensor fp32 k_scale / v_scale at execute -- "
+    "the prepare / the write-through quantizes (sat_e4m3(row x (1 / scale))), the sparse core dequantizes IN-KERNEL (k_scale folded into the softmax scale, v_scale "
+    "into the normaliser; bitwise the bf16 pools of the dequantized values at a power-of-two scale); every list form, S_q, split, LSE and gate placement of the "
+    "bf16 mode, the in-block indexer included",
 )
 
 
@@ -7816,9 +7894,10 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
     for byte).  Each row carries ONE shared token the tests pin: ``shared_list_rows`` ``tail covers at most two blocks``;
     ``indexer_f16`` ``needs bf16 activations``; ``indexer_head_dim`` ``packs 128-wide heads``; ``indexer_thd`` ``scores dense [B, S]
     prompts``; ``indexer_query_rows`` ``query rows per sequence (at most 64``; ``indexer_page_size`` ``a power-of-two count of compressed
-    rows``; ``indexer_e4m3_pool`` ``in-kernel dequant arm``; ``indexer_shared_list`` ``selects per row``; ``fuse_prepare_rope_tables_unfused``
-    ``the unfused query norm reads the per-token``.  (The ``indexer_e4m3_cache`` row retired 2026-10-21: the e4m3 compressed-key cache is
-    SERVED at decode -- a served form has no decline row; ``decode.index_cache_dtypes`` lists it.)  The host facts come from the DSL-free
+    rows``; ``indexer_shared_list`` ``selects per row``; ``fuse_prepare_rope_tables_unfused`` ``the unfused query norm reads the
+    per-token``.  (The ``indexer_e4m3_cache`` row retired 2026-10-21: the e4m3 compressed-key cache is SERVED at decode -- a served form
+    has no decline row; ``decode.index_cache_dtypes`` lists it.  The ``indexer_e4m3_pool`` row retired 2026-10-21 too: e4m3 pools are served
+    under the indexer through the sparse core's in-kernel dequant arm; ``decode.kv_cache_dtypes`` lists them.)  The host facts come from the DSL-free
     modules (``cudnn.QSA.selection`` / ``cudnn.QSA.selection_paged``) and the sparse record, never from a kernel module."""
     from cudnn.QSA.selection import INDEXER_SCORER_HEAD_DIM
     from cudnn.QSA.selection_paged import MAX_QUERY_ROWS, MMA_M, padded_heads
@@ -7854,11 +7933,6 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
             "QsaSpec(index_source='indexer') over the pools: the decode scorer splits a block id into its page and row by a shift, so "
             "paged_kv_page_size must hold a power-of-two count of compressed rows (16 / 32 / 64 / 128 at block size 4) -- declare one of "
             "those pages, or hand the step's lists in under index_source='caller'"
-        ),
-        "indexer_e4m3_pool": (
-            "QsaSpec(index_source='indexer') with kv_cache_dtype=torch.float8_e4m3fn: the block-sparse decode mode over e4m3 pools runs the "
-            "gathered cast + the d256 decode tile over a caller list; its composition with the in-block indexer waits for the sparse core's "
-            "in-kernel dequant arm -- declare bf16 pools or index_source='caller'"
         ),
         "indexer_shared_list": (
             "QsaSpec(index_source='indexer', index_list_form='shared') over the pools: the decode indexer selects per row (one list per query "
@@ -8019,28 +8093,30 @@ class GatedAttentionBlockFwd(APIBase):
     (the prepare runs first on the same stream), the list is canonical (ids descending, ``-1`` last) and the first execute of a
     fresh declaration captures with no warm-up (no plan constant, no allocation, no host read, no torch op on the path).  Typed
     declines (the envelope's rows): f16 activations, another head dim, ``S_q x next_pow2(index_heads) > 64``, a page off the
-    powers of two, the e4m3 MAIN pool together with the indexer (``indexer_e4m3_pool``; the compressed-key cache itself may be e4m3
-    through ``QsaSpec.index_cache_dtype``, served since 2026-10-21), the shared list form, ``index_commit_present=True``,
+    powers of two (the e4m3 MAIN pool together with the indexer is served since 2026-10-21 through the sparse core's in-kernel dequant
+    arm, and the compressed-key cache itself may be e4m3 through ``QsaSpec.index_cache_dtype``), the shared list form, ``index_commit_present=True``,
     ``rope_position_tables_only`` with the unfused twin; the envelope publishes the indexer facts (``decode.index_*``,
     ``decode.fuse_prepare_default``) so a serving stack reads them instead of re-spelling them.
 
-    **The e4m3 KV cache (``kv_cache_dtype=torch.float8_e4m3fn``; bf16 inference; 2026-10-14)** -- the serving stacks'
-    ``--kv-cache-dtype fp8`` recipe: the pools hold e4m3 codes under per-tensor fp32 DEscales ``execute(k_scale=, v_scale=)``
-    (value = code x scale), a bf16 Q attends over the dequantized rows.  A declaration ATTRIBUTE beside ``paged_kv_page_size``
-    (it changes the write-through's numerics), never a knob.  The WRITE-THROUGH then quantizes the post-RoPE K / V
-    (:class:`_QuantizedCacheWrite`: two per-tensor casts ``sat_e4m3(row x (1 / scale))`` + the bit copy through the pools' bf16
-    views; the raw indexer key keeps its bf16 pool) on every DENSE form that writes through over the block's own K / V (QsaSpec or
-    dense; the packed prefill's quantizing write-through is a typed decline until its accept cell lands).  OVER THE POOLS it is served on the block-sparse DECODE mode at ``S_q <= 4`` (the shared list):
-    stage (4) is :class:`_UpcastSparseSdpa` -- ``kernels/qsa_kv_upcast.py`` gathers the listed rows and the open tail, casts them
-    to bf16 into the workspace scratch (``[B x S_q x H_kv, 2, 2176, 256]`` + ``kv_len_t``), and the Rubin d256 DECODE tile runs
-    over it as a plain padded dense SDPA (no causal mask, ``seq_kv_lens = kv_len_t``, the group packed, unsplit); the mode
-    norms + rotates OUT of place (the tile's per-item Q is a view of the compact Q alone: ``inplace_qkv=None`` reads as False,
-    ``fuse_norm_rope`` is declined) and gates in its own launch.  Typed declines: e5m2; another dtype; the attribute without
-    ``paged_kv_page_size``; ``quant`` / ``save_for_backward`` (the write-through's rows); f16 activations; over the pools the
-    EXTEND form and the dense DECODE form (the paged THD body and the decode tile read bf16 / f16 pools: a dense e4m3 pool needs
-    the in-kernel dequant arm), ``S_q > 4``, ``return_lse``, ``decode_split_kv > 1``, ``fuse_norm_rope`` / ``inplace_qkv=True``;
-    pools of the wrong dtype (at declaration and at execute, both ways); the scales missing under the attribute or given
-    without it.  The envelope says ``decode.kv_cache_dtypes``.
+    **The e4m3 KV cache (``kv_cache_dtype=torch.float8_e4m3fn``; bf16 inference; 2026-10-14, the in-kernel arm 2026-10-21)** -- the
+    serving stacks' ``--kv-cache-dtype fp8`` recipe: the pools hold e4m3 codes under per-tensor fp32 DEscales ``execute(k_scale=,
+    v_scale=)`` (value = code x scale), a bf16 Q attends over the dequantized rows.  A declaration ATTRIBUTE beside
+    ``paged_kv_page_size`` (it changes the write-through's numerics), never a knob.  The WRITE forms quantize the post-RoPE K / V,
+    ``code = sat_e4m3(fp32(row) x fp32(1 / scale))`` (one fp32 product, one RN rounding; the reciprocal IEEE RN on device):
+    :class:`_QuantizedCacheWrite` (two per-tensor casts + the bit copy through the pools' bf16 views) on every form that writes through,
+    or the fused prepare's e4m3 pool arm under ``fuse_prepare=True`` (``kernels/qsa_prepare.py``, bitwise the two-stage form); the raw
+    indexer key keeps its bf16 pool; the packed prefill's quantizing write-through is a typed decline until its accept cell lands.  The
+    READ form is the sparse core's IN-KERNEL dequant arm (``sdpa/fwd/kernels/sm107/sparse_d256_f16.py`` under ``CFG.KV_E4M3``; the
+    adapter's ``kv_cache_dtype``): the gather warps land the listed e4m3 rows and expand them to the bf16 operand tile in SMEM
+    (exact), ``k_scale`` is folded into the softmax scale and ``v_scale`` into the normaliser (at a power-of-two scale BITWISE the bf16
+    core over pools holding ``bf16(code x scale)``; the LSE is the log-sum-exp over the dequantized K; a split's partials carry
+    ``v_scale``) -- so OVER THE POOLS the attribute is served on EVERY block-sparse decode declaration: caller lists and the in-block
+    indexer, the shared and the per-row list at any ``S_q``, the split, the LSE, the gate in the epilogue or the combine,
+    ``fuse_norm_rope`` / ``inplace_qkv`` by the bf16 mode's rules, no scratch (the gathered cast of 2026-10-14 and its workspace are
+    retired).  Typed declines: e5m2; another dtype; the attribute without ``paged_kv_page_size``; ``quant`` / ``save_for_backward``
+    (the write-through's rows); f16 activations (one bf16 operand tile per plan); over the pools the EXTEND form and the dense
+    DECODE form (the paged THD body and the decode tile read bf16 / f16 pools); pools of the wrong dtype (at declaration and at
+    execute, both ways); the scales missing under the attribute or given without it.  The envelope says ``decode.kv_cache_dtypes``.
 
     **The fp8 indexer cache (``QsaSpec(index_source="indexer", index_cache_dtype=torch.float8_e4m3fn)``; 2026-10-14)** -- the
     in-block indexer's compressed keys and queries as plain e4m3 of the RMSNormed + rotated values (no scales; the caller's
@@ -8230,10 +8306,11 @@ class GatedAttentionBlockFwd(APIBase):
         # True where an explicit True is declined; `fuse_prepare_requested` keeps the declaration, `fuse_prepare` the resolved knob.
         fuse_prepare: Optional[bool] = None,
         # APPENDED (serving, the e4m3 KV cache): the POOLS' dtype.  None = the activation dtype (the pools as before).  torch.float8_e4m3fn =
-        # the serving stacks' fp8 KV cache: the write-through quantizes the post-RoPE K / V into e4m3 codes under per-tensor fp32 DEscales
-        # (execute(k_scale=, v_scale=), REQUIRED there, refused otherwise) and the block-sparse DECODE mode (S_q <= 4) reads the pools
-        # through kernels/qsa_kv_upcast.py + the bf16 d256 decode tile.  Needs paged_kv_page_size > 0 and bf16 activations.  A declaration
-        # ATTRIBUTE (numerics-changing), never a knob.  Class docstring, "The e4m3 KV cache".
+        # the serving stacks' fp8 KV cache: the write-through (or the fused prepare) quantizes the post-RoPE K / V into e4m3 codes under
+        # per-tensor fp32 DEscales (execute(k_scale=, v_scale=), REQUIRED there, refused otherwise) and the block-sparse DECODE mode reads the
+        # pools through the sparse core's in-kernel dequant arm (the scales folded in-kernel; every form of the bf16 mode, the in-block
+        # indexer included).  Needs paged_kv_page_size > 0 and bf16 activations.  A declaration ATTRIBUTE (numerics-changing), never a knob.
+        # Class docstring, "The e4m3 KV cache".
         kv_cache_dtype: Optional[torch.dtype] = None,
         # APPENDED (the DECODE form's route policy; refused on the packed form and under "self"): None = DECODE_ROUTE_SINGLE_UNIT -- the
         # decode tile in ONE token unit where its width table holds the packed rows, else the paged d256 prefill tile with the group
@@ -8648,19 +8725,16 @@ class GatedAttentionBlockFwd(APIBase):
             or (list_form is None and not self.indexer_decode and self.seq_len <= _sparse_record().index_shared_list_max_tokens)
         )
         self.qsa_list_form = (QSA_INDEX_LIST_FORM_SHARED if self.qsa_shared_list else QSA_INDEX_LIST_FORM_PER_ROW) if self.sparse_decode else None
-        # The e4m3 KV cache OVER THE POOLS: stage (4) is the gathered cast + the dense decode tile (the block-sparse decode mode at
-        # S_q <= 4 only); every other paged form over e4m3 pools, the LSE and a split are typed declines, and the mode norms +
-        # rotates OUT of place (the tile's per-item Q is a view of the compact Q only), so inplace_qkv / fuse_norm_rope are settled here.
-        self.upcast_decode = self.sparse_decode and self.kv_cache_e4m3
+        # The e4m3 KV cache OVER THE POOLS: stage (4) is the sparse core's in-kernel dequant arm on every block-sparse decode declaration
+        # (the list form, the split, the LSE, the gate placement, inplace_qkv / fuse_norm_rope all by the bf16 mode's rules above); the
+        # EXTEND form and the dense DECODE form over e4m3 pools stay typed declines (the serving check below), the split stays as resolved.
         if self.kv_cache_e4m3 and self.kv_source == KV_SOURCE_PAGED:
             self.decode_split_kv = self._check_kv_cache_dtype_serving(decode_split_kv, inplace_qkv, fuse_norm_rope)
         # Where the sigmoid gate runs: the SDPA epilogue (fuse_gate on the prefill forms), the split COMBINE of the decode tile
         # (fuse_gate on the DECODE form with split >= 2: the tile has no gate seams), or its own launch, stage (5), everywhere
         # else (an unsplit decode tile).  `fuse_gate` stays what was declared; `gate_fused` is what runs.
-        self.gate_fused = (
-            self.fuse_gate
-            and not self.upcast_decode
-            and (self.decode_route is None or self.decode_route.prefill_tile or (self.decode_route.decode_tile and self.decode_split_kv >= 2))
+        self.gate_fused = self.fuse_gate and (
+            self.decode_route is None or self.decode_route.prefill_tile or (self.decode_route.decode_tile and self.decode_split_kv >= 2)
         )
         # Where the paged KV-cache write-through runs: the fused projection's epilogue (the arm serves the bf16 / f16 fused norm + RoPE
         # pipeline without an indexer band) or the separate cache-write launch.  `fuse_cache_write` stays what was declared;
@@ -8688,11 +8762,8 @@ class GatedAttentionBlockFwd(APIBase):
         # MEASURED default (`_fuse_prepare_default`: the decode indexer's form on the parts that measured it; False everywhere else).
         self.fuse_prepare_requested: Optional[bool] = fuse_prepare
         self.fuse_prepare = self._check_fuse_prepare_declaration(fuse_prepare)
-        if self.fuse_prepare and self.kv_cache_e4m3:
-            raise NotImplementedError(
-                "fuse_prepare=True with kv_cache_dtype=torch.float8_e4m3fn: the prepare kernel writes the activation dtype's K / V rows into the pools; "
-                "the e4m3 cache's write-through quantizes in its own stage (two per-tensor casts + the bit copy) -- pass fuse_prepare=False"
-            )
+        # (fuse_prepare x kv_cache_dtype=e4m3 is served since 2026-10-21: the prepare launch's e4m3 K / V pool arm quantizes on the way in,
+        # bitwise the two-stage write-through -- _QsaPrepare is built with the pools' dtype below.)
         if self.rope_position_tables_only and not self.fuse_prepare:
             # the position-table arm is the fused launch's: the unfused twin's pool-1 query norm reads per-token rows
             raise NotImplementedError(_qsa_decode_decline_texts(geometry, self.act_dtype)["fuse_prepare_rope_tables_unfused"])
@@ -8792,9 +8863,7 @@ class GatedAttentionBlockFwd(APIBase):
         # skipped -- a stage that is never run should not be in `_stages`,
         # where it would still be compiled and still report support.  Under
         # FP8 / MXFP8 the quantize stages compact V (and Q, K) on the way to e4m3.
-        # The e4m3 decode mode norms Q / K out of place (the compact slots) but never compacts V: the write-through reads the slab's
-        # V band and stage (4) reads the pools, so the stage is not built there either.
-        self._compact_v = None if (self.inplace_qkv or fp8 or self.upcast_decode) else _VCompaction(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
+        self._compact_v = None if (self.inplace_qkv or fp8) else _VCompaction(geometry, batch=self.batch, seq_len=self.seq_len, dtype=act)
         # (3q) UNFUSED FP8 only: bf16 slab slices -> compact e4m3 Q/K/V.  Two
         # recipes (h_q and h_kv); K and V share the h_kv one.  Fully fused FP8
         # quantizes in the projection fork's epilogue and builds none of them.
@@ -8839,21 +8908,7 @@ class GatedAttentionBlockFwd(APIBase):
             # bf16: in-place reads the slab at its padded stride; FP8 / MXFP8
             # unfused read the compact e4m3 buffers.  GATE is always a slab column slice.
             sdpa_token_stride, sdpa_gate_token_stride, sdpa_o_dtype = (geometry.n_qkvg if self.inplace_qkv else 0) if not fp8 else 0, geometry.n_qkvg, act
-        if self.upcast_decode:
-            # Stage (4) under QsaSpec over e4m3 POOLS: the gathered cast + the bf16 d256 decode tile over the scratch (the class
-            # docstring); the compact normed Q (out of place) is its Q.
-            self._sdpa = _UpcastSparseSdpa(
-                geometry,
-                batch=self.batch,
-                seq_len=self.seq_len,
-                dtype=self.dtype,
-                device=self.device,
-                page_size=self.paged_kv_page_size,
-                k_cache_desc=self._descs["k_cache"],
-                v_cache_desc=self._descs["v_cache"],
-                block_table_desc=self._descs["block_table"],
-            )
-        elif self.qsa is not None:
+        if self.qsa is not None:
             # Stage (4) under QsaSpec: the index-list sparse core -- built or not built per declaration like every other
             # stage.  Reads the slab (or the compact buffers) at the SAME strides the dense stage would; declines, typed,
             # until the core lands (its own docstring).
@@ -8884,6 +8939,9 @@ class GatedAttentionBlockFwd(APIBase):
                 split_kv=self.decode_split_kv if self.sparse_decode else 1,
                 # the switch reaches the sparse core and its combine on every arm the adapter serves it on (THD declined above by name)
                 use_pdl=self.use_pdl,
+                # The e4m3 pools (kv_cache_dtype): the sparse core's in-kernel dequant arm over the pools; over the block's own K / V the
+                # operands are the activation dtype whatever the pools hold (the write-through quantizes on the way out).
+                kv_cache_dtype=self.kv_cache_dtype if (self.sparse_decode and self.kv_cache_e4m3) else None,
             )
         else:
             # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
@@ -8949,7 +9007,8 @@ class GatedAttentionBlockFwd(APIBase):
                 index_raw_pool=not self.indexer_decode,
             )
         # (2+3+4w) FUSED under fuse_prepare: ONE launch norms + rotates Q / K in place and writes the post-RoPE K, the V (and the
-        # raw indexer key) into the pools from the same registers -- bitwise the two stages it replaces, which are then not
+        # raw indexer key) into the pools from the same registers (quantized to e4m3 codes under kv_cache_dtype=e4m3, the scales read on
+        # device) -- bitwise the two stages it replaces, which are then not
         # built (a stage that never runs is not in `_stages`).  Under the decode indexer over the pools the launch carries the three
         # PAGED indexer arms (the query norm into the workspace, the raw key into the ring, the completing block into the paged
         # compressed-key cache) in place of the raw-key pool arm: `_IndexerDecode` then launches the scorer and the top-k alone.
@@ -8983,6 +9042,8 @@ class GatedAttentionBlockFwd(APIBase):
                 use_pdl=self.use_pdl,
                 index_arms=arms,
                 index_cache_dtype=self.index_cache_dtype if self.indexer_decode else None,
+                # the e4m3 KV cache: the launch's quantizing K / V pool arm (the scales at execute) in place of _QuantizedCacheWrite
+                kv_cache_dtype=self.kv_cache_dtype if self.kv_cache_e4m3 else None,
             )
             self._norm_rope = None
             self._cache_write = None
@@ -9126,7 +9187,7 @@ class GatedAttentionBlockFwd(APIBase):
         ``"paged"`` the bottom-right diagonal is the DECODE / extend-with-prefix mode's (served through the sparse stage;
         the serving table validates the rest), under ``"self"`` it stays a decline naming that mode.  ``kv_cache_dtype`` /
         ``page_size`` (appended; the raw arguments, validated by their own rows afterwards) feed the in-block indexer's rows over the
-        pools (the e4m3 pool, the page's power-of-two row count)."""
+        pools (the page's power-of-two row count; ``kv_cache_dtype`` is unread since 2026-10-21 -- e4m3 pools are served under the indexer)."""
         g = self.geom
         g.validate()
         q = g.qsa
@@ -9188,7 +9249,7 @@ class GatedAttentionBlockFwd(APIBase):
         if q.index_source == "indexer":
             # The in-block indexer's own rows (device-free): the scorer's dtype / head dim, the packed form; on the prefill form the
             # prefill scorer's head groups, over the POOLS (the decode step) the paged scorer's envelope -- the query rows per sequence,
-            # the page's power-of-two row count, the e4m3 cache, the e4m3 pool, the shared list -- each the envelope's row.
+            # the page's power-of-two row count, the e4m3 cache, the shared list -- each the envelope's row.
             _check_qsa_indexer_geometry(g, self.dtype, thd=self.thd, paged=paged, s_q=self.seq_len, page_size=page_size, kv_cache_dtype=kv_cache_dtype)
 
     def _check_qsa_execute_args(
@@ -9809,8 +9870,8 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if kv_cache_dtype == torch.float8_e5m2:
             raise NotImplementedError(
-                "kv_cache_dtype=torch.float8_e5m2: the e4m3 KV cache is the one served (the serving stacks' fp8 KV cache is e4m3fn; the gathered cast and "
-                "the quantizing write-through are e4m3 kernels) -- declare torch.float8_e4m3fn"
+                "kv_cache_dtype=torch.float8_e5m2: the e4m3 KV cache is the one served (the serving stacks' fp8 KV cache is e4m3fn; the sparse core's dequant "
+                "arm and the quantizing write-through are e4m3 kernels) -- declare torch.float8_e4m3fn"
             )
         if kv_cache_dtype in (torch.bfloat16, torch.float16):
             if kv_cache_dtype != act:
@@ -9834,7 +9895,7 @@ class GatedAttentionBlockFwd(APIBase):
             )
         if act != torch.bfloat16:
             raise NotImplementedError(
-                f"kv_cache_dtype=torch.float8_e4m3fn with {act} activations: the gathered cast writes bf16 rows and the d256 decode tile over them reads a "
+                f"kv_cache_dtype=torch.float8_e4m3fn with {act} activations: the sparse core's e4m3 arm expands the pools to bf16 operand tiles under a "
                 "bf16 Q (one dtype per plan) -- declare bf16 activations (f16 activations over an e4m3 cache are a follow-up)"
             )
         if self.thd and kv_source != KV_SOURCE_PAGED:
@@ -9846,59 +9907,25 @@ class GatedAttentionBlockFwd(APIBase):
         return KV_CACHE_E4M3
 
     def _check_kv_cache_dtype_serving(self, decode_split_kv, inplace_qkv, fuse_norm_rope) -> int:
-        """The e4m3 cache OVER THE POOLS (``kv_source="paged"``), device-free, after the serving table: served on the block-sparse
-        DECODE mode at ``S_q <= 4`` only -- the EXTEND form and the dense DECODE form read bf16 / f16 pools (the paged THD body and the
-        decode tile have no dequant arm; the gathered cast is list-driven), the per-token list form would gather 2176 x 256 bf16 rows
-        per (row, KV head) item, the decode tile over the scratch writes no LSE the block hands back and runs unsplit, and the mode
-        norms + rotates OUT of place (the tile's per-item Q is a view of the compact Q alone), so ``fuse_norm_rope`` and an explicit
-        ``inplace_qkv=True`` are declined and ``inplace_qkv=None`` reads as False.  Returns the split (1)."""
+        """The e4m3 cache OVER THE POOLS (``kv_source="paged"``), device-free, after the serving table: served on the block-sparse DECODE
+        mode through the sparse core's in-kernel dequant arm (2026-10-21) at every list form, ``S_q``, split, LSE and gate placement of
+        the bf16 mode -- ``decode_split_kv`` / ``inplace_qkv`` / ``fuse_norm_rope`` were resolved by the bf16 rules already and stay as
+        resolved (the three parameters remain for the signature) --; the two declines that remain: the EXTEND form (the paged THD body has
+        no dequant arm) and the dense DECODE form (the decode tile has none).  Returns the split as resolved."""
         e4 = "kv_cache_dtype=torch.float8_e4m3fn"
         if self.thd:
             raise NotImplementedError(
                 f"kv_source='paged' with {e4} on a packed (thd=True) declaration -- the EXTEND form over e4m3 pools: the paged d256 THD body reads bf16 / "
-                "f16 pools (no dequant arm); the e4m3 read is the block-sparse DECODE mode's (a dense [B, S_q <= 4] QsaSpec declaration: the gathered cast + "
-                "the decode tile)"
+                "f16 pools (no dequant arm); the e4m3 read is the block-sparse DECODE mode's (a dense [B, S_q] QsaSpec declaration: the sparse core's "
+                "in-kernel dequant arm)"
             )
         if self.qsa is None:
             raise NotImplementedError(
-                f"kv_source='paged' with {e4} on a dense geometry (the DECODE form): the Rubin d256 decode tile reads bf16 / f16 pools, and the gathered-cast "
-                "composition is list-driven (a QsaSpec geometry: the listed blocks and the open tail, at most 2176 rows per item); a dense e4m3 pool needs the "
-                "tile's in-kernel dequant arm -- a follow-up.  Declare a QsaSpec geometry (the block-sparse DECODE mode over e4m3 pools) or bf16 / f16 pools"
+                f"kv_source='paged' with {e4} on a dense geometry (the DECODE form): the Rubin d256 decode tile reads bf16 / f16 pools; a dense e4m3 pool "
+                "needs the tile's in-kernel dequant arm -- a follow-up.  Declare a QsaSpec geometry (the block-sparse DECODE mode over e4m3 pools: the "
+                "sparse core's in-kernel dequant arm) or bf16 / f16 pools"
             )
-        if self.seq_len > _UPCAST_MAX_S_Q:
-            raise NotImplementedError(
-                f"{e4} over the pools serves the SHARED-list form, S_q <= {_UPCAST_MAX_S_Q} rows per sequence (the decode step and its speculative rows): the "
-                f"gathered cast lays out {_UPCAST_ROWS} x {_UPCAST_D} bf16 rows per (row, KV head) item ({2 * _UPCAST_ROWS * _UPCAST_D * 2} bytes), so the "
-                f"per-token list form (S_q > {_UPCAST_MAX_S_Q}: the extend-with-prefix mode) over e4m3 pools waits for the in-kernel dequant arm; got S_q={self.seq_len}"
-            )
-        if self.qsa.index_list_form == QSA_INDEX_LIST_FORM_PER_ROW:
-            raise NotImplementedError(
-                f"QsaSpec(index_list_form='per_row') with {e4} over the pools: the gathered cast reads ONE list per sequence (the shared form anchored at the "
-                "step-0 position) per (row, KV head) item; the per-row list over e4m3 pools waits for the sparse core's in-kernel dequant arm -- declare "
-                "index_list_form=None or 'shared', or bf16 pools"
-            )
-        if self.return_lse:
-            raise NotImplementedError(
-                f"return_lse=True with {e4} over the pools: the decode tile over the gathered scratch writes its Stats item-major ([B x S_q x H_kv, G, 1]) and "
-                "the block hands no LSE back on this form -- a follow-up; declare return_lse=False"
-            )
-        if decode_split_kv is not None and int(decode_split_kv) != 1:
-            raise NotImplementedError(
-                f"decode_split_kv={decode_split_kv} with {e4}: the e4m3 mode runs the d256 decode tile UNSPLIT over the gathered scratch (at most 17 KV tiles "
-                "per item); a split there is a follow-up -- pass None or 1"
-            )
-        why_oop = (
-            "the decode tile over the gathered scratch reads the step's Q per (token, KV head) item, a view of the COMPACT normed Q only (the slab's token "
-            "stride cannot fold token and KV head into one batch stride), so the mode norms + rotates OUT of place"
-        )
-        if fuse_norm_rope:
-            raise NotImplementedError(
-                f"fuse_norm_rope=True with {e4} over the pools: {why_oop} -- declare fuse_norm_rope=False (the fused projection writes the slab in place)"
-            )
-        if inplace_qkv:
-            raise NotImplementedError(f"inplace_qkv=True with {e4} over the pools: {why_oop} -- leave inplace_qkv=None (read as False here) or pass False")
-        self.inplace_qkv = False
-        return 1
+        return self.decode_split_kv
 
     def _check_cache_write_args(
         self,
@@ -9951,7 +9978,7 @@ class GatedAttentionBlockFwd(APIBase):
                     got = f"{x.dtype} x {int(x.numel())} on {x.device}" if isinstance(x, torch.Tensor) else type(x).__name__
                     raise ValueError(
                         f"kv_cache_dtype=torch.float8_e4m3fn needs {nm} at execute: a 1-element fp32 CUDA tensor on h's device {dev} (the pool's per-tensor "
-                        f"DEscale: value = code x scale; the write-through quantizes with its reciprocal, the gathered cast multiplies it in -- both on device), got {got}"
+                        f"DEscale: value = code x scale; the write-through quantizes with its reciprocal, the sparse core folds it in-kernel -- both on device), got {got}"
                     )
         elif scales:
             raise ValueError(
@@ -10391,9 +10418,9 @@ class GatedAttentionBlockFwd(APIBase):
             ),
             _geometry=geometry,
             sparse_core=sparse,
-            # the e4m3 cache (the gathered cast + the decode tile) is a form of the block-sparse decode mode with bf16 activations only --
-            # under caller lists: its composition with the in-block indexer waits for the sparse core's in-kernel dequant arm
-            kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16 and not indexer) else ()),
+            # the e4m3 cache (the sparse core's in-kernel dequant arm) is a form of the block-sparse decode mode with bf16 activations --
+            # caller lists and the in-block indexer alike (2026-10-21)
+            kv_cache_dtypes=(dtype,) + ((KV_CACHE_E4M3,) if (sparse and dtype == torch.bfloat16) else ()),
             policy=policy,
             claimed_max_s_q=DECODE_CLAIMED_MAX_S_Q,
             q_tile_max=q_tile_max,
@@ -10649,7 +10676,7 @@ class GatedAttentionBlockFwd(APIBase):
             thd_num_sequences=self.num_sequences if self.thd else 0,
             qsa_indexer_cand_floats=self._indexer.cand_floats if (self._indexer is not None and self._indexer.selects) else None,
             kv_cache_e4m3=self.kv_cache_e4m3,
-            upcast_items=(self.batch * self.seq_len * self.geom.h_kv) if self.upcast_decode else 0,
+            upcast_items=0,  # the gathered-cast scratch is retired (the sparse core reads the e4m3 pools in-kernel)
             qsa_indexer_e4m3=(self._indexer is not None and self._indexer.fp8),
             # the prefill route's [B] int32 Q lengths (a declaration fact: the route is read at declaration, so get_workspace_size()
             # before compile() already counts the slot)
@@ -11220,9 +11247,10 @@ class GatedAttentionBlockFwd(APIBase):
         REQUIRED -- the pools' per-tensor DEscales (value = code x scale), 1-element
         fp32 CUDA tensors on ``h``'s device, read on device: the write-through
         quantizes the post-RoPE K / V with their reciprocals (two fp32 words of the
-        workspace, written on the launch stream), the block-sparse decode step's
-        gathered cast multiplies them back in; REFUSED on a block whose pools are
-        the activation dtype.
+        workspace, written on the launch stream; the fused prepare reads them in its
+        own launch), the block-sparse decode step's sparse core folds them in-kernel
+        (k_scale into the scores' scale, v_scale into the normaliser); REFUSED on a
+        block whose pools are the activation dtype.
 
         ``index_kv_cache`` / ``index_state_cache`` / ``index_state_block_table`` /
         ``index_state_slot_mapping`` / ``cos_pos`` / ``sin_pos`` / ``n_commit`` (appended):
@@ -11506,6 +11534,9 @@ class GatedAttentionBlockFwd(APIBase):
                     index_src=_cols(proj, g.index_k_raw_offset, g.qsa.index_kv_heads, g.qsa.index_head_dim) if g.index_band else None,
                     index_cache=index_k_raw if (g.index_band and dec is None) else None,
                     current_stream=stream,
+                    # the e4m3 KV cache: the pools' DEscales, read on device by the launch's quantizing pool arm (None on bf16 / f16 pools)
+                    k_scale=k_scale if self.kv_cache_e4m3 else None,
+                    v_scale=v_scale if self.kv_cache_e4m3 else None,
                     **(
                         dict(
                             index_q_src=_cols(proj, g.qkvg_offsets[ProjBlock.INDEX], g.qsa.index_heads, g.qsa.index_head_dim),
@@ -11688,49 +11719,31 @@ class GatedAttentionBlockFwd(APIBase):
         # geometry, the sparse stage (the block-sparse DECODE / extend-with-prefix mode: the same paged read through the sparse core,
         # kv_lens bound to the KV side only, the list in the form the declaration derived from S_q).
         paged_kw = dict(block_table=block_table, kv_lens=kv_lens, k_cache=k_cache, v_cache=v_cache) if paged else {}
-        if self.upcast_decode:
-            # The e4m3 cache over the pools: the gathered cast into the workspace scratch, then the d256 decode tile over it -- the compact
-            # normed Q and the O slot per (token, KV head) item; the scales read on device.
-            items = t * g.h_kv
-            self._sdpa.execute(
-                q_c,
-                o,
-                k_cache=k_cache,
-                v_cache=v_cache,
-                block_table=block_table,
-                kv_lens=kv_lens,
-                block_ids=block_ids,
-                block_lens=block_lens,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                scratch=_view(workspace, ws.kv_gathered, (items, 2, _UPCAST_ROWS, _UPCAST_D), act),
-                kv_len_t=_view(workspace, ws.kv_len_t, (items,), torch.int32),
-                workspace=engine_ws,
-                current_stream=stream,
-            )
-        else:
-            self._sdpa.execute(
-                q_c.view(self.batch, self.seq_len, g.h_q, g.d_head),
-                k_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
-                v_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
-                o.view(self.batch, self.seq_len, g.h_q, g.d_head),
-                lse=lse,
-                # the prefill route hands the paged THD leg the block's own constant Q lengths (the workspace slot, [B] int32, all S_q);
-                # every other form the caller's
-                seq_lens=decode_q_lens if decode_q_lens is not None else seq_lens,
-                workspace=engine_ws,
-                current_stream=cuda.CUstream(stream),
-                gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,
-                # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them)
-                descale_q=qd["descale_q"] if (fp8 and not mxfp8) else None,
-                descale_k=qd["descale_k"] if (fp8 and not mxfp8) else None,
-                descale_v=qd["descale_v"] if (fp8 and not mxfp8) else None,
-                sf_q=sfq,
-                sf_k=sfk,
-                sf_v=sfv,
-                **sparse_kw,
-                **paged_kw,
-            )
+        if self.sparse_decode and self.kv_cache_e4m3:
+            # the e4m3 pools' DEscales into the sparse core (read on device by its in-kernel dequant arm; the stage refuses them elsewhere)
+            sparse_kw.update(k_scale=k_scale, v_scale=v_scale)
+        self._sdpa.execute(
+            q_c.view(self.batch, self.seq_len, g.h_q, g.d_head),
+            k_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
+            v_c.view(self.batch, self.seq_len, g.h_kv, g.d_head),
+            o.view(self.batch, self.seq_len, g.h_q, g.d_head),
+            lse=lse,
+            # the prefill route hands the paged THD leg the block's own constant Q lengths (the workspace slot, [B] int32, all S_q);
+            # every other form the caller's
+            seq_lens=decode_q_lens if decode_q_lens is not None else seq_lens,
+            workspace=engine_ws,
+            current_stream=cuda.CUstream(stream),
+            gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head) if self.gate_fused else None,
+            # per-tensor FP8: scalar descales; MXFP8: the three SF blobs (and NO scalars -- _Sdpa refuses them)
+            descale_q=qd["descale_q"] if (fp8 and not mxfp8) else None,
+            descale_k=qd["descale_k"] if (fp8 and not mxfp8) else None,
+            descale_v=qd["descale_v"] if (fp8 and not mxfp8) else None,
+            sf_q=sfq,
+            sf_k=sfk,
+            sf_v=sfv,
+            **sparse_kw,
+            **paged_kw,
+        )
         if not self.gate_fused:
             # (5) -- gates the SUBSTITUTED O: the SDPA epilogue already selected
             # O := 0 on dead rows, so no residue reaches the sigmoid.  In place

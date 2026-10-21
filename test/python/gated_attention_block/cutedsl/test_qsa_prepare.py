@@ -748,7 +748,7 @@ def _make_block(geom_kw, batch, seq_len, dtype=BF16, qsa=None, **blk_kw):
 
 def test_fuse_prepare_declaration_rows():
     """The knob's rows, typed and naming the knob: a non-bool, no write-through to fold, together with ``fuse_norm_rope``,
-    the out-of-place layout, the packed and the paged forms, the e4m3 KV cache; and the knob accepted on the in-place bf16 block
+    the out-of-place layout, the packed and the dense paged form; the knob accepted on the in-place bf16 block and on the e4m3 KV cache (its pool arm)
     with the attribute."""
     with pytest.raises(TypeError, match="fuse_prepare must be a bool"):
         _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=1)
@@ -785,8 +785,12 @@ def test_fuse_prepare_declaration_rows():
         auto.fuse_prepare is False and auto.fuse_prepare_requested is None and auto._prepare is None and SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS == ((10, 7),)
     )
     assert _make_block(dict(_SMALL_D256, causal_bottom_right=True), 1, 1, qsa=QsaSpec(index_band=True), fuse_prepare=False, **paged)[0]._prepare is None
-    with pytest.raises(NotImplementedError, match="fuse_prepare=True with kv_cache_dtype=torch.float8_e4m3fn"):
-        _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, kv_cache_dtype=torch.float8_e4m3fn)
+    # the e4m3 KV cache takes the knob (2026-10-21): the prepare launch's quantizing K / V pool arm replaces the two-stage write-through
+    e4, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True, kv_cache_dtype=torch.float8_e4m3fn)
+    assert e4.fuse_prepare is True and e4.kv_cache_e4m3 and isinstance(e4._prepare, _QsaPrepare) and e4._prepare.kv_e4m3 and e4._cache_write is None
+    assert (
+        e4._prepare.kv_cache_dtype == torch.float8_e4m3fn and not _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True)[0]._prepare.kv_e4m3
+    )
     blk, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16, fuse_prepare=True)
     assert blk.fuse_prepare and blk.paged_kv_page_size == 16 and isinstance(blk._prepare, _QsaPrepare)
     plain, *_ = _make_block(_SMALL_D256, 1, 64, paged_kv_page_size=16)
@@ -1196,6 +1200,135 @@ def test_paged_decode_form_census_four_unfused_one_fused(rows):
     assert len(fused) == 1 and "frost_qsa_prepare" in fused[0]
     assert len(unfused) == 4 and sum("frost_qsa_compress_step" in n for n in unfused) == 1
     ch.assert_bitwise(f"paged census B=4 rows={rows}")
+
+
+E4M3 = torch.float8_e4m3fn
+
+
+def _e4m3_quant(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """The e4m3 pool arm's chain as torch computes it: ``sat_e4m3(fp32(row) x fp32(1 / scale))`` -- the IEEE-RN reciprocal, one fp32
+    product, one round-to-nearest-even rounding saturating at 448 (``cvt.rn.satfinite.e4m3x2.f32``)."""
+    return (x.float() * torch.reciprocal(scale.float())).clamp(-448.0, 448.0).to(E4M3)
+
+
+def _bits8(x: torch.Tensor) -> torch.Tensor:
+    return x.contiguous().view(torch.int8)
+
+
+def _e4m3_pools(ch: _Chain):
+    """NaN-filled e4m3 K / V pools in the chain's layout (an e4m3 NaN is the code 0x7f)."""
+    mk = lambda *shape: torch.full(shape, float("nan"), device="cuda", dtype=torch.float32).to(E4M3)  # noqa: E731
+    if ch.layout == "hnd":
+        return mk(ch.n_pages, ch.h_kv, _PAGE, ch.d), mk(ch.n_pages, ch.h_kv, _PAGE, ch.d)
+    return mk(ch.n_pages, _PAGE, ch.h_kv, ch.d).permute(0, 2, 1, 3), mk(ch.n_pages, _PAGE, ch.h_kv, ch.d).permute(0, 2, 1, 3)
+
+
+def _run_e4m3_fused(ch: _Chain, recipe, X, k_scale, v_scale):
+    s = X["slab"]
+    wq, wk = (ch.w_q, ch.w_k) if ch.apply_norm else (None, None)
+    cos_t, sin_t = (None, None) if ch.rope_table else (ch.cos_t, ch.sin_t)
+    run_qsa_prepare(
+        recipe,
+        ch.cols(s, ch.o_q, ch.h_q, ch.d),
+        ch.cols(s, ch.o_k, ch.h_kv, ch.d),
+        ch.cols(s, ch.o_v, ch.h_kv, ch.d),
+        None,
+        None,
+        wq,
+        wk,
+        cos_t,
+        sin_t,
+        X["k_pool"],
+        X["v_pool"],
+        ch.slot,
+        index_eps=_EPS,
+        index_norm_weight_offset=0.0,
+        stream=_stream(),
+        k_scale=k_scale,
+        v_scale=v_scale,
+        **ch.fused_kwargs(X),
+    )
+    torch.cuda.synchronize()
+
+
+@requires_cuda
+@pytest.mark.parametrize(
+    "arms_id, layout",
+    [pytest.param("attention_only", "hnd", id="attention_only_hnd"), pytest.param("paged_decode_arms", "nhd", id="paged_decode_arms_nhd")],
+)
+def test_e4m3_pool_arm_quantizes_the_k_v_pools_bitwise_the_torch_cast_and_keeps_every_other_output(arms_id, layout):
+    """The prepare launch's e4m3 K / V pool arm (``compile_qsa_prepare(kv_cache_dtype=torch.float8_e4m3fn)``, the scales at
+    ``run_qsa_prepare(k_scale=, v_scale=)``): on the bf16 fused launch's inputs the e4m3 launch writes the slab, the indexer queries, the
+    ring, the compressed keys and the slot report BITWISE the bf16 launch, and the K / V pools as torch's e4m3 codes of the bf16 launch's
+    pool rows -- ``sat_e4m3(fp32(row) x fp32(1 / scale))`` -- on exactly the live slots (padded / out-of-range slots NaN); the scales are
+    read ON DEVICE (a second launch of the SAME recipe under new scales moves the codes: no re-plan); the refusals in both directions
+    (scales on a bf16 recipe, none on the e4m3 recipe, a bf16 pool bound to the e4m3 recipe) by name.  Any sm_89+ CUDA device."""
+    if tuple(torch.cuda.get_device_capability()) < (8, 9):
+        pytest.skip("the e4m3 pool arm's fp8 cvt needs sm_89+")
+    if arms_id == "attention_only":
+        ch = _Chain(_GEOM_SMALL, batch=2, rows=4, pos0=(3, 10), arms=None, band=False, layout=layout)
+    else:
+        arms = QsaPrepareIndexArms(heads=4, head_dim=128, raw_pool=False, query=True, compress=True, paged=True)
+        ch = _Chain(_GEOM_FN, batch=4, rows=2, pos0=(7, 0, 13, 2048), arms=arms, paged=True, page=16, cap=8, layout=layout)
+    ch.compile_unfused()
+    ch.compile_fused()
+    ch.run_unfused()
+    ch.run_fused()
+    ch.assert_bitwise(f"{arms_id} bf16 pools")
+    r8 = compile_qsa_prepare(
+        dtype=ch.dtype,
+        h_q=ch.h_q,
+        h_kv=ch.h_kv,
+        d=ch.d,
+        rope_dim=ch.rope,
+        eps=_EPS,
+        page_size=_PAGE,
+        slot_dtype=ch.slot_dtype,
+        apply_norm=ch.apply_norm,
+        index=ch.arms,
+        kv_cache_dtype=E4M3,
+    )
+    assert r8.kv_e4m3 and r8.pool_dtype == E4M3 and not ch.r_fused.kv_e4m3 and ch.r_fused.pool_dtype == ch.dtype
+    k_scale, v_scale = torch.tensor([0.0123], device="cuda"), torch.tensor([0.0456], device="cuda")
+    X8 = ch._fresh()
+    X8["k_pool"], X8["v_pool"] = _e4m3_pools(ch)
+    _run_e4m3_fused(ch, r8, X8, k_scale, v_scale)
+    Bf = ch.Bf
+    same = [
+        ("the whole slab", X8["slab"], Bf["slab"]),
+        ("indexer queries", X8["qi"], Bf["qi"]),
+        ("ring", X8["ring"], Bf["ring"]),
+        ("compressed keys", X8["comp"], Bf["comp"]),
+        ("compressed_slot", X8["cslot"], Bf["cslot"]),
+    ]
+    bad = [nm for nm, x, y in same if not _same(x, y)]
+    assert not bad, f"{arms_id}: the e4m3 launch differs from the bf16 launch on {bad}"
+    n_live = int(ch.live.sum())
+    for nm, p8, p16, sc in (("K", X8["k_pool"], Bf["k_pool"], k_scale), ("V", X8["v_pool"], Bf["v_pool"], v_scale)):
+        assert int((~torch.isnan(p8.float())).all(-1).sum()) == n_live * ch.h_kv, f"{nm} pool: rows written != live slots x heads"
+        s_ = ch.slot[ch.live].long()
+        assert torch.equal(
+            _bits8(p8[s_ // _PAGE, :, s_ % _PAGE, :]), _bits8(_e4m3_quant(p16[s_ // _PAGE, :, s_ % _PAGE, :], sc))
+        ), f"{nm} pool: not the torch cast"
+    # the scales are execute inputs read on device: the same recipe under new scales writes different codes (no re-plan; the slab untouched)
+    X8b = ch._fresh()
+    X8b["k_pool"], X8b["v_pool"] = _e4m3_pools(ch)
+    k2, v2 = k_scale * 2.0, v_scale * 0.5
+    _run_e4m3_fused(ch, r8, X8b, k2, v2)
+    s_ = ch.slot[ch.live].long()
+    assert torch.equal(_bits8(X8b["k_pool"][s_ // _PAGE, :, s_ % _PAGE, :]), _bits8(_e4m3_quant(Bf["k_pool"][s_ // _PAGE, :, s_ % _PAGE, :], k2)))
+    assert torch.equal(_bits8(X8b["v_pool"][s_ // _PAGE, :, s_ % _PAGE, :]), _bits8(_e4m3_quant(Bf["v_pool"][s_ // _PAGE, :, s_ % _PAGE, :], v2)))
+    assert not torch.equal(_bits8(X8b["k_pool"]), _bits8(X8["k_pool"])) and _same(X8b["slab"], X8["slab"])
+    # the refusals in both directions, by name
+    with pytest.raises(ValueError, match="k_scale / v_scale: this artifact traced bf16 / f16 K / V pools"):
+        _run_e4m3_fused(ch, ch.r_fused, ch._fresh(), k_scale, v_scale)
+    with pytest.raises(ValueError, match="k_scale must be bound at execute"):
+        X = ch._fresh()
+        X["k_pool"], X["v_pool"] = _e4m3_pools(ch)
+        _run_e4m3_fused(ch, r8, X, None, None)
+    with pytest.raises((ValueError, TypeError)):
+        _run_e4m3_fused(ch, r8, ch._fresh(), k_scale, v_scale)  # bf16 pools on the e4m3 recipe: the pool dtype check
+    print(f"{arms_id} {layout}: the e4m3 pool arm bitwise the bf16 launch on every other output; {n_live} live slots quantized bitwise the torch cast")
 
 
 @requires_cuda

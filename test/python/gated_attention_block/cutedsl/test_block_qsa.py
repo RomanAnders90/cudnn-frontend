@@ -371,7 +371,6 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "indexer_thd": "scores dense [B, S] prompts",
         "indexer_query_rows": "query rows per sequence (at most 64",
         "indexer_page_size": "a power-of-two count of compressed rows",
-        "indexer_e4m3_pool": "in-kernel dequant arm",
         "indexer_shared_list": "selects per row",
         "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
     }
