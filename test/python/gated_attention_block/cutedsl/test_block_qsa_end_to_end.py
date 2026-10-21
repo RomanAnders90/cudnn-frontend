@@ -2104,7 +2104,9 @@ def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
 # ---------------------------------------------------------------------------- the in-block indexer's DECODE step over the pools (2026-10-21)
 
 
-def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16):
+def _decode_indexer_block(
+    geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16, combine_in_out_proj=None, return_lse=True
+):
     """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools) at ``[1, s_q]`` on EMPTY step inputs -- the
     prefill's weights, the K / V pools + the three side caches as samples, the gate fused, the LSE out -- checked, compiled, with its
     sentinel-filled workspace."""
@@ -2127,19 +2129,20 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
         sample_index_kv_cache=icache,
         sample_index_state_cache=ring,
         sample_index_state_block_table=ring_table,
-        return_lse=True,
+        return_lse=return_lse,
         fuse_gate=True,
         fuse_prepare=fuse_prepare,
+        **({} if combine_in_out_proj is None else dict(combine_in_out_proj=combine_in_out_proj)),
     )
-    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.check_support()
+    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.combine_in_out_proj is bool(combine_in_out_proj) and blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
     return blk, ws
 
 
 @requires_rubin
-@pytest.mark.parametrize("fuse_prepare", [False, True], ids=["unfused", "fused"])
-def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare):
+@pytest.mark.parametrize("fuse_prepare, combine", [(False, None), (True, None), (True, True)], ids=["unfused", "fused", "fused-combine-in-out-proj"])
+def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache(fuse_prepare, combine):
     """The multi-step decode on ONE token stream: a 301-token prompt through the PREFILL form of the in-block indexer (``index_k_compressed``
     out, the K / V written through into the pools), its 75 compressed rows scattered into the paged compressed-key cache and the ring
     primed from the prompt's raw band (the slab's), then EIGHT decode steps over the pools with the ring / cache / pools CARRIED between
@@ -2150,7 +2153,9 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
     budget of the fp32 oracle fed the kernel's list (the two-stage oracle over the ACCEPTED prefix + the step's own tokens), the ring
     rows of the step the slab's raw keys, the pools' step rows the slab's K / V; and the cache's rows for every complete block of the
     ACCEPTED stream BITWISE a from-scratch prefill compress of that stream's raw keys (the compress kernel's dense form over the keys
-    the block committed) -- so the prefill's rows, the rows a step completes and a re-stepped block are one chain.  Both knob readings."""
+    the block committed) -- so the prefill's rows, the rows a step completes and a re-stepped block are one chain.  Both knob readings;
+    and ``combine_in_out_proj=True`` (the split combine formed in the out projection; no LSE on that form): every step's ``out``, list and
+    counts BITWISE a kernel-combine twin executed over the same carried state (the step rewrites the same ring / pool / cache bytes)."""
     import test_block_qsa_decode as _qsa
     from cudnn.gated_attention_block.kernels.qsa_compress import compile_qsa_compress, run_qsa_compress
 
@@ -2222,8 +2227,15 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         _bits(compress(k_raw_all[None, : nb0 * BS])[0]), _bits(kbar0)
     ), "the prefill's compressed rows are not the from-scratch compress of its raw band"
     common = dict(ps=ps, k_cache=k_cache, v_cache=v_cache, table=table, icache=icache, ring=ring, ring_table=ring_table, fuse_prepare=fuse_prepare)
+    want_lse = combine is not True  # the arm writes no LSE (a typed decline with one)
+    common.update(combine_in_out_proj=combine, return_lse=want_lse)
     blk1, ws1 = _decode_indexer_block(geom, inp, 1, **common)
     blk4, ws4 = _decode_indexer_block(geom, inp, 4, **common)
+    twins = {}
+    if combine:
+        twin_kw = dict(common, combine_in_out_proj=False)
+        twins = {1: _decode_indexer_block(geom, inp, 1, **twin_kw), 4: _decode_indexer_block(geom, inp, 4, **twin_kw)}
+        assert blk1._sdpa.combine_external and blk4._sdpa.combine_external and not twins[1][0]._sdpa.combine_external
     assert blk1._indexer_decode.n_blocks_max == blk4._indexer_decode.n_blocks_max == max_pages * rpp
     # (3) the steps: (S_q, rows accepted)
     plan = [(1, 1), (1, 1), (1, 1), (1, 1), (4, 2), (4, 4), (4, 3), (4, 4)]
@@ -2238,7 +2250,7 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
             h_full, inp["w_qkvg"][:n_dense], inp["w_q_norm"], inp["w_k_norm"], cos_all[:, :Lf], sin_all[:, :Lf], inp["w_o"], ref_geom
         )
         out = torch.full((1, s_q, d_model), float("nan"), device="cuda", dtype=BF16)
-        lse = torch.full((1, h_q, s_q), float("nan"), device="cuda", dtype=torch.float32)
+        lse = torch.full((1, h_q, s_q), float("nan"), device="cuda", dtype=torch.float32) if want_lse else None
         ids_out = torch.full((1, s_q, top_k), -7, dtype=torch.int32, device="cuda")
         lens_out = torch.full((1, s_q), -7, dtype=torch.int32, device="cuda")
         slots = torch.tensor([slot_of(p) for p in range(pos0, Lf)], dtype=torch.int32, device="cuda")
@@ -2269,7 +2281,40 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
             sin_pos=sin_all,
         )
         torch.cuda.synchronize()
-        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare}"
+        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc} fuse_prepare={fuse_prepare} combine_in_out_proj={blk.combine_in_out_proj}"
+        if combine:
+            # the kernel-combine twin over the SAME carried state (the step rewrites the same ring / pool / cache bytes, bitwise): out and the list bitwise
+            twin, tws = twins[s_q]
+            t_out = torch.full_like(out, float("nan"))
+            t_ids, t_lens = torch.full_like(ids_out, -7), torch.full_like(lens_out, -7)
+            twin.execute(
+                h_step,
+                inp["w_qkvg"],
+                inp["w_q_norm"],
+                inp["w_k_norm"],
+                cos_all[:, pos0:Lf].contiguous(),
+                sin_all[:, pos0:Lf].contiguous(),
+                inp["w_o"],
+                t_out,
+                tws,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                block_table=table,
+                kv_lens=torch.tensor([Lf], dtype=torch.int32, device="cuda"),
+                slot_mapping=slots,
+                w_iq_norm=inp["w_iq_norm"],
+                w_ik_norm=inp["w_ik_norm"],
+                block_ids_out=t_ids,
+                block_lens_out=t_lens,
+                index_kv_cache=icache,
+                index_state_cache=ring,
+                index_state_block_table=ring_table,
+                cos_pos=cos_all,
+                sin_pos=sin_all,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(out), _bits(t_out)), f"{label}: out is not bitwise the kernel-combine twin"
+            assert torch.equal(ids_out, t_ids) and torch.equal(lens_out, t_lens), f"{label}: the list differs from the kernel-combine twin"
         # the counts rule (a completing row sees its own block), the list form
         counts = blk._indexer_decode.views(ws, blk._ws)["counts"].view(s_q)
         want = ((pos + 1) // BS).clamp(max=blk._indexer_decode.n_blocks_max).to(torch.int32)
@@ -2301,8 +2346,11 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         og, ref_lse = _qsa._attend(ref, allowed, pos, geom.scale, BF16, h_q, G)
         o = _view(ws, lay.o, (s_q, h_q, D_), BF16)
         ref_out = (og.reshape(s_q, h_q * D_).float() @ inp["w_o"].float().t()).to(BF16)
-        assert torch.isfinite(out.float()).all() and torch.isfinite(lse).all(), f"{label}: non-finite"
-        d_o, d_lse, c = float((o.float() - og.float()).abs().max()), float((lse[0] - ref_lse).abs().max()), _cos(out[0], ref_out)
+        assert torch.isfinite(out.float()).all() and (lse is None or torch.isfinite(lse).all()), f"{label}: non-finite"
+        # under combine_in_out_proj the O slot is never written (the out projection folds the partials) and no LSE is declared: `out` is the check
+        d_o = float((o.float() - og.float()).abs().max()) if not blk.combine_in_out_proj else 0.0
+        d_lse = float((lse[0] - ref_lse).abs().max()) if lse is not None else 0.0
+        c = _cos(out[0], ref_out)
         assert d_o <= ATOL and d_lse <= ATOL and c > COS_OUT, f"{label}: O {d_o:.3e} LSE {d_lse:.3e} cos {c:.6f}"
         # accept `n_acc` rows: the stream, its raw keys; then the carried state against the from-scratch compress of the ACCEPTED stream
         L = pos0 + n_acc

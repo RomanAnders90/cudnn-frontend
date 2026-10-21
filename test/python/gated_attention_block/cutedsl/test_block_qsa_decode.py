@@ -657,6 +657,7 @@ class _Case:
         shuffle=True,
         index_list_form=None,
         fuse_prepare=None,
+        combine_in_out_proj=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
         self.fuse_prepare = fuse_prepare
@@ -774,6 +775,8 @@ class _Case:
         )
         if fuse_prepare is not None:
             kw["fuse_prepare"] = fuse_prepare
+        if combine_in_out_proj is not None:
+            kw["combine_in_out_proj"] = combine_in_out_proj
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -858,12 +861,15 @@ class _Case:
         q, gate, k, v, o, proj = self.slab_views(ws)
         assert torch.isfinite(out.float()).all(), f"{what}: non-finite out"
         assert not (out.float() == sent).any(), f"{what}: a sentinel survived in out"
-        assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the sparse core never wrote keeps the workspace fill)"
+        # under combine_in_out_proj the O slot is never written (the out projection folds the fp32 partials itself): `out` is the check
+        o_written = not getattr(self.blk, "combine_in_out_proj", False)
+        if o_written:
+            assert torch.isfinite(o.float()).all(), f"{what}: non-finite gated O (a row the sparse core never wrote keeps the workspace fill)"
         if dead.any():
-            assert (out[dead] == 0).all() and (o[dead] == 0).all(), f"{what}: a dead row's out and O must be exactly 0"
+            assert (out[dead] == 0).all() and (not o_written or (o[dead] == 0).all()), f"{what}: a dead row's out and O must be exactly 0"
         c = _cos(out[live], self.ref_out[live])
         d_out = float((out[live].float() - self.ref_out[live].float()).abs().max())
-        d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max())
+        d_o = float((o[live].float() - self.ref_o_gated[live].float()).abs().max()) if o_written else 0.0
         d_lse = 0.0
         if self.return_lse:
             assert lse is not None and not (lse == sent).any(), f"{what}: a sentinel survived in LSE"
@@ -1491,8 +1497,8 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_page_sizes == (16, 32, 64, 128) and d.fuse_prepare_default is True and d.kv_cache_dtypes == (BF16,)  # the measured part
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `combine_in_out_proj_default`)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-13:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1505,6 +1511,7 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "index_state_rows_extra",
             "index_page_sizes",
             "fuse_prepare_default",
+            "combine_in_out_proj_default",
         ]
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
@@ -2578,3 +2585,248 @@ def test_caller_list_band_block_with_fuse_prepare_is_bitwise_the_two_stage_form(
     assert torch.equal(_bits(on.index_cache), _bits(off.index_cache)), "the raw-key pool differs"
     names_on, names_off = [st.name for st in on.blk._stages], [st.name for st in off.blk._stages]
     assert "qsa_prepare" in names_on and "cache_write" not in names_on and "qk_norm_rope" not in names_on and len(names_on) == len(names_off) - 1
+
+
+# ---------------------------------------------------------------------------
+# The combine in the out projection (`combine_in_out_proj`; 2026-10-21): the sparse core's split combine formed in the out-projection
+# GEMM's B operand ring -- bitwise the combine kernel, one launch fewer
+# ---------------------------------------------------------------------------
+
+# (geometry, S_q, kv_lens, split, seed): T 1 and T 4 on the 24 / 2 geometry (the production out projection: the 128x8 splitK8 swap-AB tile),
+# the default split (the fill rule: 16 on this part) and a pinned uneven one; a dead entry (every split dead); T 8 on the small geometry
+# (the explicit knob past the AUTO threshold; its out projection is the unsplit 64x8 swap-AB tile: the arm without a split-K reducer)
+_COMBINE_IN_OUT_PROJ_CELLS = [
+    pytest.param(GEOM_FLASH_NEXT, 1, (8192,), None, 71, id="B1-Sq1-24-2-8K-default-split"),
+    pytest.param(GEOM_FLASH_NEXT, 1, (2052, 300, 0, 4097), None, 72, id="B4-Sq1-24-2-dead-entry-default-split"),
+    pytest.param(GEOM_FLASH_NEXT, 4, (4096,), 7, 73, id="B1-Sq4-24-2-split7"),
+    pytest.param(GEOM_SMALL, 2, (300, 0, 1000, 77), 4, 74, id="B4-Sq2-small-T8-split4-unsplit-gemm"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, split, seed", _COMBINE_IN_OUT_PROJ_CELLS)
+def test_combine_in_out_proj_is_bitwise_the_kernel_combine_with_the_census_by_kernel_name(geom_kw, s_q, kv_lens, split, seed):
+    """``combine_in_out_proj`` on vs off on the same inputs: ``out`` BITWISE, both within the oracle's budget and two launches bitwise each;
+    the CUPTI census by kernel NAME: the ON chain is exactly ONE kernel shorter -- no ``cudnn_kernel__combine*`` kernel, the out projection's
+    GEMM symbol carries ``_combineB`` -- and no memset / memcpy on either path; the sparse adapter compiled no combine entry under the arm
+    (``combine='external'``), the out projection's plan carries the record and the ``+combineB`` name; no allocation and no host sync over
+    three executes of the arm."""
+    on = _Case(geom_kw, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=False, combine_in_out_proj=True)
+    off = _Case(geom_kw, s_q, kv_lens, page=16, seed=seed, split=split, fuse_gate=True, return_lse=False, combine_in_out_proj=False)
+    assert on.blk.combine_in_out_proj is True and on.blk.combine_in_out_proj_requested is True and on.blk.decode_split_kv >= 2
+    assert off.blk.combine_in_out_proj is False and off.blk.combine_in_out_proj_requested is False
+    for case in (on, off):
+        case.compile()
+    impl_on, impl_off = on.blk._sdpa._impl, off.blk._sdpa._impl
+    assert impl_on.combine == "external" and impl_on._combine is None and impl_on._combine_owner is None, "the arm compiled a combine entry"
+    assert impl_off.combine == "kernel" and impl_off._combine is not None
+    spec = on.blk._out_proj.combine_prologue
+    assert spec is not None and spec.n_splits == on.blk.decode_split_kv == off.blk.decode_split_kv and spec.tokens == on.blk.batch * on.blk.seq_len
+    assert on.blk._out_proj._plan.combine_prologue is spec and on.blk._out_proj._plan.tile_config_name.endswith("+combineB")
+    assert (
+        off.blk._out_proj._plan.combine_prologue is None and on.blk._out_proj._plan.tile_config_name == off.blk._out_proj._plan.tile_config_name + "+combineB"
+    )
+    assert on.blk.get_workspace_size() == off.blk.get_workspace_size(), "the arm changed the workspace carve"
+    _two_launches(on, "combine_in_out_proj=True")
+    _two_launches(off, "combine_in_out_proj=False")
+    assert torch.equal(_bits(on.out), _bits(off.out)), (
+        f"combine_in_out_proj changed out: max |d| {(on.out.float() - off.out.float()).abs().max().item():.3e}, "
+        f"{int((_bits(on.out) != _bits(off.out)).sum())} of {on.out.numel()} elements differ"
+    )
+    # the pools and the slab are the same bytes either way (the knob touches the tail of the chain only)
+    assert torch.equal(_bits(on.k_cache.contiguous()), _bits(off.k_cache.contiguous())) and torch.equal(
+        _bits(on.v_cache.contiguous()), _bits(off.v_cache.contiguous())
+    )
+    k_on, m_on = _cupti_kernels(lambda: on.execute())
+    k_off, m_off = _cupti_kernels(lambda: off.execute())
+    if k_on is None or k_off is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the bitwise cells stand")
+    print(f"\n{on.label()} combine_in_out_proj ON: {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_on))
+    print(f"OFF: {len(k_off)} kernels + {len(m_off)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_off))
+    assert not (m_on or m_off), "a memset / memcpy on the execute path"
+    assert len(k_off) - len(k_on) == 1, (len(k_off), len(k_on))
+    assert sum(n.startswith("cudnn_kernel__combine") for n in k_off) == 1 and not any(n.startswith("cudnn_kernel__combine") for n in k_on)
+    assert sum("_combineB" in n for n in k_on) == 1 and not any("_combineB" in n for n in k_off)
+    assert sum("splitk_reduce" in n for n in k_on) == sum("splitk_reduce" in n for n in k_off)  # the reducer is the route's, untouched
+    if geom_kw is GEOM_FLASH_NEXT and s_q * len(kv_lens) <= 4:
+        # the caller-list band-off chain at B x S_q <= 4 on the 24 / 2 geometry: the slab, norm + RoPE, the K / V write, the sparse tile, [the
+        # combine,] the out projection and its split-K reducer = 7 kernels with the kernel combine, 6 with the combine in the out projection
+        # (the in-block indexer's fused chain reads 8 / 7: the prepare launch, the scorer and the top-k in place of the norm + RoPE and the write)
+        assert (len(k_off), len(k_on)) == (7, 6), (len(k_off), len(k_on))
+    # no allocation of the block's own on the execute path, no host sync (the R9 census), on the arm
+    torch.cuda.synchronize()
+    stat = lambda: torch.cuda.memory_stats()["allocation.all.allocated"]  # noqa: E731
+    n0 = stat()
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            on.execute()
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert stat() == n0, f"combine_in_out_proj=True: the block made {stat() - n0} CUDA allocation(s) over three executes"
+
+
+@requires_rubin
+def test_combine_in_out_proj_capture_of_the_first_execute_replays_bitwise_the_kernel_combine_chain():
+    """A FRESH ``combine_in_out_proj=True`` declaration (never executed) captured on a NEW stream with no eager warm-up under
+    ``set_sync_debug_mode("error")``: the capture launches nothing, three replays are BITWISE the eager kernel-combine twin's ``out``."""
+    off = _Case(GEOM_FLASH_NEXT, 1, (4096, 60), page=16, seed=81, split=8, fuse_gate=True, return_lse=False, combine_in_out_proj=False)
+    off.run()
+    on = _Case(GEOM_FLASH_NEXT, 1, (4096, 60), page=16, seed=81, split=8, fuse_gate=True, return_lse=False, combine_in_out_proj=True)  # fresh: never executed
+    on.compile()
+    assert on.blk._proj.capture_safe and on.blk._out_proj.capture_safe and on.blk._out_proj._plan.route == "jit-only"
+    on.out.fill_(float("nan"))
+    s = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        with torch.cuda.stream(s), torch.cuda.graph(graph, stream=s):
+            on.execute(stream=s.cuda_stream)  # the FIRST execute of this declaration, captured
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert torch.isnan(on.out.float()).all(), "the capture launched work"
+    for _ in range(3):
+        on.out.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(_bits(on.out), _bits(off.out)), "the replay of the captured first execute is not bitwise the kernel-combine chain"
+    on.check(what="captured combine_in_out_proj=True")
+
+
+def test_combine_in_out_proj_declaration_facts_and_declines(monkeypatch):
+    """The knob at declaration (any device, no host sync): ``True`` is served on the block-sparse decode step -- the sparse stage's combine is
+    external, the out projection carries the ``CombinePrologueSpec`` (the split, B, S_q, the heads, the gate's slab token stride), the stage
+    list is unchanged (the combine was never a stage); ``None`` reads the MEASURED default -- False everywhere while
+    ``SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS`` is empty, and with the constant patched to cc 10.7: True at ``T <= COMBINE_IN_OUT_PROJ_MAX_TOKENS``
+    on a served form, False at T 6, at split 1, with an LSE, without the gate and on another part; ``False`` explicit; at split 1 ``True`` is
+    accepted and resolves False (nothing to fold); the in-block indexer's decode step takes it; T 6 / T 8 under the explicit knob; the typed
+    declines (T 16, the LSE, the gate, the e4m3 pools, a wide weight whose out projection takes the 2x1-cluster tile, a dense geometry), each
+    the envelope's own row where the row exists; the type; the envelope's field."""
+    import dataclasses
+
+    import cudnn.gated_attention_block.api as _api
+    from cudnn.gated_attention_block import DecodeEnvelope
+    from cudnn.gated_attention_block.api import SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS, _qsa_decode_decline_texts
+    from cudnn.gated_attention_block.kernels.proj_gemm import COMBINE_IN_OUT_PROJ_MAX_TOKENS
+
+    assert SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS == () and COMBINE_IN_OUT_PROJ_MAX_TOKENS == 4
+    kw = dict(n_pages=4, fuse_gate=True, decode_split_kv=4)
+    with _no_host_sync():
+        on = _declare(GEOM_SMALL, 2, 1, **kw, combine_in_out_proj=True)[0]
+        base = _declare(GEOM_SMALL, 2, 1, **kw)[0]
+        assert on.combine_in_out_proj is True and on.combine_in_out_proj_requested is True and on.sparse_decode and on.gate_fused
+        spec = on._out_proj.combine_prologue
+        assert spec is not None and (spec.n_splits, spec.batch, spec.s_q, spec.heads, spec.d_head) == (4, 2, 1, 8, D)
+        assert spec.gate_token_stride == on.geom.n_qkvg and spec.gate_head_stride == D and spec.tokens == 2 and spec.k == 8 * D
+        assert on._sdpa.combine_external is True and base._sdpa.combine_external is False and base._out_proj.combine_prologue is None
+        assert [st.name for st in on._stages] == [st.name for st in base._stages]  # the combine was never a stage: the list is unchanged
+        assert base.combine_in_out_proj is False and base.combine_in_out_proj_requested is None
+        assert _declare(GEOM_SMALL, 2, 1, **kw, combine_in_out_proj=False)[0].combine_in_out_proj is False
+        one = _declare(GEOM_SMALL, 2, 1, n_pages=4, fuse_gate=True, decode_split_kv=1, combine_in_out_proj=True)[0]
+        assert (
+            one.combine_in_out_proj is False
+            and one.combine_in_out_proj_requested is True
+            and one._out_proj.combine_prologue is None
+            and not one._sdpa.combine_external
+        )
+        ix = _declare_indexer(GEOM_SMALL, 1, 1, fuse_gate=True, decode_split_kv=4, combine_in_out_proj=True)
+        assert ix.combine_in_out_proj is True and ix._out_proj.combine_prologue.n_splits == 4 and ix._sdpa.combine_external
+        assert _declare(GEOM_SMALL, 2, 3, **kw, combine_in_out_proj=True)[0].combine_in_out_proj is True  # T 6: the explicit knob past the AUTO threshold
+        assert _declare(GEOM_SMALL, 2, 4, **kw, combine_in_out_proj=True)[0].combine_in_out_proj is True  # T 8: the B tile's rows
+        # the declines: each row's raised text equals the envelope's
+        texts = _qsa_decode_decline_texts(base.geom, BF16)
+        kc8, vc8 = (torch.empty(4, 2, 16, D, dtype=torch.float8_e4m3fn, device=_DEV) for _ in range(2))
+        rows = {
+            "combine_in_out_proj_tokens": lambda: _declare(GEOM_SMALL, 4, 4, **kw, combine_in_out_proj=True),  # T 16
+            "combine_in_out_proj_lse": lambda: _declare(GEOM_SMALL, 1, 1, **kw, return_lse=True, combine_in_out_proj=True),
+            "combine_in_out_proj_gate": lambda: _declare(GEOM_SMALL, 1, 1, n_pages=4, fuse_gate=False, decode_split_kv=4, combine_in_out_proj=True),
+            "combine_in_out_proj_form": lambda: _declare(
+                GEOM_SMALL,
+                1,
+                1,
+                n_pages=4,
+                fuse_gate=True,
+                kv_cache_dtype=torch.float8_e4m3fn,
+                sample_k_cache=kc8,
+                sample_v_cache=vc8,
+                fuse_norm_rope=False,
+                combine_in_out_proj=True,
+            ),
+        }
+        for name, trip in rows.items():
+            with pytest.raises(NotImplementedError, match="combine_in_out_proj") as e:
+                trip()
+            assert str(e.value) == texts[name], (name, str(e.value))
+        if torch.cuda.is_available():
+            # a wide weight (d_model 8192: 128 64-row tiles): on a part whose SM count the 64-row tiles fit (204 / 212) the route pairs them in a
+            # 2x1 cluster -- the arm's tile decline; where they overflow a wave (a smaller part) the 128-row 1x1-cluster tile serves the arm.
+            # The expectation is read off the resolver `build_proj_gemm` runs, never assumed.
+            from cudnn.gemm.frost.tile_config import by_name
+            from cudnn.gated_attention_block.kernels.proj_gemm import small_m_tile_config
+
+            wide = dict(GEOM_SMALL, d_model=8192)
+            cfg = by_name(small_m_tile_config(1, 8192, 8 * D, dtype=BF16))
+            if tuple(cfg.cluster_shape) == (1, 1, 1):
+                assert _declare(wide, 1, 1, **kw, combine_in_out_proj=True)[0].combine_in_out_proj is True
+            else:
+                with pytest.raises(NotImplementedError, match="combine_in_out_proj") as e:
+                    _declare(wide, 1, 1, **kw, combine_in_out_proj=True)
+                assert str(e.value) == _qsa_decode_decline_texts(_geom(wide)[0], BF16)["combine_in_out_proj_tile"]
+        geom_dense = GatedAttentionBlockGeometry(**GEOM_SMALL, causal_bottom_right=True)
+        mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+        kc, vc = _pools(4, 2, 16, "hnd", BF16)
+        with pytest.raises(NotImplementedError, match="combine_in_out_proj.*dense geometry"):
+            GatedAttentionBlockFwd(
+                mk(1, 1, 512),
+                mk(geom_dense.n_qkvg, 512),
+                torch.ones(D, dtype=BF16, device=_DEV),
+                torch.ones(D, dtype=BF16, device=_DEV),
+                mk(1, 1, ROPE),
+                mk(1, 1, ROPE),
+                mk(512, 8 * D),
+                mk(1, 1, 512),
+                geom_dense,
+                paged_kv_page_size=16,
+                kv_source=KV_SOURCE_PAGED,
+                sample_k_cache=kc,
+                sample_v_cache=vc,
+                sample_block_table=torch.zeros(1, 4, dtype=torch.int32, device=_DEV),
+                combine_in_out_proj=True,
+            )
+        with pytest.raises(TypeError, match="combine_in_out_proj must be a bool"):
+            _declare(GEOM_SMALL, 1, 1, **kw, combine_in_out_proj=1)
+        # the AUTO reading with the constant patched to the measured part: True on a served form at T <= the threshold only
+        monkeypatch.setattr(_api, "SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS", ((10, 7),))
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 7))
+        auto = _declare(GEOM_SMALL, 2, 2, **kw)[0]  # T 4
+        assert auto.combine_in_out_proj is (torch.cuda.is_available()) and auto.combine_in_out_proj_requested is None  # the tile resolves on a CUDA host only
+        assert _declare(GEOM_SMALL, 2, 3, **kw)[0].combine_in_out_proj is False  # T 6: past the AUTO threshold, the explicit knob's domain
+        assert _declare(GEOM_SMALL, 1, 1, n_pages=4, fuse_gate=True, decode_split_kv=1)[0].combine_in_out_proj is False  # no combine at split 1
+        assert _declare(GEOM_SMALL, 1, 1, **kw, return_lse=True)[0].combine_in_out_proj is False
+        assert _declare(GEOM_SMALL, 1, 1, n_pages=4, fuse_gate=False, decode_split_kv=4)[0].combine_in_out_proj is False
+        assert _declare(GEOM_SMALL, 1, 1, **kw, combine_in_out_proj=False)[0].combine_in_out_proj is False  # explicit wins
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+        assert _declare(GEOM_SMALL, 2, 2, **kw)[0].combine_in_out_proj is False  # an unmeasured part
+        env_on = GatedAttentionBlockFwd.serving_envelope(base.geom, BF16, _DEV, device_cc=(10, 7)).decode
+        assert (
+            env_on.combine_in_out_proj_default is True
+            and GatedAttentionBlockFwd.serving_envelope(base.geom, BF16, _DEV, device_cc=(10, 0)).decode.combine_in_out_proj_default is False
+        )
+        monkeypatch.undo()
+        # the envelope today: the field False on every part (the constant is empty), the rows published verbatim, the tail append-only
+        d = GatedAttentionBlockFwd.serving_envelope(base.geom, BF16, _DEV, device_cc=_SM107).decode
+        assert d.combine_in_out_proj_default is False and all(d.declines[nm] == texts[nm] for nm in texts if nm.startswith("combine_in_out_proj"))
+        assert set(texts) >= {
+            "combine_in_out_proj_form",
+            "combine_in_out_proj_gate",
+            "combine_in_out_proj_lse",
+            "combine_in_out_proj_tokens",
+            "combine_in_out_proj_tile",
+        }
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-2:] == ["fuse_prepare_default", "combine_in_out_proj_default"]
+        dense_env = GatedAttentionBlockFwd.serving_envelope(geom_dense, BF16, _DEV, device_cc=_SM107).decode
+        assert dense_env.combine_in_out_proj_default is False and not any(nm.startswith("combine_in_out_proj") for nm in dense_env.declines)

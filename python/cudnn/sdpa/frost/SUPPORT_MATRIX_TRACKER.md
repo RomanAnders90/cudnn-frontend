@@ -3332,14 +3332,32 @@ bitwise the per-token form; `index_commit_present=True` is a follow-up (typed). 
 path (the first execute captures without a warm-up).  The carve: the caller-list band block's + five slots at the END (`ix_q`, the fp32
 logits `[T, max_pages x P / 4]`, the counts, the ids, the compressed-slot report).  The envelope publishes `index_sources`,
 `index_cache_dtypes`, `index_head_dims`, `index_kv_heads`, `index_block_sizes`, `index_top_k_range`, `index_query_rows_max` (64),
-`index_state_rows_extra` (3), `index_page_sizes` (16 / 32 / 64 / 128), `fuse_prepare_default`; `kv_cache_dtypes` narrows to `(bf16,)`
+`index_state_rows_extra` (3), `index_page_sizes` (16 / 32 / 64 / 128), `fuse_prepare_default`, `combine_in_out_proj_default`; `kv_cache_dtypes` narrows to `(bf16,)`
 under the indexer.  Typed declines by row name, the raised text EQUAL to the envelope's row: `indexer_query_rows` (`S_q x
 next_pow2(index_heads) > 64`), `indexer_page_size` (`P / 4` not a power of two), `indexer_e4m3_cache` (the paged scorer's e4m3 read arm),
 `indexer_e4m3_pool` (the sparse core's in-kernel dequant arm), `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`,
 `indexer_head_dim`, `indexer_thd`, `shared_list_rows`; `use_pdl=True` on the sparse chain keeps the existing decline (the stage threads
 the switch it is handed: `pdl_names` the kernels that would take it).  LIMITATION: no FROST writer of the paged compressed-key cache at
 PREFILL -- the prefill form writes `index_k_compressed` densely; the serving stack scatters the rows into the pages and primes the ring
-(the multi-step row does exactly that).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim;
+(the multi-step row does exactly that).  **The combine in the out projection (`combine_in_out_proj`, 2026-10-21; a performance knob of
+the block-sparse DECODE step, both forms served and BITWISE):** `True` folds the sparse core's split combine into the out-projection GEMM
+-- the GEMM's four epilogue warps form every k-tile's B tile (the gated, combined O rows) in the operand ring from the fp32 split
+partials, the LSEs and the gate with the combine kernel's arithmetic in its order (`gemm/frost/sm100/kernel_templates/sm100_matmul.py`,
+the `@@COMBINE_PROLOGUE_ONLY@@` arm: `ab_full`'s init count 1 -> 5, the TMA warp loads A only; no new SMEM / mbarrier / cluster /
+atomic; the renderings without the arm byte-identical), the sparse adapter runs `combine="external"` (no combine compiled or
+launched; `split_partials()` hands the slabs out) -- so the step's census reads 7 kernels where the kernel-combine chain reads 8
+(`B x S_q <= 4` under `fuse_prepare`; the sparse core, its partial stores, the GEMM's weight path and split-K reducer unchanged).
+Served at `B x S_q <= 8` tokens (the 8-row B tile) with `fuse_gate=True`, `return_lse=False`, bf16 / f16 pools, a split of at least 2
+(at 1 there is no combine: `True` is accepted and does nothing) where the out projection takes the small-M route's swap-AB
+1x1-cluster tile; typed declines by row name (`combine_in_out_proj_form` / `_gate` / `_lse` / `_tokens` / `_tile`, the raised text
+EQUAL to the envelope's row).  `None` is the MEASURED default: `SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS` is EMPTY until the
+end-to-end gate measures the arm against the combine kernel on an exclusive part (the AUTO reading will take it at `B x S_q <=
+COMBINE_IN_OUT_PROJ_MAX_TOKENS` = 4); `serving_envelope(...).decode.combine_in_out_proj_default` says what a part reads.  Pinned
+(`test_proj_gemm.py`, `test_block_qsa_decode.py`, `test_block_qsa_end_to_end.py`): the arm's `out` bitwise the combine kernel + the plain
+GEMM at T 1 / 4 / 6 / 8 x splits 2 / 7 / 8 / 16 x both gate layouts with dead splits and a dead row; the block's decode ladder ON == OFF
+bitwise with the 7 / 8 census by kernel name; the captured first execute; the multi-step decode ON bitwise its kernel-combine twin at
+every step; the PTX census of the arm (the init count 5 on every stage, one elected arrive site, the proxy fences, no B TMA copy, no
+`.local`, no atomic / cluster op) and the OFF renderings' byte identity.  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim;
 `test_block_qsa_decode.py`, `test_block_qsa_end_to_end.py`) against the two-stage oracle: the step's SET equals the fp64 top-k of the
 block's own `(ix_q, kbar)` up to ties (`TIE_TOL` 1e-4), every row's attention within `cos(out) > 0.999` / atol 2e-2 of the fp32 oracle fed
 the kernel's list, the ring rows bitwise the slab's raw band, the completed cache rows bitwise the compress kernel, dead rows exact.

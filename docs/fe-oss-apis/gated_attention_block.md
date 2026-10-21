@@ -75,6 +75,21 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
   `use_pdl=True` launches the fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.
   See "Serving: write-through".
+- `combine_in_out_proj=True` (the block-sparse DECODE step over the pools: `kv_source="paged"` on a `QsaSpec` geometry at `S_q <= 4`,
+  the sparse core split-KV with `fuse_gate=True`, `return_lse=False`, bf16 / f16 pools) folds the sparse core's split COMBINE into the
+  out-projection GEMM: the GEMM's four epilogue warps -- idle through its mainloop -- form every k-tile's B tile (the gated, combined O
+  rows) in the operand ring from the fp32 split partials, the per-split LSEs and the gate, with the combine kernel's own arithmetic in its
+  order, so the two forms are BITWISE and the combine launch disappears (8 -> 7 kernels per decode step at `B x S_q <= 4` under
+  `fuse_prepare`); the sparse core, its partial stores, the GEMM's weight path, its MMA and its split-K reducer are untouched.  Served at
+  `B x S_q <= 8` tokens (the 8-row B tile) where the out projection takes the small-M route's swap-AB 1x1-cluster tile (the 24 / 2 and
+  32 / 2 shards); at a split of 1 there is no combine, so `True` is accepted and does nothing.  `None` is the MEASURED default
+  (`SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS`, empty until the arm is measured against the combine kernel on an exclusive part: `None`
+  reads False everywhere today; the AUTO reading will take it at `B x S_q <= COMBINE_IN_OUT_PROJ_MAX_TOKENS` = 4, the explicit knob
+  reaches 8), `False` the combine kernel.  Typed declines naming the knob: `return_lse=True` (the arm writes no LSE), `fuse_gate=False`
+  (the gate's launch would read the O the arm never writes), more than 8 tokens, the e4m3 pools / a quantized pipeline / a prefill or
+  packed form (no split combine there), a geometry whose out projection takes another tile; `blk.combine_in_out_proj` reads back what
+  runs, `blk.combine_in_out_proj_requested` the declaration.  Under the knob the workspace O slot is never written (the out
+  projection reads the partials).  See "The combine in the out projection".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -687,6 +702,7 @@ blk = GatedAttentionBlockFwd(
     index_state_slot_mapping_present=False,   # that step: execute(index_state_slot_mapping=) names the ring's write rows (block x cap + pos % cap, -1 dead; slot_mapping's dtype) instead of the rows the kernels derive from the ring table
     index_commit_present=False,  # that step: a per-sequence commit count at execute (a follow-up: True is a typed NotImplementedError)
     rope_position_tables_only=False,   # that step under fuse_prepare=True: cos / sin REFUSED at execute; the fused launch rotates Q / K and the indexer queries from cos_pos / sin_pos at the device-derived position (the unfused twin with it is a typed decline)
+    combine_in_out_proj=None,    # the block-sparse DECODE step: WHERE the sparse core's split combine runs -- None = the MEASURED default (False on every part until the arm is measured; `serving_envelope().decode.combine_in_out_proj_default`), True = INSIDE the out-projection GEMM (its epilogue warps fold the fp32 split partials, the LSEs and the gate into the GEMM's B operand ring: no combine launch, one kernel fewer per step), False = the combine kernel; the same function, BITWISE -- "The combine in the out projection"
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -708,7 +724,7 @@ blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
 Every appended argument (`sample_w_o_sf`, `w_o_sf`, `saved_gate_copy`, the four packing knobs `thd` / `num_sequences` /
 `max_seq_len` / `cu_seqlens`, the serving attributes `paged_kv_page_size` / `kv_source` / `token_capacity` / `kv_cache_dtype` with their samples, the DECODE
 form's `max_kv_len` / `decode_split_kv`, the knob `fuse_prepare`, the execute inputs, `num_tokens_live`, `k_scale` / `v_scale`, the indexer's five
-execute inputs and -- last, 2026-10-21 -- the decode indexer's three samples + three flags and its seven execute inputs) sits at the end with a default,
+execute inputs, the decode indexer's three samples + three flags and its seven execute inputs and -- last, 2026-10-21 -- the knob `combine_in_out_proj`) sits at the end with a default,
 so positional callers of the bf16, FP8 and MXFP8 pipelines are unchanged; `MxQuantSpec.o_fp4` and `sample_w_o_sf` must be given
 together (a typed `ValueError` names the missing half), and `num_sequences` / `max_seq_len` / `cu_seqlens` are refused without
 `thd=True`.

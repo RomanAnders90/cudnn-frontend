@@ -665,6 +665,16 @@ cache write, the pool-1 query norm, the paged compress step), bitwise.  EMPTY un
 on an exclusive part (the measured-default rule: a default ships with its table, in the change that measures it); until then ``None``
 reads False -- the unfused twin -- and an explicit ``fuse_prepare=True`` is served.  Every other form keeps ``None`` = False."""
 
+SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS: Tuple[Tuple[int, int], ...] = ()
+"""The parts on which the AUTO reading of ``combine_in_out_proj`` (``None``, the default) resolves True on the block-sparse DECODE step
+(``kv_source="paged"`` on a ``QsaSpec`` geometry at ``S_q <= 4``: the sparse core split-KV with ``fuse_gate=True`` and no LSE output): the
+sparse core's split combine formed INSIDE the out-projection GEMM's B operand ring by its epilogue warps (``kernels/proj_gemm.py``
+``combine_prologue``; the combine kernel is not launched -- one launch fewer per decode step) -- the same function, BITWISE.  EMPTY until
+the arm is measured against the kernel combine on an exclusive part (the measured-default rule: a default ships with its table, in the
+change that measures it); until then ``None`` reads False -- the combine kernel -- and an explicit ``combine_in_out_proj=True`` is served
+wherever the arm is (``_check_combine_in_out_proj_declaration``).  The AUTO reading's token threshold is
+``kernels.proj_gemm.COMBINE_IN_OUT_PROJ_MAX_TOKENS`` (the explicit knob reaches the B tile's 8 rows)."""
+
 CACHE_WRITE_SMALL_M_DEFAULT_MAX_ROWS = 128
 """The AUTO reading of ``fuse_cache_write_small_m`` (``None``, the default) folds the paged K / V write-through into the norm + RoPE
 launch (``kernels/qk_norm_rope_tma.py``'s pool-write arm: one launch fewer, the pools bitwise the separate write) wherever the arm is
@@ -1022,6 +1032,11 @@ class DecodeEnvelope:
     index_state_rows_extra: int = 0
     index_page_sizes: Tuple[int, ...] = ()
     fuse_prepare_default: bool = False
+    # appended (2026-10-21): the AUTO reading of ``combine_in_out_proj`` on THIS part for a served block-sparse decode form -- True on the parts
+    # of :data:`SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS` when ``served`` and ``sparse_core``, False everywhere else.  A FORM-level reading: the
+    # per-step one is this AND the step's tokens ``B x S_q <= COMBINE_IN_OUT_PROJ_MAX_TOKENS``, a split of at least 2, ``fuse_gate=True``, no LSE
+    # output and the out projection on the small-M route's swap-AB 8-row tile (``_combine_in_out_proj_default``); an explicit value outranks it.
+    combine_in_out_proj_default: bool = False
 
 
 @dataclass(frozen=True)
@@ -3048,12 +3063,17 @@ class _Projection(_Stage):
         w_dtype: Optional[torch.dtype] = None,
         block_size: int = MXFP8_BLOCK_SIZE,
         sf_dtype=None,
+        combine_prologue=None,
     ) -> None:
         self.name = name
         self.m = int(m)
         self.k = int(k)
         self.n = int(n)
         self.dtype = dtype
+        # combine_in_out_proj (append-only, default None = the plain GEMM): the `CombinePrologueSpec` the JIT renders the combine prologue with --
+        # the B operand (the tokens) formed in the operand ring from a split-KV step's fp32 partial O / LSE slabs and the gate (the combine
+        # kernel's arithmetic, bitwise), so the step's combine launch disappears; `execute(o_partial=, lse_partial=, gate=)` feeds it.
+        self.combine_prologue = combine_prologue
         # FP8: inputs e4m3, fp32 accumulate, `out_dtype` (bf16) out, and `alpha`
         # = descale_a * descale_w folded into the GEMM's scalar-multiply epilogue.
         self.out_dtype = out_dtype if out_dtype is not None else dtype
@@ -3131,6 +3151,7 @@ class _Projection(_Stage):
             block_size=self.block_size,
             # capture_safe: the serving declaration's flag (default off); a capture-safe block sets it on both projection stages before compile()
             capture_safe=bool(getattr(self, "capture_safe", False)),
+            combine_prologue=self.combine_prologue,
         )
 
     def workspace_bytes(self) -> int:
@@ -3156,11 +3177,16 @@ class _Projection(_Stage):
         sf_w: Optional[torch.Tensor] = None,
         *,
         stream=None,
+        o_partial: Optional[torch.Tensor] = None,
+        lse_partial: Optional[torch.Tensor] = None,
+        gate: Optional[torch.Tensor] = None,
     ) -> None:
         """``sf_a`` / ``sf_w`` (block-scale plans only, both required): the PADDED
         F8_128x4 E8M0 blobs of ``a`` (over its M rows) and ``w`` (over its N rows).
         ``stream`` is the block's launch stream (a raw ``CUstream`` int); the
-        runner carries it onto both GEMM routes -- see ``run_proj_gemm`` (Rule 5)."""
+        runner carries it onto both GEMM routes -- see ``run_proj_gemm`` (Rule 5).
+        ``o_partial`` / ``lse_partial`` / ``gate`` (a combine-prologue projection only, all three required there, refused otherwise): the
+        split-KV step's fp32 partial slabs and the gate the GEMM forms its B operand from; ``a`` is then the never-read token-count carrier."""
         from .kernels.proj_gemm import run_proj_gemm
 
         if self._plan is None:
@@ -3169,7 +3195,9 @@ class _Projection(_Stage):
             raise ValueError(f"{self.name}: block_scale=True needs both scale-factor blobs (sf_a=, sf_w=); no silent unit scale (Rule 1)")
         if not self.block_scale and (sf_a is not None or sf_w is not None):
             raise ValueError(f"{self.name}: this projection has no block-scale dequant; refusing to drop sf_a / sf_w silently")
-        run_proj_gemm(self._plan, a, w, out, workspace, handle, alpha=alpha, sf_a=sf_a, sf_w=sf_w, stream=stream)
+        run_proj_gemm(
+            self._plan, a, w, out, workspace, handle, alpha=alpha, sf_a=sf_a, sf_w=sf_w, stream=stream, o_partial=o_partial, lse_partial=lse_partial, gate=gate
+        )
 
 
 def _qkv_gate_projection(
@@ -3211,10 +3239,13 @@ def _out_projection(
     w_dtype: Optional[torch.dtype] = None,
     block_size: int = MXFP8_BLOCK_SIZE,
     sf_dtype=None,
+    combine_prologue=None,
 ) -> _Projection:
     """Stage (6). At the 397B full-attention layer: ``M x 4096 x 8192``.  ``block_scale`` + the fp4
     trio (``dtype=w_dtype=torch.float4_e2m1fn_x2``, ``block_size`` 16 | 32, ``sf_dtype`` E4M3 | E8M0)
-    is the fp4 gated-O x fp4 ``W_o`` projection; the defaults are the per-tensor / bf16 path as before."""
+    is the fp4 gated-O x fp4 ``W_o`` projection; the defaults are the per-tensor / bf16 path as before.
+    ``combine_prologue`` (appended; a ``CombinePrologueSpec``, None = the plain GEMM) is the block-sparse decode step's
+    ``combine_in_out_proj`` arm: the GEMM forms its B operand from the sparse core's split partials and the gate."""
     return _Projection(
         m=batch * seq_len,
         k=geom.h_q * geom.d_head,
@@ -3227,6 +3258,7 @@ def _out_projection(
         w_dtype=w_dtype,
         block_size=block_size,
         sf_dtype=sf_dtype,
+        combine_prologue=combine_prologue,
     )
 
 
@@ -5422,6 +5454,10 @@ class _SparseSdpa(_Stage):
         block_table_desc: Optional[TensorDesc] = None,  # kv_source="paged": the (B, max_pages) int32 block table's descriptor (contiguous)
         list_per_sequence: bool = False,  # kv_source="paged": block_ids [B, top_k] shared by the sequence's S_q <= 4 rows (else [T, top_k])
         split_kv: int = 1,  # kv_source="paged": the KV split (fp32 partials in the engine workspace arm + the combine); 1 = unsplit
+        # APPENDED (combine_in_out_proj): the split's combine is EXTERNAL -- the adapter compiles and launches no combine; the fp32 partial slabs
+        # stay in the engine workspace for the out projection's B-operand prologue (`split_partials` hands them out).  Needs the paged decode form
+        # with a split and the gate fused, no LSE (the block's rows decline the rest by name; these checks keep the stage honest on its own).
+        combine_external: bool = False,
     ) -> None:
         if geometry.qsa is None:
             raise ValueError(f"{self.name}: the geometry declares no QsaSpec (geometry.qsa is None); the dense stage serves it")
@@ -5472,6 +5508,12 @@ class _SparseSdpa(_Stage):
         self.k_cache_desc, self.v_cache_desc, self.block_table_desc = k_cache_desc, v_cache_desc, block_table_desc
         self.list_per_sequence = bool(list_per_sequence)
         self.split_kv = int(split_kv)
+        self.combine_external = bool(combine_external)
+        if self.combine_external and not (self.paged and self.split_kv > 1 and self.fuse_gate and not self.want_lse):
+            raise ValueError(
+                f"{self.name}: combine_external=True (combine_in_out_proj) needs the paged decode form with split_kv >= 2, fuse_gate=True and want_lse=False; "
+                f"got paged={self.paged}, split_kv={self.split_kv}, fuse_gate={self.fuse_gate}, want_lse={self.want_lse}"
+            )
         if self.paged:
             rec = self._record()
             if self.paged_page_size <= 0 or k_cache_desc is None or v_cache_desc is None or block_table_desc is None:
@@ -5605,6 +5647,8 @@ class _SparseSdpa(_Stage):
             block_table=ops["block_table"],
             list_per_sequence=self.list_per_sequence,
             split_kv=self.split_kv,
+            # combine_in_out_proj: no combine compiled or launched; the partial slabs stay in the workspace for the out projection
+            combine="external" if self.combine_external else "kernel",
         )
         self._impl.check_support()
 
@@ -5624,6 +5668,14 @@ class _SparseSdpa(_Stage):
         if self._impl is None:
             raise RuntimeError(f"{self.name}: call check_support() before scratch_workspace_bytes()")
         return int(self._impl.scratch_workspace_bytes())
+
+    def split_partials(self, workspace: torch.Tensor):
+        """The fp32 split partials the last execute left in the engine workspace -- the O partials ``(B x S, S_q, H_q, D)`` and the LSE
+        partials ``(B x S, H_q, S_q)``, split-major -- as views (the adapter's ``split_partials``; no copy): what the out projection folds
+        under ``combine_in_out_proj``."""
+        if self._impl is None:
+            raise RuntimeError(f"{self.name}: call check_support() before split_partials()")
+        return self._impl.split_partials(workspace)
 
     def _declared_strides(self, t: Optional[torch.Tensor], name: str) -> Optional[torch.Tensor]:
         """The bound view re-strided on its UNIT dims to the declared strides -- an exact view of the same storage (a unit dim's
@@ -7716,7 +7768,33 @@ def _qsa_decode_decline_texts(geometry: GatedAttentionBlockGeometry, dtype: torc
     cap = int(_sparse_record().index_shared_list_max_tokens)
     h_i, d_i = int(q.index_heads), int(q.index_head_dim)
     max_s_q = MAX_QUERY_ROWS // padded_heads(h_i)
+    from .kernels.proj_gemm import COMBINE_IN_OUT_PROJ_MAX_TOKENS
+    from cudnn.gemm.frost.fusion_ir import COMBINE_PROLOGUE_MAX_TOKENS
+
     return {
+        # the combine-in-the-out-projection knob (combine_in_out_proj; 2026-10-21): every row carries the knob's name
+        "combine_in_out_proj_form": (
+            "combine_in_out_proj=True needs the block-sparse DECODE step over the pools (kv_source='paged' on a QsaSpec geometry at S_q <= 4, bf16 / f16 "
+            "activations and pools): its sparse core's split combine is what the out projection folds into its B operand; this declaration has no such "
+            "combine (a prefill form, the packed form, the e4m3 pools or a quantized pipeline) -- pass combine_in_out_proj=None or False"
+        ),
+        "combine_in_out_proj_gate": (
+            "combine_in_out_proj=True needs fuse_gate=True: the gate rides the split combine, which the out projection folds into its B operand ring; "
+            "the gate's own launch (fuse_gate=False) would read the bf16 O the arm never writes -- declare fuse_gate=True or combine_in_out_proj=False"
+        ),
+        "combine_in_out_proj_lse": (
+            "combine_in_out_proj=True with return_lse=True: the out projection's B-operand prologue writes no LSE (the combine kernel does) -- declare "
+            "return_lse=False or combine_in_out_proj=False"
+        ),
+        "combine_in_out_proj_tokens": (
+            f"combine_in_out_proj=True serves steps of at most {COMBINE_PROLOGUE_MAX_TOKENS} tokens (B x S_q: the 8-row B tile the out projection's prologue "
+            f"forms; the AUTO reading takes it up to {COMBINE_IN_OUT_PROJ_MAX_TOKENS}); a wider step keeps the combine kernel -- pass combine_in_out_proj=None "
+            "or False"
+        ),
+        "combine_in_out_proj_tile": (
+            "combine_in_out_proj=True needs the out projection on the small-M route's swap-AB 1x1-cluster tile with an 8-row token tile (the 128x8 / 64x8 "
+            "swap-AB configs); at this geometry on this part the route resolves another tile -- pass combine_in_out_proj=None or False"
+        ),
         "shared_list_rows": (
             f"QsaSpec(index_list_form='shared') past {cap} rows per sequence: the shared per-sequence list is anchored at the step-0 position and "
             f"its tail covers at most two blocks (S_q <= {cap}); declare index_list_form='per_row' (one list per row, [B, S_q, top_k])"
@@ -8197,6 +8275,17 @@ class GatedAttentionBlockFwd(APIBase):
         index_state_slot_mapping_present: bool = False,
         index_commit_present: bool = False,
         rope_position_tables_only: bool = False,
+        # APPENDED (2026-10-21; the block-sparse DECODE step; performance-only): WHERE the sparse core's split combine runs.  None = AUTO, the
+        # MEASURED default (SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS, empty until the gate; `serving_envelope().decode.combine_in_out_proj_default`
+        # says what it reads on a part), False everywhere else; True = INSIDE the out-projection GEMM: its epilogue warps fold the fp32 split
+        # partials, the LSEs and the gate into the GEMM's B operand ring (kernels/proj_gemm.py `combine_prologue`), the combine kernel is not
+        # launched (one kernel fewer per step), the workspace O slot is never written; False = the combine kernel (the chain as before).  The
+        # same function, BITWISE (the arm runs the combine kernel's arithmetic in its order).  Served on the block-sparse decode mode with a
+        # split of at least 2 (at split 1 there is no combine: True is accepted and resolves False), fuse_gate=True, return_lse=False, bf16 /
+        # f16 activations and pools, B x S_q <= 8 tokens (<= 4 under AUTO), where the out projection resolves the small-M route's swap-AB 8-row
+        # tile; everything else is a typed decline naming the knob (the envelope's `combine_in_out_proj_*` rows).
+        # `combine_in_out_proj_requested` keeps the declaration, `combine_in_out_proj` what runs.
+        combine_in_out_proj: Optional[bool] = None,
     ):
         """Validate the declaration -- the dtype / ``quant`` / scale-blob halves, the fusion and save-mode knobs against
         ``save_for_backward``, the THD envelope, the paged-cache write-through -- normalise the samples, record the knobs and
@@ -8559,6 +8648,12 @@ class GatedAttentionBlockFwd(APIBase):
         if self.rope_position_tables_only and not self.fuse_prepare:
             # the position-table arm is the fused launch's: the unfused twin's pool-1 query norm reads per-token rows
             raise NotImplementedError(_qsa_decode_decline_texts(geometry, self.act_dtype)["fuse_prepare_rope_tables_unfused"])
+        # THE COMBINE IN THE OUT PROJECTION (combine_in_out_proj): a performance knob of the block-sparse DECODE step -- the sparse core's split
+        # combine formed inside the out-projection GEMM instead of its own launch, bitwise.  None = the MEASURED default
+        # (`_combine_in_out_proj_default`); the arm's own rows (the form, the gate, the LSE, the token count, the tile), typed and naming the
+        # knob; `combine_in_out_proj_requested` keeps the declaration, `combine_in_out_proj` what runs (False at split 1: nothing to fold).
+        self.combine_in_out_proj_requested: Optional[bool] = combine_in_out_proj
+        self.combine_in_out_proj: bool = self._check_combine_in_out_proj_declaration(combine_in_out_proj)
         self._descs = {
             "w_qkvg": self._make_tensor_desc(sample_w_qkvg, name="w_qkvg"),
             "w_q_norm": self._make_tensor_desc(sample_w_q_norm, name="w_q_norm"),
@@ -8745,6 +8840,8 @@ class GatedAttentionBlockFwd(APIBase):
                 block_table_desc=self._descs["block_table"] if self.sparse_decode else None,
                 list_per_sequence=self.qsa_shared_list,
                 split_kv=self.decode_split_kv if self.sparse_decode else 1,
+                # combine_in_out_proj: the sparse core's partials stay in the engine workspace for the out projection (no combine launch)
+                combine_external=self.combine_in_out_proj,
             )
         else:
             # The DECODE form's PREFILL route: stage (4) is the EXTEND form's binding -- the adapter's paged THD leg with the group packed
@@ -8907,7 +9004,17 @@ class GatedAttentionBlockFwd(APIBase):
                 self._quant_o = _Quantize(geometry, batch=self.batch, seq_len=self.seq_len, dtype_in=act, heads=geometry.h_q, name="quantize_o")
             else:
                 self._quant_o = self._quant_q
-            self._out_proj = _out_projection(geometry, batch=self.batch, seq_len=self.seq_len, dtype=self.dtype, out_dtype=act, alpha=fp8)
+            self._out_proj = _out_projection(
+                geometry,
+                batch=self.batch,
+                seq_len=self.seq_len,
+                dtype=self.dtype,
+                out_dtype=act,
+                alpha=fp8,
+                # combine_in_out_proj: the GEMM forms its B operand from the sparse core's split partials + LSEs and the gate (the slab's GATE band
+                # at its token stride) -- the record carries the step's plan-time facts; None = the plain GEMM over the gated O
+                combine_prologue=self._combine_prologue_spec(sdpa_gate_token_stride),
+            )
         # The SERVING declaration (kv_source="paged") is captured by a serving stack with vLLM's defaults -- the FIRST execute
         # of a fresh declaration inside a CUDA-graph capture on a new stream, no eager warm-up -- so both dense projection
         # stages are declared capture-safe here.  The flag is consumed by the projection GEMM driver's capture-safe route
@@ -9565,6 +9672,101 @@ class GatedAttentionBlockFwd(APIBase):
                     "cache's write-through QUANTIZES (two per-tensor casts + the bit copy through the pools' bf16 views) -- declare fuse_cache_write=False (or None)"
                 )
         return fuse_cache_write
+
+    def _out_proj_takes_the_combine_prologue(self) -> bool:
+        """Whether the out projection of THIS declaration resolves, on this part, to a tile the combine prologue serves: the small-M route's
+        swap-AB 1-CTA-MMA cluster-1x1 config with an 8-row token tile (``kernels.proj_gemm.small_m_tile_config`` at ``T = B x S_q`` tokens over
+        ``N = d_model``, ``K = h_q x d_head``; a host query of the device's SM count, no sync -- the same resolver ``build_proj_gemm`` runs)."""
+        from cudnn.gemm.frost.tile_config import by_name
+
+        from .kernels.proj_gemm import small_m_tile_config
+
+        g = self.geom
+        if self.act_dtype not in (torch.bfloat16, torch.float16):
+            return False
+        try:
+            name = small_m_tile_config(self.batch * self.seq_len, g.d_model, g.h_q * g.d_head, dtype=self.act_dtype)
+        except NotImplementedError:  # no CUDA device to read the SM count from: the route resolves nothing here
+            return False
+        if name is None:
+            return False
+        cfg = by_name(name)
+        return bool(cfg.swap_ab and cfg.cta_tile_n == 8 and tuple(cfg.cluster_shape) == (1, 1, 1) and cfg.ctas_per_mma == 1)
+
+    def _combine_in_out_proj_default(self) -> bool:
+        """The AUTO reading of ``combine_in_out_proj`` (None): True iff the sample's device is one of :data:`SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS`
+        (EMPTY until the arm is measured on an exclusive part) AND this is a block-sparse DECODE step the arm serves -- the sparse core
+        split-KV (at least 2) with the gate fused and no LSE output, bf16 / f16 pools, at most ``COMBINE_IN_OUT_PROJ_MAX_TOKENS`` tokens (the
+        measured threshold), the out projection on the small-M route's swap-AB 8-row tile; False everywhere else.  Never True where an
+        explicit True is declined."""
+        from .kernels.proj_gemm import COMBINE_IN_OUT_PROJ_MAX_TOKENS
+
+        return bool(
+            _device_cc_of(self.device) in SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS
+            and self.sparse_decode
+            and not self.kv_cache_e4m3
+            and not self.upcast_decode
+            and not self.thd
+            and self.fuse_gate
+            and not self.return_lse
+            and self.decode_split_kv >= 2
+            and self.batch * self.seq_len <= COMBINE_IN_OUT_PROJ_MAX_TOKENS
+            and self._out_proj_takes_the_combine_prologue()
+        )
+
+    def _check_combine_in_out_proj_declaration(self, combine_in_out_proj) -> bool:
+        """``combine_in_out_proj`` at declaration: ``None`` (the measured default, :meth:`_combine_in_out_proj_default`), ``True`` or ``False``
+        (``TypeError`` otherwise).  ``True`` needs the block-sparse DECODE step over bf16 / f16 pools (``combine_in_out_proj_form``),
+        ``fuse_gate=True`` (``_gate``), ``return_lse=False`` (``_lse``), at most 8 tokens (``_tokens``) and the out projection on the small-M
+        route's swap-AB 8-row tile (``_tile``) -- each a ``NotImplementedError`` with the envelope's own text; at split 1 there is no combine, so
+        ``True`` is accepted and resolves False.  A performance knob: whatever it returns, the block computes the same function."""
+        if combine_in_out_proj is not None and not isinstance(combine_in_out_proj, bool):
+            raise TypeError(
+                f"combine_in_out_proj must be a bool (the combine-in-the-out-projection knob) or None (the measured default), got {type(combine_in_out_proj).__name__}"
+            )
+        if combine_in_out_proj is None:
+            return self._combine_in_out_proj_default()
+        if not combine_in_out_proj:
+            return False
+        from cudnn.gemm.frost.fusion_ir import COMBINE_PROLOGUE_MAX_TOKENS
+
+        if self.qsa is None:
+            raise NotImplementedError(
+                "combine_in_out_proj=True needs the block-sparse DECODE step over the pools (kv_source='paged' on a QsaSpec geometry at S_q <= 4): its "
+                "sparse core's split combine is what the out projection folds into its B operand; a dense geometry has no such combine -- pass "
+                "combine_in_out_proj=None or False"
+            )
+        texts = _qsa_decode_decline_texts(self.geom, self.act_dtype)
+        if not self.sparse_decode or self.kv_cache_e4m3 or self.upcast_decode or self.thd or self.act_dtype not in (torch.bfloat16, torch.float16):
+            raise NotImplementedError(texts["combine_in_out_proj_form"])
+        if not self.fuse_gate:
+            raise NotImplementedError(texts["combine_in_out_proj_gate"])
+        if self.return_lse:
+            raise NotImplementedError(texts["combine_in_out_proj_lse"])
+        if self.batch * self.seq_len > COMBINE_PROLOGUE_MAX_TOKENS:
+            raise NotImplementedError(texts["combine_in_out_proj_tokens"])
+        if not self._out_proj_takes_the_combine_prologue():
+            raise NotImplementedError(texts["combine_in_out_proj_tile"])
+        return self.decode_split_kv >= 2  # at split 1 the core writes O directly: nothing to fold (accepted, no-op)
+
+    def _combine_prologue_spec(self, gate_token_stride: int):
+        """The :class:`cudnn.gemm.frost.fusion_ir.CombinePrologueSpec` the out projection is built with under ``combine_in_out_proj`` (None
+        otherwise): the step's split count, batch, ``S_q``, heads, ``d_head`` and the gate's strides (the slab's GATE band at the token stride
+        the sparse stage reads it at; the head stride ``d_head``)."""
+        if not self.combine_in_out_proj:
+            return None
+        from cudnn.gemm.frost.fusion_ir import CombinePrologueSpec
+
+        g = self.geom
+        return CombinePrologueSpec(
+            n_splits=int(self.decode_split_kv),
+            batch=self.batch,
+            s_q=self.seq_len,
+            heads=g.h_q,
+            d_head=g.d_head,
+            gate_token_stride=int(gate_token_stride),
+            gate_head_stride=g.d_head,
+        )
 
     def _fuse_prepare_default(self) -> bool:
         """The AUTO reading of ``fuse_prepare`` (None): True iff this is the in-block indexer's DECODE step over the pools (the form the
@@ -10235,6 +10437,9 @@ class GatedAttentionBlockFwd(APIBase):
             index_list_forms=((QSA_INDEX_LIST_FORM_PER_ROW,) if indexer else (QSA_INDEX_LIST_FORM_SHARED, QSA_INDEX_LIST_FORM_PER_ROW)) if sparse else (),
             index_list_form_default=(QSA_INDEX_LIST_FORM_PER_ROW if indexer else QSA_INDEX_LIST_FORM_SHARED) if sparse else "",
             **cls._indexer_envelope_fields(geometry, dtype, cc, decode_reason is None),
+            # the AUTO reading of combine_in_out_proj on this part for a served block-sparse decode form (the measured default; empty until the
+            # gate) -- the FORM-level reading, the per-step one adds the step's tokens / split / gate / LSE / tile (`_combine_in_out_proj_default`)
+            combine_in_out_proj_default=(decode_reason is None) and sparse and cc in SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS,
         )
         forms = tuple(nm for nm, env in (("extend", extend), ("decode", decode)) if env.served)
         return ServingEnvelope(
@@ -11556,6 +11761,24 @@ class GatedAttentionBlockFwd(APIBase):
             # descale_w_o into its epilogue.
             self._quant_o.execute(o_gated, o8, qd["scale_o"], current_stream=stream)
             self._out_proj.execute(o8.view(t, g.h_q * g.d_head), w_o, out.view(t, g.d_model), engine_ws, alpha=qd["alpha_o"], stream=stream)
+        elif self.combine_in_out_proj:
+            # (6) under combine_in_out_proj: the out projection forms its B operand from the sparse core's fp32 split partials + LSEs (left in the
+            # engine workspace: stage (4) launched no combine) and the gate; the O slot is handed as the launch's never-read token-count carrier.
+            if rows != t:
+                raise RuntimeError(
+                    f"combine_in_out_proj: the step's live rows ({rows}) differ from the declared tokens ({t}); the partial slabs are indexed by the declaration"
+                )
+            o_partial, lse_partial = self._sdpa.split_partials(engine_ws)
+            self._out_proj.execute(
+                o_gated.view(t, g.h_q * g.d_head),
+                w_o,
+                out_live,
+                engine_ws,
+                stream=stream,
+                o_partial=o_partial,
+                lse_partial=lse_partial,
+                gate=gate_src.view(self.batch, self.seq_len, g.h_q, g.d_head),
+            )
         else:
             # (6) -- reads the gated O: the workspace `o` (inference) or `o_gated` (training); the live rows under num_tokens_live.
             self._out_proj.execute(o_gated[:rows].view(rows, g.h_q * g.d_head), w_o, out_live, engine_ws, stream=stream)

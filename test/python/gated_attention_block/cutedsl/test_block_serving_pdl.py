@@ -657,3 +657,20 @@ def test_detector_turns_red_when_the_combine_launches_with_the_attribute_but_doe
         monkeypatch.undo()
         retrace(split_combine.compile_ptr)
         compiled_cache.clear_memo()
+
+
+def test_combine_in_out_proj_leaves_the_sparse_chains_switch_readback_unchanged():
+    """The combine-in-the-out-projection knob of the block-sparse decode step and the PDL switch answer for different things: with the
+    knob ON the switch's AUTO reading stays False with no stage switched (the GEMM's own programmatic sites are the template's, neither
+    listed nor counted), and an explicit ``use_pdl=True`` keeps the sparse chain's typed decline on both knob readings."""
+    import test_block_qsa_decode as _qsa
+
+    off = lambda blk: blk.use_pdl is False and blk.use_pdl_requested is None and blk.pdl_stages == () and blk.use_pdl_effective is False  # noqa: E731
+    kw = dict(n_pages=4, fuse_gate=True, decode_split_kv=4)
+    arm = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, **kw, combine_in_out_proj=True)[0]
+    plain = _qsa._declare(_qsa.GEOM_SMALL, 2, 1, **kw, combine_in_out_proj=False)[0]
+    assert off(arm) and off(plain) and arm.combine_in_out_proj is True and plain.combine_in_out_proj is False
+    assert not hasattr(arm._sdpa, "use_pdl") and not hasattr(arm._out_proj, "use_pdl")  # neither the sparse core nor the GEMM is a switched stage
+    for knob in (True, False):
+        with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
+            _qsa._declare(_qsa.GEOM_SMALL, 2, 1, **kw, combine_in_out_proj=knob, use_pdl=True)

@@ -353,7 +353,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     import dataclasses
 
     from cudnn.gated_attention_block import DecodeEnvelope
-    from cudnn.gated_attention_block.api import SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _qsa_decode_decline_texts
+    from cudnn.gated_attention_block.api import SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS, SPARSE_INDEXER_FUSE_PREPARE_DEFAULT_CCS, _qsa_decode_decline_texts
 
     tokens = {
         "shared_list_rows": "tail covers at most two blocks",
@@ -370,7 +370,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
     for dtype in (torch.bfloat16, torch.float16):
         texts = _qsa_decode_decline_texts(geom, dtype)
-        assert set(texts) == set(tokens) and all(tok in texts[nm] for nm, tok in tokens.items())
+        assert set(tokens) <= set(texts) and all(tok in texts[nm] for nm, tok in tokens.items())  # + the combine_in_out_proj rows (below)
         d = GatedAttentionBlockFwd.serving_envelope(geom, dtype, _DEV, device_cc=(10, 7)).decode
         assert all(d.declines[nm] == texts[nm] for nm in texts), "a decline row reaches the envelope reworded"
         assert d.index_sources == (("caller", "indexer") if dtype == torch.bfloat16 else ("caller",))
@@ -381,13 +381,24 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
             (10, 7),
         )  # the measured part; f16: not served
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row"
+        # the combine-in-the-out-projection knob (2026-10-21): its rows published, its AUTO reading False until measured (the constant is empty)
+        assert {
+            "combine_in_out_proj_form",
+            "combine_in_out_proj_gate",
+            "combine_in_out_proj_lse",
+            "combine_in_out_proj_tokens",
+            "combine_in_out_proj_tile",
+        } <= set(d.declines)
+        assert all("combine_in_out_proj" in d.declines[nm] for nm in d.declines if nm.startswith("combine_in_out_proj"))
+        assert d.combine_in_out_proj_default is False and SPARSE_COMBINE_IN_OUT_PROJ_DEFAULT_CCS == ()
     dense = GatedAttentionBlockFwd.serving_envelope(
         GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True), torch.bfloat16, _DEV, device_cc=(10, 7)
     ).decode
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
+    assert dense.combine_in_out_proj_default is False and not any(nm.startswith("combine_in_out_proj") for nm in dense.declines)
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-10:] == [
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-11:] == [
         "index_sources",
         "index_cache_dtypes",
         "index_head_dims",
@@ -398,6 +409,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "index_state_rows_extra",
         "index_page_sizes",
         "fuse_prepare_default",
+        "combine_in_out_proj_default",
     ]
 
 

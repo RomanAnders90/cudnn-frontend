@@ -65,7 +65,11 @@ chain partials with ``exp(m_c - m)`` factors; the final O rounds once either way
 pinned value back.  ``use_pdl`` (appended, default False) names the programmatic-dependent-launch form of the chain's two launches; the
 record declines ``True`` by name on this tree (:meth:`SparseGqaFwdDslSm107.check_support`: the sparse core carries no
 ``griddepcontrol`` site yet), while the flag already reaches the combine's entry (``compile_ptr(use_pdl=)``) so the commit that lands
-the sites lifts the decline alone.
+the sites lifts the decline alone.  ``combine`` (appended 2026-10-21, ``"kernel"`` by default) names the combine's FORM OF DELIVERY:
+``"external"`` compiles and launches NO combine -- the fp32 partial slabs stay in the caller's workspace at :meth:`SparseGqaFwdDslSm107.
+_split_workspace_layout` for a consumer that folds them itself (:meth:`SparseGqaFwdDslSm107.split_partials` hands them out as views; the
+gated attention block's out projection under ``combine_in_out_proj`` forms its B operand from them with this combine's arithmetic,
+bitwise); it needs a split and no LSE output (the external consumer writes none) and is a typed decline otherwise.
 
 The device does the work (Rule 3): lengths, counts, dead items and the tail block(s) are derived on device from the position
 and the per-row ``block_lens``; nothing below reads device memory.  ``execute`` validates and launches (Rule 1): no
@@ -115,6 +119,7 @@ _BLOCK_SIZE = 4
 _D = 256
 _GQA_GROUP_MAX = 16
 _INT32_MAX = 2**31 - 1
+COMBINE_FORMS = ("kernel", "external")  # where a split's combine happens: this adapter's second launch, or an external consumer of the partial slabs
 
 
 @dataclass(frozen=True)
@@ -365,8 +370,17 @@ class SparseGqaFwdDslSm107:
         workspace=None,
         softmax_groups: int = 0,
         use_pdl: bool = False,
+        combine: str = "kernel",
     ):
         self.q, self.k, self.v, self.o, self.lse = q, k, v, o, lse
+        # The split combine's FORM OF DELIVERY (appended 2026-10-21; a PERFORMANCE choice of the caller that owns the partials): "kernel" = this
+        # adapter's second launch (the combine entry, as before); "external" = NO combine compiled or launched -- the fp32 partial slabs stay in
+        # the workspace at `_split_workspace_layout()` for a consumer that folds them itself (`split_partials()` hands them out; the gated
+        # attention block's out projection under `combine_in_out_proj` forms its B operand from them with this combine's arithmetic, bitwise).
+        # Needs a split and no LSE output (check_support: the external consumer writes no LSE).
+        if combine not in COMBINE_FORMS:
+            raise ValueError(f"sparse d256 forward (sm107): combine must be one of {COMBINE_FORMS}, got {combine!r}")
+        self.combine = combine
         # Programmatic dependent launch (appended 2026-10-21; a PERFORMANCE knob of the chain's two launches -- the same function, bitwise):
         # the launch attribute plus the griddepcontrol pair in every kernel it reaches.  The flag is threaded to the split combine's entry
         # (compile_ptr(use_pdl=), whose every form carries the pair); the sparse core itself carries no site on this tree, so check_support
@@ -500,6 +514,17 @@ class SparseGqaFwdDslSm107:
                 "on a tile whose wait is removed); the split combine's entry already takes the switch, so the commit that lands the sites in "
                 "kernels/sm107/sparse_d256_f16.py lifts this decline alone -- declare use_pdl=False"
             )
+        if self.combine == "external":
+            if self.split_kv <= 1:
+                raise ValueError(
+                    "sparse d256 forward (sm107): combine='external' hands the fp32 split partials to an external consumer, and split_kv=1 writes no "
+                    "partials (the kernel writes O directly) -- declare split_kv >= 2 or combine='kernel'"
+                )
+            if self.lse is not None:
+                raise NotImplementedError(
+                    "sparse d256 forward (sm107): combine='external' with an LSE output: the external combine (the gated attention block's out-projection "
+                    "prologue, combine_in_out_proj) writes no LSE -- declare lse=None or combine='kernel'"
+                )
         if self.thd:
             for name, requested in (("split_kv", self.split_kv > 1), ("list_per_sequence", self.list_per_sequence), ("bottom_right", self.bottom_right)):
                 if requested:
@@ -789,6 +814,28 @@ class SparseGqaFwdDslSm107:
             return self._thd_meta_bytes(self._NSEQ)
         return self._split_workspace_bytes()
 
+    def split_partials(self, workspace):
+        """The fp32 partial slabs a split launch leaves in ``workspace`` -- the O partials ``(B x S, S_q, H, D)`` and the LSE partials
+        ``(B x S, H, S_q)``, split-major on the batch axis (row ``s x B + b``), as contiguous VIEWS on the caller's workspace (no copy): what an
+        external consumer folds under ``combine="external"`` (the gated attention block's out projection), readable under a kernel combine too.
+        A plan-time geometry (``check_support`` runs when needed); ``split_kv=1`` has no partials (``ValueError``); the workspace must be the
+        one ``execute`` was handed (``scratch_workspace_bytes()`` bytes, contiguous, 16-byte aligned)."""
+        import torch
+
+        if self.split_kv <= 1:
+            raise ValueError("sparse d256 forward (sm107): split_partials() needs a split (split_kv >= 2): an unsplit launch writes O directly, no partials")
+        if not self._G:
+            self.check_support()
+        if workspace is None or isinstance(workspace, SparseOperandDesc) or not isinstance(workspace, torch.Tensor):
+            raise ValueError("sparse d256 forward (sm107): split_partials() takes the partials workspace tensor execute() was handed")
+        self._check_workspace(workspace, self._NSEQ)
+        B, SQ, H, S = self._B, self._SQ, self._H, self.split_kv
+        o_off, lse_off, _fin_off, _total = self._split_workspace_layout()
+        flat = workspace.view(torch.uint8).view(-1) if workspace.dtype != torch.uint8 or workspace.dim() != 1 else workspace
+        o_partial = flat.narrow(0, o_off, B * S * SQ * H * _D * 4).view(torch.float32).view(B * S, SQ, H, _D)
+        lse_partial = flat.narrow(0, lse_off, B * S * H * SQ * 4).view(torch.float32).view(B * S, H, SQ)
+        return o_partial, lse_partial
+
     # --- compile / execute -----------------------------------------------------------------------------------------------
 
     def template_params(self):
@@ -867,7 +914,7 @@ class SparseGqaFwdDslSm107:
         self._fns[has_block_lens] = fn
         if has_block_lens == (self.block_lens is not None):
             self._fn = fn
-        if self.split_kv > 1 and self._combine is None:
+        if self.split_kv > 1 and self._combine is None and self.combine == "kernel":
             # The split combine (sm100/split_combine.py): fp32 partials -> the caller's O dtype, ONE rounding; the gate, when
             # declared, applied to the fp32 merged value (QI01's gate-in-combine entry).  Compiled at plan time like the kernel, with
             # the kernel FORM pinned per plan (combine_form(): the decode-grid kernel / the lean group walk / the module's own forms on
@@ -972,7 +1019,7 @@ class SparseGqaFwdDslSm107:
                     f"sparse d256 forward (sm107): split_kv={self.split_kv} needs the partials workspace at execute(workspace=) (scratch_workspace_bytes() bytes)"
                 )
             self._check_workspace(ws, self._NSEQ)
-            if self._combine is None:
+            if self._combine is None and self.combine == "kernel":
                 raise RuntimeError("sparse d256 forward (sm107): call compile() before execute() -- the split combine is not compiled (plan-time keys only)")
         if block_lens is not None:
             self._check_block_lens_form(block_lens, self._B, self._SQ, self.list_per_sequence)
@@ -1089,7 +1136,7 @@ class SparseGqaFwdDslSm107:
             stream=stream,
             **thd_kw,
         )
-        if self.split_kv > 1:
+        if self.split_kv > 1 and self.combine == "kernel":
             # The second launch on the same stream: the positional combine entry (partials, O, final LSE, (B, H, S_q, D), the
             # split count, O's four BSHD strides, the LSE's three, [the gate's pointer + four BSHD strides,] the stream).
             lse_final = int(lse.data_ptr()) if lse is not None else base + fin_off
