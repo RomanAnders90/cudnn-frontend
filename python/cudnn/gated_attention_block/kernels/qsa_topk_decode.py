@@ -140,6 +140,13 @@ them together until the key is exact, the id select names the ``need``-th smalle
 id select; negative logits order by value (the key flips every bit of a negative float); garbage past ``counts[t]`` is loaded (within
 the row) and discarded.
 
+The single-CTA body is the ROLE function ``topk_role`` (``@cute.jit``): the query row is an ARGUMENT (the standalone kernel
+``frost_qsa_topk_decode`` passes ``block_idx.y``; a fused indexer kernel hands a CTA of its grid this role from its dispatch table),
+the role carves its own dynamic shared memory from the CTA's base, and a compile-time ``fused`` flag puts the fused form's two counter
+sites -- the acquire of the row's counter word before the first ``counts`` / ``logits`` load (the identity path included) and its reset
+right after -- behind a seam that is declined at trace time until the grid-scope counter module lands; ``fused=False`` renders the
+body exactly as before (the test module pins every served single-CTA cubin byte-identical to the pre-refactor record).
+
 Programmatic dependent launch (``use_pdl``): ``griddepcontrol.wait`` before the FIRST dependent global read (the counts and the
 speculated logits: the scorer writes both), ``griddepcontrol.launch_dependents`` once per CTA right after the ``counts`` read -- before the
 identity branch, so the identity path fires it too (the sparse tile that consumes the list waits for THIS grid's completion; the trigger
@@ -220,6 +227,7 @@ __all__ = [
     "DEFAULT_THREADS_PER_CTA",
     "default_knobs_for",
     "QsaTopkDecodeRecipe",
+    "topk_role",
     "cols_cap_for",
     "smem_bytes_for",
     "compile_qsa_topk_decode",
@@ -460,22 +468,58 @@ def _scan_find(s_hist, hbuf: cutlass.Constexpr[int], s_wsum, s_found, need, corr
     cute.arch.barrier()  # B3
 
 
-@cute.kernel
-def frost_qsa_topk_decode(
+def _fused_counter_seam(cnt_row_ptr, cnt_target, row, warp, lane, threads_per_cta):
+    """The fused indexer's C1 seam of the top-k role (plain Python, reached only under ``topk_role(fused=True)``): the acquire of the
+    row's counter word ``cnt_row[row] >= cnt_target`` (the scorer CTAs' releases; one polling lane, the CTA's threads parked in a named
+    barrier that publishes the acquire) BEFORE the role's first ``counts`` / ``logits`` load -- the identity path included -- and the
+    reset ``cnt_row[row] = 0`` right after (every arrival observed; no other reader in the launch).  The sites, exactly:
+    ``acquire_geq(addr, cnt_target, warp_gate=warp == 0, bar_id=1, bar_threads=threads_per_cta)`` by every thread (``warp`` is this
+    role's CTA-level warp index: ONE warp of the CTA), then ``if warp == 0: if nvvm.elect_sync(): counter_store_u64(addr,
+    cutlass.Int64(0))`` -- the acquire exposes no acquiring lane (its elect is internal), so the reset is its own one-lane site, and the
+    literal is an ``Int64``, never a Python ``0`` into inline PTX.  Under the test-only compile key ``check_arrivals`` the resetting lane
+    re-reads the word (``ld_acquire_gpu_u64``) before the store and traps unless it equals ``cnt_target`` exactly: the over-arrival
+    detector (a scorer release gated once per unit instead of once per CTA) that the reset otherwise erases.  The entries are the
+    grid-scope release / acquire module's ``acquire_geq`` + ``counter_store_u64``; until the fused kernel binds them the fused form is
+    declined HERE at trace time, never rendered half-way."""
+    raise NotImplementedError(
+        "topk_role(fused=True): the per-row counter acquire + reset need the grid-scope counter module (acquire_geq / counter_store_u64), "
+        "which this tree does not carry; the standalone kernel runs fused=False"
+    )
+
+
+@cute.jit
+def topk_role(
     mLogits: cute.Tensor,  # [T, n_blocks_max] the fp32 logits viewed as int32 bits; row stride symbolic, unit column stride
     mCounts: cute.Tensor,  # [T] int32 contiguous
     mOut: cute.Tensor,  # [T, top_k] int32; row stride symbolic, unit column stride
+    row: cutlass.Int32,  # the query row this CTA selects for (the standalone kernel: block_idx.y; a fused kernel: from its dispatch table)
     cols_cap: cutlass.Constexpr[int],
     top_k: cutlass.Constexpr[int],
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
-) -> None:
-    """Grid ``(1, T, 1)``: ``block_idx.y`` is the query row; one CTA per row.  The SM issues ~4 warp instructions per cycle for the
-    whole CTA, so every instruction of a per-element sweep costs ``EPT x nwarps / 4`` cycles: the body is written for the fewest
-    instructions per element (no per-element predicate on the histogram pass, no bitmap words, no per-element branch) and the fewest
-    barriers on its chain.  Warp ``w`` owns the CONTIGUOUS id range ``[w x EPT x 32, (w + 1) x EPT x 32)``, round ``i`` of it the 32
-    consecutive ids ``w x EPT x 32 + 32 i + lane`` (coalesced 128-B rounds): the ascending id order is then warp-major, round-major,
-    lane-minor, and a selected id's canonical rank is (the lower warps' selected count) + (the warp's running count) + (the lanes below)."""
+    fused: cutlass.Constexpr[bool],
+    cnt_row_ptr,  # fused only: the plan-owned u64 counter words, one per query row (None otherwise)
+    cnt_target,  # fused only: the arrivals the row's word must reach (the scorer CTAs per sequence; None otherwise)
+):
+    """The decode top-k's single-CTA body as a ROLE: every thread of a ``threads_per_cta``-thread CTA enters, selects the top-k of
+    query row ``row`` (an ARGUMENT, so a fused kernel can hand a CTA of its grid this role from its own dispatch table) and writes
+    ``mOut[row]``.  Dynamic shared memory: the role carves ``smem_bytes_for(cols_cap, 1, threads_per_cta, top_k)`` bytes from the
+    CTA's dynamic base through its own ``SmemAllocator`` (a fused kernel's allocation is at least that; a CTA runs one role, so the
+    roles' buffers alias trivially).  Its barrier sites are the module docstring's table (``bar.sync 0`` over the whole CTA);
+    ``use_pdl`` keeps the standalone kernel's two ``griddepcontrol`` sites in the body.
+
+    ``fused`` (compile-time): under ``True`` the role sits behind the fused indexer's scorer CTAs, which release the row's counter
+    word after their last ``logits`` / ``counts`` store -- so the role acquires ``cnt_row_ptr[row] >= cnt_target`` BEFORE its first
+    ``counts`` / ``logits`` load (the identity path included: the counts load decides it) and resets the word right after
+    (:func:`_fused_counter_seam`, the C1 row of the fused kernel's counter table).  ``False`` (the standalone kernel) renders the
+    body exactly as before the refactor: the served single-CTA cubins are pinned byte-identical by the test module's record.
+
+    The SM issues ~4 warp instructions per cycle for the whole CTA, so every instruction of a per-element sweep costs
+    ``EPT x nwarps / 4`` cycles: the body is written for the fewest instructions per element (no per-element predicate on the
+    histogram pass, no bitmap words, no per-element branch) and the fewest barriers on its chain.  Warp ``w`` owns the CONTIGUOUS id
+    range ``[w x EPT x 32, (w + 1) x EPT x 32)``, round ``i`` of it the 32 consecutive ids ``w x EPT x 32 + 32 i + lane`` (coalesced
+    128-B rounds): the ascending id order is then warp-major, round-major, lane-minor, and a selected id's canonical rank is (the lower
+    warps' selected count) + (the warp's running count) + (the lanes below)."""
     ept = cutlass.const_expr(cols_cap // threads_per_cta)
     spec = cutlass.const_expr(min(ept, SPEC_ROUNDS))
     nwarps = cutlass.const_expr(threads_per_cta // 32)
@@ -513,7 +557,6 @@ def frost_qsa_topk_decode(
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     lane = cutlass.Int32(cute.arch.lane_idx())
     warp = cutlass.Int32(cute.arch.make_warp_uniform(tidx // cutlass.Int32(32)))
-    row = cutlass.Int32(cute.arch.block_idx()[1])
     my_bit = cutlass.Uint32(1) << lane.to(cutlass.Uint32)
     lt_mask = my_bit - cutlass.Uint32(1)  # the lanes below this one (= %lanemask_lt, derived)
     row64 = row.to(cutlass.Int64)
@@ -524,6 +567,9 @@ def frost_qsa_topk_decode(
 
     if cutlass.const_expr(use_pdl):
         wait_on_dependent_grids()
+    if cutlass.const_expr(fused):
+        # the fused indexer's C1 seam: the row's counter acquired (>= cnt_target) and reset before the first counts / logits load
+        _fused_counter_seam(cnt_row_ptr, cnt_target, row, warp, lane, threads_per_cta)
 
     cols = cutlass.Int32(mLogits.shape[1])
     row_ptr = mLogits.iterator + row64 * cutlass.Int64(mLogits.stride[0])
@@ -870,6 +916,22 @@ def frost_qsa_topk_decode(
                         slot = cutlass.Int32(top_k - 1) - pos
                         st_global(out_row + slot.to(cutlass.Int64) * four, e0 + cutlass.Int32(32 * i), cutlass.Int32)
                     run = run + cutlass.Int32(cute.arch.popc(bal))
+
+
+@cute.kernel
+def frost_qsa_topk_decode(
+    mLogits: cute.Tensor,  # [T, n_blocks_max] the fp32 logits viewed as int32 bits; row stride symbolic, unit column stride
+    mCounts: cute.Tensor,  # [T] int32 contiguous
+    mOut: cute.Tensor,  # [T, top_k] int32; row stride symbolic, unit column stride
+    cols_cap: cutlass.Constexpr[int],
+    top_k: cutlass.Constexpr[int],
+    threads_per_cta: cutlass.Constexpr[int],
+    use_pdl: cutlass.Constexpr[bool],
+) -> None:
+    """Grid ``(1, T, 1)``: ``block_idx.y`` is the query row; one CTA per row running :func:`topk_role` unfused (no counter seam: the
+    scorer's launch completed before this one started)."""
+    row = cutlass.Int32(cute.arch.block_idx()[1])
+    topk_role(mLogits, mCounts, mOut, row, cols_cap, top_k, threads_per_cta, use_pdl, False, None, None)
 
 
 frost_qsa_topk_decode.set_name_prefix("cudnn", remove_cutlass_symbol=True)

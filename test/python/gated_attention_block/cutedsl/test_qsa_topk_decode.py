@@ -33,6 +33,10 @@ import torch
 import cudnn.frost.compiled_cache as cc
 from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirement_error
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import cubin_pin_support as pin  # noqa: E402  (the cubin pins' skip-or-fail contract: the DSL string, the bundled assembler, the target)
+
 _CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_topk_decode")  # None at or above the floor
 pytestmark = [pytest.mark.L0, pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))]
 
@@ -935,9 +939,10 @@ def _pin_id(key):
 
 # The probe: one fresh interpreter per rendering, the dump dir / the kept artifact / the arch fixed BEFORE the first cutlass import (the
 # DSL reads them once), the persistent compiled-plan cache disabled (a hit skips ptxas and dumps no cubin), the launch wrapper compiled
-# exactly as compile_qsa_topk_decode does (the same fake tensors, the single-CTA form), then the md5 of the newest cubin in the dump.
+# exactly as compile_qsa_topk_decode does (the same fake tensors, the single-CTA form), then the md5 of the ONE cubin in the dump (a
+# second cubin -- another kernel reached through the wrapper -- is a failure, never a silent pick) and the assembler string it carries.
 _CUBIN_PROBE = textwrap.dedent("""
-    import glob, hashlib, os, sys
+    import glob, hashlib, os, re, sys
     dump, cap, top_k, thr, pdl = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1"
     os.environ["CUTE_DSL_DUMP_DIR"] = dump
     os.environ["CUTE_DSL_KEEP"] = "cubin"
@@ -950,10 +955,13 @@ _CUBIN_PROBE = textwrap.dedent("""
                  make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
                  M._fake_rows(cutlass.Int32), cutlass.Int32(1), cap, top_k, 1, thr, pdl, M.smem_bytes_for(cap, 1, thr, top_k),
                  make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
-    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
-    if not cubins:
-        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
-    print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+    cubins = glob.glob(os.path.join(dump, "*.cubin"))
+    if len(cubins) != 1:
+        print("FAIL expected exactly one cubin in", dump, sorted(os.listdir(dump))); sys.exit(3)
+    data = open(cubins[0], "rb").read()
+    m = re.search(rb"Cuda compilation tools, release (\\d+\\.\\d+), V(\\d+\\.\\d+\\.\\d+)", data)  # the assembler's own string in the cubin
+    print("CUBIN_COMPILER", "ptxas " + m.group(2).decode() if m else "unknown")
+    print("CUBIN_MD5", hashlib.md5(data).hexdigest())
     """)
 
 
@@ -970,7 +978,16 @@ def _cubin_record():
     return dsl, want
 
 
-def _render_cubin_md5(tmp_path, key):
+def _cubin_record_compiler():
+    """The record's ``compiler=`` line (the assembler its cubins carry), or None."""
+    for ln in _CUBIN_RECORD.read_text().splitlines():
+        if ln.startswith("compiler="):
+            return ln[len("compiler=") :].strip()
+    return None
+
+
+def _render_cubin(tmp_path, key):
+    """``(md5, compiler)`` of the rendering at ``key`` (a fresh interpreter; the ONE cubin in the dump)."""
     cap, top_k, threads, use_pdl = key
     dump = tmp_path / f"cubin_{_pin_id(key)}"
     dump.mkdir()
@@ -983,13 +1000,16 @@ def _render_cubin_md5(tmp_path, key):
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     md5 = next((ln.split()[1] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN_MD5 ")), "")
     assert re.fullmatch(r"[0-9a-f]{32}", md5), proc.stdout[-2000:]
-    return md5
+    compiler = next((ln.split(" ", 1)[1] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN_COMPILER ")), pin.COMPILER_UNKNOWN)
+    return md5, compiler
 
 
 def test_single_cta_cubin_record_is_committed_and_complete():
-    """The record names its DSL build and holds exactly the pinned keys (a key added here lands in the record, or the pin goes red)."""
+    """The record names its DSL build (the version string and the bundled assembler) and holds exactly the pinned keys (a key added here
+    lands in the record, or the pin goes red)."""
     dsl, want = _cubin_record()
     assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert re.fullmatch(r"ptxas \d+\.\d+\.\d+", _cubin_record_compiler() or ""), _cubin_record_compiler()
     assert set(want) == {_pin_id(k) for k in _PINNED_SINGLE_CTA_KEYS}, (sorted(want), sorted(_pin_id(k) for k in _PINNED_SINGLE_CTA_KEYS))
 
 
@@ -997,15 +1017,60 @@ def test_single_cta_cubin_record_is_committed_and_complete():
 def test_single_cta_cubin_is_byte_identical_to_the_record(tmp_path, key):
     """A host trace-compile for sm_107a (no GPU) of the single-CTA form at this served rendering md5-equals the committed record: the
     body's move into the role function ``topk_role`` (the row as an argument, the fused-form counter seams behind a ``Constexpr`` flag
-    that is False here) changed no byte of the standalone kernel.  Skips on another DSL build (the cubin is a function of it)."""
-    from cudnn.frost.buffers import cutedsl_state
+    that is False here) changed no byte of the standalone kernel.  Another DSL build (the version string or the bundled assembler) or a
+    DSL without the target skips naming both sides -- or FAILS under ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1``, the pin-owning CI job."""
+    pin.check_arch("sm_107a")
+    dsl, want = _cubin_record()
+    pin.check_dsl(dsl)
+    md5, compiler = _render_cubin(tmp_path, key)
+    pin.check_compiler(_cubin_record_compiler(), compiler)
+    assert md5 == want[_pin_id(key)], f"{_pin_id(key)}: cubin md5 {md5} != the record's {want[_pin_id(key)]} -- the single-CTA rendering changed"
 
+
+# The role's fused seam: a wrapper kernel hands topk_role a row and the flag; fused=True must be DECLINED at trace time (the counter
+# module the two sites call is not in this tree), fused=False through the same wrapper must trace and compile (the standalone kernel's path).
+_ROLE_PROBE = textwrap.dedent("""
+    import os, sys
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    import cuda.bindings.driver as cuda
+    import cutlass, cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_stream, make_fake_compact_tensor
+    from cudnn.gated_attention_block.kernels import qsa_topk_decode as M
+    FUSED = sys.argv[1] == "1"
+
+    @cute.kernel
+    def wrapper(mLogits: cute.Tensor, mCounts: cute.Tensor, mOut: cute.Tensor, fused: cutlass.Constexpr[bool]):
+        row = cutlass.Int32(cute.arch.block_idx()[1])
+        M.topk_role(mLogits, mCounts, mOut, row, 8192, 512, 1024, False, fused, None, None)
+
+    @cute.jit
+    def launch(logits: cute.Tensor, counts: cute.Tensor, out: cute.Tensor, fused: cutlass.Constexpr[bool], stream: cuda.CUstream):
+        wrapper(logits, counts, out, fused).launch(grid=(1, 1, 1), block=(1024, 1, 1), smem=M.smem_bytes_for(8192, 1, 1024, 512), stream=stream)
+
+    try:
+        cute.compile(launch, M._fake_rows(cutlass.Int32),
+                     make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
+                     M._fake_rows(cutlass.Int32), FUSED, make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+        print("OUTCOME compiled")
+    except NotImplementedError as e:
+        print("OUTCOME declined", str(e).replace(chr(10), " "))
+    """)
+
+
+@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
+def test_topk_role_traces_unfused_and_declines_the_fused_seam_until_the_counter_module_lands(tmp_path, fused):
+    """``topk_role`` called from a wrapper kernel with the row as an argument: ``fused=False`` traces and compiles for sm_107a (no GPU);
+    ``fused=True`` raises ``NotImplementedError`` at TRACE time naming the counter module -- the seam is declined whole, never rendered
+    without its acquire / reset.  (The probe runs from a file: the DSL needs the wrapper's source, which a ``-c`` program has not.)"""
     if not _arch_known("sm_107a"):
         pytest.skip("this CuTe DSL has no sm_107a target")
-    dsl, want = _cubin_record()
-    _installed, version = cutedsl_state()
-    have = " ".join(version) if version else None
-    if dsl is not None and have != dsl:
-        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build, re-render the record")
-    md5 = _render_cubin_md5(tmp_path, key)
-    assert md5 == want[_pin_id(key)], f"{_pin_id(key)}: cubin md5 {md5} != the record's {want[_pin_id(key)]} -- the single-CTA rendering changed"
+    probe = tmp_path / "topk_role_probe.py"
+    probe.write_text(_ROLE_PROBE)
+    proc = subprocess.run([sys.executable, str(probe), "1" if fused else "0"], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    outcome = next((ln for ln in proc.stdout.splitlines() if ln.startswith("OUTCOME ")), "")
+    if fused:
+        assert outcome.startswith("OUTCOME declined") and "counter" in outcome and "fused=False" in outcome, proc.stdout[-2000:]
+    else:
+        assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
