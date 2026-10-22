@@ -361,7 +361,7 @@ def _ptx(tmp_path, arch, mode, *, async_proxy=False, deadline=False):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("entry", ["release_add", "acquire_geq", "last_arriver"])
+@pytest.mark.parametrize("entry", ["release_add", "release_add_rows", "acquire_geq", "last_arriver"])
 def test_warp_gate_is_a_required_keyword_argument(entry):
     """The over-arrival is unwritable at the signature: ``warp_gate`` is keyword-only and has no default on every entry."""
     from cudnn.frost.tile_dsl import gsync
@@ -385,6 +385,26 @@ def test_named_barrier_domain_is_checked(bar_id, bar_threads):
 
     with pytest.raises(TypeError, match="bar_(id|threads)"):
         gsync._require_barrier(bar_id, bar_threads, "release_add")
+
+
+def test_multi_row_release_has_the_same_gate_contract_and_a_constant_row_count():
+    """``release_add_rows``: the gate and the barrier are checked by the same guards as ``release_add`` (the over-arrival stays
+    unwritable), ``n_rows`` is a trace-time Python int >= 1 and ``row_bytes`` whole u64 words -- the signature's own contract,
+    read without tracing (the call's bodies are DSL; the parameter facts are plain Python)."""
+    import inspect
+
+    from cudnn.frost.tile_dsl import gsync
+
+    sig = inspect.signature(gsync.release_add_rows)
+    names = list(sig.parameters)
+    assert names[:3] == ["addr", "n_rows", "n"], names
+    assert sig.parameters["row_bytes"].default == gsync.COUNTER_WORD_BYTES
+    assert sig.parameters["async_proxy"].default is False
+    for kw in ("warp_gate", "bar_id", "bar_threads", "row_bytes", "async_proxy"):
+        assert sig.parameters[kw].kind is inspect.Parameter.KEYWORD_ONLY, kw
+    assert "release_add_rows" in gsync.__all__
+    with pytest.raises(TypeError, match="warp_gate must be a per-thread predicate"):
+        gsync._require_gate(True, "release_add_rows")
 
 
 def test_counter_word_offset_keeps_one_line_per_class():

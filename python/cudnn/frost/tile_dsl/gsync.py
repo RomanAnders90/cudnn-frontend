@@ -23,6 +23,14 @@ The three entries (every one is called by EVERY thread of the role -- all ``bar_
     siblings reconverge at the end of the gate region and the role's other warps park in the named barrier, so a poll
     never starves the SMSP siblings) -> [``fence.proxy.async.global`` by that warp, ``async_proxy`` only] ->
     ``bar.sync bar_id, bar_threads`` publishes the acquire to the role's other warps.
+``release_add_rows(addr, n_rows, n, *, warp_gate, bar_id, bar_threads, row_bytes=8, async_proxy=False)``
+    the RELEASE of ``n_rows`` CONSECUTIVE words at once (a producer that feeds several consumers' words -- the scorer CTA
+    of a sequence releasing its ``S_q`` per-row words): the SAME prefix as ``release_add`` executed ONCE (one fence by every
+    thread, one named barrier), then the ONE elected lane issues ``n_rows`` ``red.release.gpu.global.add.u64`` at
+    ``addr + i x row_bytes``.  Every red is a release at gpu scope by the elected lane the fence + barrier made cumulative, so one
+    prefix orders the role's stores before all of them; ``n_rows`` separate ``release_add`` calls would repeat the fence
+    and the barrier ``n_rows`` times for the same ordering.  The ledger row per word is unchanged (``1 lane x <arriving
+    CTAs> == target``); the PTX census counts ``n_rows`` red sites per rendering.
 ``last_arriver(addr, count, *, warp_gate, flag_smem, bar_id, bar_threads, reset=True, async_proxy=False) -> (is_last, old)``
     LAST ARRIVER: the RELEASE prefix above, then ONE lane: ``atom.acq_rel.gpu.global.add.u64 old, [addr], 1``; the
     lane stores ``old`` into ``flag_smem`` (one 8-byte SMEM word the caller owns), ``bar.sync`` broadcasts it, every
@@ -129,6 +137,7 @@ __all__ = [
     "last_arriver",
     "ld_acquire_gpu_u64",
     "release_add",
+    "release_add_rows",
 ]
 
 # One 128-byte line per counter class (a release atom must never share a line with a polled word of another class: every
@@ -272,6 +281,44 @@ def release_add(
     if warp_gate:
         if nvvm.elect_sync():
             _red_release_gpu_add_u64(addr, cutlass.Int64(n))
+
+
+@cute.jit
+def release_add_rows(
+    addr,
+    n_rows: cutlass.Constexpr[int],
+    n,
+    *,
+    warp_gate,
+    bar_id: cutlass.Constexpr[int],
+    bar_threads: cutlass.Constexpr[int],
+    row_bytes: cutlass.Constexpr[int] = COUNTER_WORD_BYTES,
+    async_proxy: cutlass.Constexpr[bool] = False,
+):
+    """RELEASE ``n`` arrivals on each of the ``n_rows`` consecutive counter words at ``addr + i x row_bytes`` (the module
+    docstring's multi-row form): ONE ``fence.acq_rel.gpu`` by every thread and ONE named barrier, then the elected lane of
+    the ``warp_gate`` warp issues ``n_rows`` ``red.release.gpu.global.add.u64`` -- the same ordering ``n_rows`` calls of
+    :func:`release_add` would give, without repeating the prefix.  ``n_rows`` is a trace-time constant (the reds unroll
+    to ``n_rows`` textual sites: the PTX census's figure); ``row_bytes`` the word pitch (8: the words of one class laid out
+    by :func:`counter_word_offset`).  Called by every thread of the role; the same gate / barrier contract as
+    :func:`release_add`.  Ledger row per word: ``1 lane x <arriving CTAs> == target``."""
+    _require_gate(warp_gate, "release_add_rows")
+    _require_barrier(bar_id, bar_threads, "release_add_rows")
+    if cutlass.const_expr(not isinstance(n_rows, int) or isinstance(n_rows, bool) or int(n_rows) < 1):
+        raise TypeError(f"gsync.release_add_rows: n_rows must be a Python int >= 1 (the words released per call), got {n_rows!r}")
+    if cutlass.const_expr(
+        not isinstance(row_bytes, int) or isinstance(row_bytes, bool) or int(row_bytes) < COUNTER_WORD_BYTES or int(row_bytes) % COUNTER_WORD_BYTES
+    ):
+        raise TypeError(f"gsync.release_add_rows: row_bytes must be a positive multiple of {COUNTER_WORD_BYTES} (whole u64 words), got {row_bytes!r}")
+    if cutlass.const_expr(async_proxy):
+        fence_proxy_async_global()
+    fence_acq_rel_gpu()
+    named_barrier_fence(bar_id, bar_threads)
+    if warp_gate:
+        if nvvm.elect_sync():
+            n64 = cutlass.Int64(n)
+            for i in cutlass.range_constexpr(n_rows):
+                _red_release_gpu_add_u64(addr + cutlass.Int64(i * row_bytes), n64)
 
 
 @cute.jit
