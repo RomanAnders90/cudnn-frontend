@@ -45,6 +45,7 @@ import hashlib
 import importlib
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -71,6 +72,8 @@ from cudnn.gated_attention_block.kernels import qsa_score_paged as sp  # noqa: E
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gated_block_qsa_reference import full_block_ids  # noqa: E402
+import cubin_pin_support as pin  # noqa: E402  (the pins' skip-or-fail contract: the DSL string, the bundled assembler, the target)
+import qsa_score_paged_renderings as renderings  # noqa: E402  (the served compile keys + the sm_107a cubin record and its probe)
 
 D, H, BS = fd.INDEX_HEAD_DIM, 4, fd.BLOCK_SIZE
 TOP_K = fd.QSA_TOP_K
@@ -381,6 +384,132 @@ def test_compile_site_keys_on_the_module_digest():
     assert cc.template_key(vars(sp), {"key": key}, "compile_qsa_score_paged") == f"{sp.FROST_SOURCE_DIGEST}|compile_qsa_score_paged|[('key', {key!r})]"
     src = Path(sp.__file__).read_text()
     assert "cute.compile(" not in src and 'symbol="cudnn_block_qsa_score_paged"' in src and '"compile_qsa_score_paged")' in src
+
+
+# --------------------------------------------------------------------------------------------- the served renderings' cubin pin (host)
+
+_RENDERED = {}  # one child interpreter per session renders every served key; the parametrized cells read its md5s
+
+
+def _rendered(tmp_path_factory):
+    if "r" not in _RENDERED:
+        _RENDERED["r"] = renderings.render_md5s(tmp_path_factory.mktemp("qsa_score_paged_renderings"))
+    return _RENDERED["r"]
+
+
+def test_served_renderings_record_is_committed_and_complete():
+    """The committed record (``renderings/md5_qsa_score_paged_sm_107a.txt``) names its DSL build (the version string and the bundled
+    assembler) and holds exactly one md5 per served key, every md5 distinct (two keys rendering the same cubin would mean a compile key
+    that is not a rendering axis)."""
+    assert renderings.RECORD.is_file(), f"the record {renderings.RECORD} is missing: regenerate it with qsa_score_paged_renderings.py"
+    dsl, want = renderings.read_record()
+    assert dsl is not None and dsl.split()[0] == "nvidia-cutlass-dsl", dsl
+    meta = renderings.read_record_meta()
+    assert meta["dsl"] == dsl and re.fullmatch(r"ptxas \d+\.\d+\.\d+", meta.get("compiler", "")), meta
+    assert set(want) == {k.tag for k in renderings.SERVED_KEYS}, sorted(set(want) ^ {k.tag for k in renderings.SERVED_KEYS})
+    assert len(set(want.values())) == len(want), "two served keys share a cubin md5"
+
+
+@pytest.mark.parametrize("key", renderings.SERVED_KEYS, ids=[k.tag for k in renderings.SERVED_KEYS])
+def test_served_renderings_are_byte_identical_to_the_record(tmp_path_factory, key):
+    """Every served rendering of the standalone kernel trace-compiles for ``sm_107a`` (host; no GPU) to the cubin the record pins, byte for
+    byte: a change meant to leave the standalone kernel alone -- the body moved into ``score_role``, a seam behind a ``Constexpr`` flag, an
+    argument that became ``Optional`` -- proves it here (the house rule: a kernel that gains an operand or a seam keeps its served cubin
+    byte-identical, shown by a host trace-compile against a committed md5 record); a deliberate change of the kernel regenerates the
+    record and the diff names every key that moved.  Another DSL build (the version string or the bundled assembler) or a DSL without the
+    target skips naming both sides -- or FAILS under ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1``, the pin-owning CI job."""
+    pin.check_arch(renderings.ARCH)
+    dsl, want = renderings.read_record()
+    pin.check_dsl(dsl)
+    got = _rendered(tmp_path_factory)
+    pin.check_compiler(renderings.read_record_meta().get("compiler"), got.compiler)
+    assert got.md5s[key.tag] == want[key.tag], (
+        f"{key.tag}: cubin md5 {got.md5s[key.tag]} != the record's {want[key.tag]} -- the standalone rendering changed "
+        f"(kernel digest now {got.digest}; a deliberate change regenerates renderings/md5_qsa_score_paged_sm_107a.txt)"
+    )
+
+
+# The role's fused / derive seams: a 2-unit wrapper kernel hands score_role the ids and the flags.  fused=True must trace THROUGH the unit's
+# named barrier, the per-unit ring base and the counts guard and be DECLINED at the release stub (the counter release is not served yet);
+# derive=True must be declined at the prologue, ABOVE the barrier site; fused=False / derive=False through the same wrapper must trace and
+# compile (the standalone kernel's path).  The probe prints the raise site's line in the kernel module beside the outcome.
+_ROLE_PROBE = """
+import os, sys, traceback
+os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+from typing import Optional
+import cuda.bindings.driver as cuda
+import cutlass, cutlass.cute as cute
+from cutlass.cute.runtime import make_fake_stream
+from cudnn.gated_attention_block.kernels import qsa_score_paged as sp
+UNITS, FUSED, DERIVE = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3] == "1"
+
+
+@cute.kernel
+def wrapper(mQ: Optional[cute.Tensor], mKbar: cute.Tensor, mTable: cute.Tensor, mKvLens: cute.Tensor, mLogits: cute.Tensor, mCounts: cute.Tensor,
+            mBlockLens: Optional[cute.Tensor], top_k: cutlass.Int32, scale: cutlass.Float32, units: cutlass.Constexpr[int],
+            fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool]):
+    ring, tile = sp.score_smem_elems(4, 1, 1, 4)
+    sK = cutlass.Array(cutlass.Int32, units * ring, alignment=128, space=cutlass.AddressSpace.smem)
+    sA = cutlass.Array(cutlass.Int32, tile, alignment=128, space=cutlass.AddressSpace.smem)
+    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
+    unit = tidx >> cutlass.Int32(7)
+    tidx_in_unit = tidx & cutlass.Int32(127)
+    warp_in_unit = tidx_in_unit >> cutlass.Int32(5)
+    bidx, bidy, _ = cute.arch.block_idx()
+    sp.score_role(mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, sK, sA, top_k, scale, cutlass.Int32(bidx), cutlass.Int32(bidy), unit,
+                  warp_in_unit, tidx_in_unit, unit * cutlass.Int32(ring), 4, 1, 4, 1, 4, False, False, fused, derive, cutlass.Int64(0), units)
+
+
+@cute.jit
+def launch(mQ: Optional[cute.Tensor], mKbar: cute.Tensor, mTable: cute.Tensor, mKvLens: cute.Tensor, mLogits: cute.Tensor, mCounts: cute.Tensor,
+           mBlockLens: Optional[cute.Tensor], top_k: cutlass.Int32, scale: cutlass.Float32, units: cutlass.Constexpr[int],
+           fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool], stream: cuda.CUstream):
+    wrapper(mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, top_k, scale, units, fused, derive).launch(
+        grid=(1, 1, 1), block=(128 * units, 1, 1), stream=stream)
+
+
+try:
+    cute.compile(launch, None if DERIVE else sp._fake_q(4), sp._fake_kbar(4), sp._fake_i32_2d(), sp._fake_i32_1d(), sp._fake_f32_2d(),
+                 sp._fake_i32_1d(), sp._fake_i32_1d(), cutlass.Int32(0), cutlass.Float32(0.0), UNITS, FUSED, DERIVE,
+                 make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+    print("OUTCOME compiled")
+except NotImplementedError as e:
+    lines = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename.endswith("qsa_score_paged.py")]
+    print("OUTCOME declined line=" + str(lines[-1] if lines else -1) + " " + str(e).replace(chr(10), " "))
+"""
+
+
+@pytest.mark.parametrize("arm", ["standalone", "fused", "derive"])
+def test_score_role_traces_the_standalone_shape_and_declines_the_fused_and_derive_seams(tmp_path, arm):
+    """``score_role`` called from a 2-unit wrapper kernel for sm_107a (no GPU): ``fused=True, derive=False`` traces THROUGH the unit's named
+    barrier, the per-unit ring base and the counts guard and raises ``NotImplementedError`` naming ``score_role(fused=True)`` at the release
+    stub -- the raise site lies BELOW the barrier site in the source, so the seam is declined whole, after everything the fused form
+    renders today; ``derive=True`` raises naming ``derive`` at the prologue, ABOVE the barrier site; ``fused=False, derive=False`` through
+    the same wrapper traces and compiles (the standalone kernel's path).  (The probe runs from a file: the DSL needs the wrapper's source,
+    which a ``-c`` program has not.)"""
+    if not renderings.arch_known():
+        pytest.skip(f"this CuTe DSL has no {renderings.ARCH} target")
+    units, fused, derive = {"standalone": (1, False, False), "fused": (2, True, False), "derive": (2, True, True)}[arm]
+    probe = tmp_path / "score_role_probe.py"
+    probe.write_text(_ROLE_PROBE)
+    proc = subprocess.run([sys.executable, str(probe), str(units), "1" if fused else "0", "1" if derive else "0"], capture_output=True, text=True, timeout=900)
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    outcome = next((ln for ln in proc.stdout.splitlines() if ln.startswith("OUTCOME ")), "")
+    if arm == "standalone":
+        assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
+        return
+    m = re.match(r"OUTCOME declined line=(-?\d+) (.*)", outcome)
+    assert m, proc.stdout[-2000:]
+    line, msg = int(m.group(1)), m.group(2)
+    src = Path(sp.__file__).read_text().splitlines()
+    barrier_line = next(i for i, ln in enumerate(src, 1) if "barrier_id=cutlass.Int32(2) + unit" in ln)  # the per-unit barrier site
+    if arm == "fused":
+        assert "score_role(fused=True)" in msg and "counter release" in msg and "fused=False" in msg, msg
+        assert line > barrier_line, (line, barrier_line)
+    else:
+        assert "score_role(derive=True)" in msg and "derive=False" in msg, msg
+        assert line < barrier_line, (line, barrier_line)
 
 
 # The fresh-process probes' shared prelude: the installed DSL modeled as the public 4.6.2 wheel two ways at once -- the version discovery
