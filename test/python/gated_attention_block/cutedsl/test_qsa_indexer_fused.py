@@ -693,11 +693,14 @@ def test_the_completing_row_is_derived_bitwise_at_every_alignment(s_q, r):
         assert H.same(case.kbar_row(fused_x, seq, blk), case.kbar_row(ref_x, seq, blk)), f"sequence {seq}: the cache row of block {blk} differs"
         assert not H.same(case.kbar_row(fused_x, seq, blk), case.kbar_row({"comp": case.comp0}, seq, blk)), f"sequence {seq}: block {blk} was not written"
         for s, t in enumerate(rows):
+            # the sentinel is compared in fp32 (a tensor comparison): the Python double 1.5e30 is not an fp32 value, float(tensor) would never equal it
             col_f, col_r = fused_x["logits"][t, blk], ref_x["logits"][t, blk]
             if s >= j:
-                assert float(col_f) != H.LOGIT_SENTINEL and H.same(col_f, col_r), f"row {t}: the derived column {blk} differs or was not scored"
+                assert bool(col_f != H.LOGIT_SENTINEL) and H.same(col_f, col_r), f"row {t}: the derived column {blk} differs or was not scored"
             else:
-                assert float(col_f) == H.LOGIT_SENTINEL == float(col_r), f"row {t}: column {blk} is not visible to a row before the completing one"
+                assert bool(col_f == H.LOGIT_SENTINEL) and bool(
+                    col_r == H.LOGIT_SENTINEL
+                ), f"row {t}: column {blk} is not visible to a row before the completing one"
 
 
 # ---------------------------------------------------------------------------------------------------------------------------------------
@@ -786,7 +789,14 @@ def test_degenerate_inputs_follow_the_matrix(row):
     elif row == "dead_page_at_the_completing_block":
         assert case.completing()[0] == (3, 599) and int(cslot[0, 3]) == -2, cslot.tolist()
         assert float(fused_x["logits"][3, 599]) == 0.0 == float(ref_x["logits"][3, 599]), "the completing block on a dead page must score as a zero key"
-        assert H.same(fused_x["comp"], case.comp0), "a cache row was written under a dead page"
+        # sequence 0's live pages and the null page 0 stay the prime's (no row for the -2 report, nothing redirected to page 0); sequence 1
+        # completes block 600 on a live page and writes it in both forms (the bitwise check above already holds the two caches equal)
+        pages0 = case.block_table[0][case.block_table[0] >= 0].long()
+        assert H.same(fused_x["comp"][pages0], case.comp0[pages0]) and H.same(fused_x["comp"][0], case.comp0[0]), "a cache row was written under a dead page"
+        j1, blk1 = case.completing()[1]
+        assert (
+            (j1, blk1) == (1, 600) and int(cslot[1, j1]) == blk1 and not H.same(case.kbar_row(fused_x, 1, blk1), case.kbar_row({"comp": case.comp0}, 1, blk1))
+        )
     elif row == "completing_block_past_the_table_width":
         assert case.completing()[0] == (3, 40) and int(cslot[0, 3]) == -2 and counts[:4].tolist() == [40] * 4, (cslot.tolist(), counts.tolist())
         pages0 = case.block_table[0].long()
