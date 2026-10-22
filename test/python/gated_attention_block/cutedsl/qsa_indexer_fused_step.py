@@ -9,19 +9,22 @@ The reference is the serving step's own form, built from the three standalone ke
 ``QsaPrepareIndexArms(raw_pool=False, query=True, compress=True, paged=True, ring_slots, rope_table)`` -- the Q / K norm + RoPE in place,
 the K / V pool rows, the indexer queries into the compact ``qi`` buffer, the raw key into the ring and the block a row completes into the
 paged compressed-key cache --, then ``qsa_score_paged`` over ``qi`` and the cache through the main block table (``scale = 1 / sqrt(128)``,
-``block_lens`` written), then ``qsa_topk_decode`` (the single-CTA form, 1024 threads) into the ``[T, top_k]`` list.  The fused launch runs
+``block_lens`` written), then ``qsa_topk_decode`` (the single-CTA form at the plan's block size) into the ``[T, top_k]`` list.  The fused launch runs
 the SAME step on an identical set of buffers with the prepare's query arm OFF (the scorer role derives the query rows and the completing
 compressed-key row itself), so every output but ``qi`` is compared: the list, ``counts``, ``block_lens``, the slot report, the Q / K bands
 of the slab, the K / V pools, the ring, the compressed-key cache and the logits buffer -- all bitwise (``torch.equal`` on the bit patterns:
 a NaN-filled pool row compares as its bits).
 
 THE ADAPTER (:class:`FusedPlan`) is the one place that spells the fused kernel's host surface -- the compile keys of
-``compile_qsa_indexer_fused`` and the operands of ``run_qsa_indexer_fused`` as the kernel module's docstrings and tables name them: the
+``compile_qsa_indexer_fused`` and the operands of ``run_qsa_indexer_fused`` as the front door's docstrings and tables name them: the
 prepare's arms + ``d / rope_dim / page_size / slot_dtype / apply_norm / eps`` (``index_head_dim`` and ``pool`` ride in the arms record), the
-scorer's ``(s_q, units_per_warp, ring_depth, has_block_lens)`` (``h_i`` is the arms' head count), the top-k's ``(cols_cap, top_k)``,
-``units`` / ``threads`` / ``use_pdl`` / ``device``, the test-only ``deadline_ns`` / ``check_arrivals`` / ``roles`` / ``order``; the run binds the
-slab bands, the pools, the ring, the cache, the tables, the workspace views, the counters and the stream by KEYWORD.  Against the
-pre-body module both entries raise ``NotImplementedError("... not served yet")`` and every cell below is RED by design.
+scorer's ``(s_q, units_per_warp, ring_depth, has_block_lens)`` (``h_i`` is the arms' head count), the top-k's ``(n_blocks_max, top_k)`` (the
+front door derives ``cols_cap = topk_cols_cap(n_blocks_max, threads)``), ``units`` / ``threads`` (the front door's ``DEFAULT_THREADS`` unless a
+cell names the 1024-thread knob) / ``use_pdl`` / ``device``, the test-only ``deadline_ns`` / ``check_arrivals`` / ``roles`` / ``order``; the run
+binds the slab bands, the pools, the ring, the cache, the tables, the workspace views (``logits`` / ``counts`` / ``block_lens`` /
+``block_ids``), the counters, the stream and -- on a trap rendering -- the deadline and the diagnostic words (pinned host memory, readable
+after a trap) by KEYWORD.  Against the pre-body module both entries raised ``NotImplementedError("... not served yet")`` and every cell
+below was RED (the test commit's RED run); against the body a spelling the front door does not take fails here, in one place.
 
 Child entries (``python qsa_indexer_fused_step.py <mode> '<json>'``; a trap leaves a sticky context, a fresh-process screen needs fresh
 processes): ``launches`` -- N launches of one plan in one process, the counters read back zero after every one and the outputs bitwise the
@@ -440,7 +443,7 @@ def fused_compile_keys(
     page: int,
     n_blocks_max: int,
     units: int,
-    threads: int = 1024,
+    threads: Optional[int] = None,
     slot_dtype=torch.int32,
     dtype=torch.bfloat16,
     rope_table: bool = False,
@@ -456,7 +459,9 @@ def fused_compile_keys(
     order: Optional[str] = None,
 ) -> dict:
     """The compile keys of ``compile_qsa_indexer_fused`` from the step's shapes alone (no tensor, no device: the host renderings use it
-    under ``build_device``).  The test-only keys (``deadline_ns``, ``check_arrivals``, ``roles``, ``order``) are passed only when armed."""
+    under ``build_device``).  ``threads`` None is the front door's ``DEFAULT_THREADS``.  The test-only keys (``deadline_ns``,
+    ``check_arrivals``, ``roles``, ``order``) are passed only when armed."""
+    threads = F.DEFAULT_THREADS if threads is None else int(threads)
     keys = dict(
         dtype=dtype,
         h_q=geom.h_q,
@@ -483,7 +488,7 @@ def fused_compile_keys(
         units_per_warp=int(units_per_warp),
         ring_depth=int(ring_depth),
         has_block_lens=bool(has_block_lens),
-        cols_cap=cols_cap_for(int(n_blocks_max), 1, int(threads)),
+        n_blocks_max=int(n_blocks_max),
         top_k=geom.top_k,
         units=int(units),
         threads=int(threads),
@@ -504,7 +509,7 @@ def fused_compile_keys(
 class FusedPlan:
     """The fused launch behind the adapter: ``compile_qsa_indexer_fused(**keys)`` once, ``run_qsa_indexer_fused`` per step (keyword operands)."""
 
-    def __init__(self, case: StepCase, *, units: int, threads: int = 1024, **extra):
+    def __init__(self, case: StepCase, *, units: int, threads: Optional[int] = None, **extra):
         self.case = case
         self.keys = fused_compile_keys(
             case.geom,
@@ -519,6 +524,7 @@ class FusedPlan:
             ring_slots=case.ring_slots,
             **extra,
         )
+        threads = self.keys["threads"]
         self.table = F.dispatch_table(
             case.T,
             case.B,
@@ -535,6 +541,8 @@ class FusedPlan:
             order=self.keys.get("order", "sequence-major"),
         )
         self.plan = F.compile_qsa_indexer_fused(**self.keys)
+        # the trap rendering's diagnostic words: pinned host memory, so the trap code and the last value read back after a sticky context
+        self.diag = torch.zeros(2, dtype=torch.int64).pin_memory() if "deadline_ns" in self.keys else None
 
     def run(self, X: dict, cnt_row: torch.Tensor, *, stream) -> None:
         c, g = self.case, self.case.geom
@@ -561,17 +569,17 @@ class FusedPlan:
             cos_pos=c.cos_pos,
             sin_pos=c.sin_pos,
             compressed_slot=X["cslot"],
-            seq_q=c.S_q,
             index_eps=g.index_eps,
             index_norm_weight_offset=0.0,
-            ix_logits=X["logits"],
-            ix_counts=X["counts"],
-            ix_block_lens=X["lens"] if self.keys["has_block_lens"] else None,
-            ix_ids=X["ids"],
-            top_k=g.top_k,
+            logits=X["logits"],
+            counts=X["counts"],
+            block_lens=X["lens"] if self.keys["has_block_lens"] else None,
+            block_ids=X["ids"],
             scale=float(g.d_i) ** -0.5,
             cnt_row=cnt_row,
             stream=stream,
+            deadline_ns=self.keys.get("deadline_ns", 0),
+            diag=self.diag,
             **c.paged_kwargs(),
         )
 
@@ -618,7 +626,7 @@ def _case_from(args: dict) -> StepCase:
 
 def _plan_or_decline(case: StepCase, args: dict, **extra):
     try:
-        return FusedPlan(case, units=int(args.get("units", 1)), threads=int(args.get("threads", 1024)), **extra), None
+        return FusedPlan(case, units=int(args.get("units", 1)), threads=args.get("threads"), **extra), None
     except NotImplementedError as e:
         why = decline_reason(e)
         if why is None:
@@ -637,7 +645,7 @@ def child_launches(args: dict) -> int:
     plan, why = _plan_or_decline(case, args, check_arrivals=bool(args.get("check_arrivals", False)))
     if plan is None:
         return _result({"declined": why})
-    _, ref_x = run_reference(case)
+    _, ref_x = run_reference(case, threads=plan.keys["threads"])
     n = int(args.get("launches", 100))
     cnt_row = new_counters(case)
     X = case.fresh()
@@ -684,7 +692,13 @@ def child_trap(args: dict) -> int:
     if plan is None:
         return _result({"declined": why})
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
-    res = {"grid": plan.table.n_ctas, "sms": int(props.multi_processor_count), "order": plan.table.order, "deadline_s": args.get("deadline_s", 2.0)}
+    res = {
+        "grid": plan.table.n_ctas,
+        "sms": int(props.multi_processor_count),
+        "order": plan.table.order,
+        "threads": plan.keys["threads"],
+        "deadline_s": args.get("deadline_s", 2.0),
+    }
     cnt_row = new_counters(case)
     X = case.fresh()
     t0 = time.time()
@@ -695,10 +709,12 @@ def child_trap(args: dict) -> int:
         res.update(
             {"completed": False, "trapped": True, "elapsed_s": round(time.time() - t0, 3), "error": type(e).__name__ + ": " + str(e).splitlines()[0][:200]}
         )
+        res["diag"] = plan.diag.tolist()  # pinned host memory: the trap code and the last counter value the deadline saw
         return _result(res)
     res.update({"completed": True, "trapped": False, "elapsed_s": round(time.time() - t0, 3), "counters_zero": int(cnt_row.abs().sum().item()) == 0})
+    res["diag"] = plan.diag.tolist()
     if args.get("compare", True):
-        _, ref_x = run_reference(case)
+        _, ref_x = run_reference(case, threads=plan.keys["threads"])
         a, b = case.outputs(ref_x, fused=False), case.outputs(X, fused=True)
         res["differs_from_reference"] = [k for k in b if not same(a[k], b[k])]
     return _result(res)

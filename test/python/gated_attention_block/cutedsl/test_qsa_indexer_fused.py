@@ -17,16 +17,18 @@ KERNEL LEVEL (``qsa_indexer_fused_step.py`` is the harness: the step's operands,
 with the decode arms -> ``qsa_score_paged`` -> ``qsa_topk_decode`` on the same primed caches, the fused launch behind ONE adapter, the
 child-process entries): the fused launch is BITWISE the three-launch form (the list, ``counts``, ``block_lens``, the slot report, the Q / K
 bands, the K / V pool rows, the ring rows, the compressed-key cache rows, the logits buffer) over the dispatch rows' cells at the route's
-units and at units 2 / 8 with ``check_arrivals`` armed; the completing row is derived bitwise at every alignment; the degenerate matrix
+units on the default block size and on the 1024-thread knob, at units 2 / 4 / 8 with ``check_arrivals`` armed; the completing row is
+derived bitwise at every alignment; the degenerate matrix
 (a padding sequence, ``kv_lens < S_q``, a dead page under a visible block and under the completing block, a completing block past the
 table's width, the ring at its minimum cap, the identity region, the dead units of the last scorer CTA); the counter lifecycle (zero
 after every launch in fresh processes, a captured FIRST execute replaying bitwise with zero counters, two steps back to back on one
 plan); the trap rendering (a grid larger than the resident capacity terminates under an armed deadline; a placement that strands the
-consumers traps instead of hanging); the host PTX census of the fused rendering and the per-role local-memory pin.  Every kernel-level
-cell compiles the fused plan FIRST: against the pre-body module that is the stubs' ``NotImplementedError`` (RED by design; a missing
-compile key is the missing symbol), a Rule 7 decline by name (the DSL floor / target, the device family, the SMEM opt-in limit) is a
-skip, and a device the three-launch reference cannot run on skips by the scorer's own reason.  The census cells skip until the body is
-served (a rendering is needed).  The kernel timeout is never raised: a child that does not return within its budget FAILS naming the hang.
+consumers traps instead of hanging); the host PTX census of the fused rendering and the per-role register pin.  Every kernel-level
+cell compiles the fused plan FIRST (against the pre-body module that was the stubs' ``NotImplementedError``: the test commit's RED run;
+against the body a compile-key or operand spelling the front door does not take fails in the harness's one adapter), a Rule 7 decline
+by name (the DSL floor / target, the device family, the SMEM ceiling) is a skip, and a device the three-launch reference cannot run on
+skips by the scorer's own reason.  The census cells trace-compile the served body for sm_107a on the host under the target's device
+facts.  The kernel timeout is never raised: a child that does not return within its budget FAILS naming the hang.
 """
 
 import importlib
@@ -56,6 +58,9 @@ needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA de
 requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
 _HERE = Path(__file__).resolve().parent
 _HARNESS = _HERE / "qsa_indexer_fused_step.py"
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import cubin_pin_support as cps  # noqa: E402  (the pins' skip-or-fail contract: the DSL string + the bundled assembler the register figures were taken under)
 
 # the Qwen 3.8 Flash-Next block's geometry (api.py's QsaSpec defaults: index_heads 4, index_head_dim 128; d_head 256)
 H_Q, H_KV, D, INDEX_HEADS, INDEX_HEAD_DIM, TOP_K = 24, 2, 256, 4, 128, 512
@@ -449,22 +454,6 @@ def _H():
     return importlib.import_module("qsa_indexer_fused_step")
 
 
-def _body_served() -> bool:
-    """Whether ``compile_qsa_indexer_fused`` is the body or the pre-body stub (the stub raises 'not served yet' whatever it is given)."""
-    try:
-        F.compile_qsa_indexer_fused()
-    except NotImplementedError as e:
-        return "not served yet" not in str(e)
-    except Exception:  # noqa: BLE001 -- the body refuses an empty call by form (TypeError / ValueError): it is served
-        return True
-    return True
-
-
-needs_body = pytest.mark.skipif(
-    not _body_served(), reason="the fused indexer's body is not served yet (compile_qsa_indexer_fused is the stub): the census needs a rendering"
-)
-
-
 def _case(b, s_q, nbm, page=16, *, kv=None, seed=1, geom=None, **kw):
     H = _H()
     return H.StepCase(
@@ -593,10 +582,11 @@ def test_the_three_launch_reference_is_self_consistent(b, s_q, nbm, page, kw):
 
 
 def _t2_cells():
-    """``(b, s_q, n_blocks_max, page, units, extra)``: the dispatch rows' cells at the route's units (1 at B <= 4 for 8K / 32K tokens, 2 at
-    128K, 8 at B 32), the units 2 / 8 variants with ``check_arrivals`` (two of them with a chunk count that is not a multiple of ``units``:
-    dead units in the last scorer CTA), the optional ``block_lens`` arm, the plan's other arms (the RoPE-table arm, the stack's ring slots
-    with int64 slots), the PDL pair, the 512-thread fallback.  The small grid first; the B 32 and the 128K cells carry a ``big_`` id."""
+    """``(b, s_q, n_blocks_max, page, units, extra)``: the dispatch rows' cells at the route's units on the DEFAULT block size (512 by the
+    register pin: units 1 at B <= 4 for 8K / 32K tokens, 2 at 128K, 4 at B 32 -- 8 units fit the 1024-thread knob alone), the knob at
+    units 1 / 2 / 8, the units 2 / 4 / 8 variants with ``check_arrivals`` (three of them with a chunk count that is not a multiple of
+    ``units``: dead units in the last scorer CTA), the optional ``block_lens`` arm, the plan's other arms (the RoPE-table arm, the stack's
+    ring slots with int64 slots), the PDL pair.  The small grid first; the B 32 and the 128K cells carry a ``big_`` id."""
     small, big = [], []
     for b in (1, 4):
         for s_q in (1, 4):
@@ -605,17 +595,19 @@ def _t2_cells():
                     small.append((b, s_q, n, page, 1, {}))
     small += [
         (1, 1, 2048, 16, 2, {}),
-        (1, 1, 2048, 16, 8, {}),
-        (4, 4, 8192, 16, 8, {}),
+        (4, 1, 8192, 16, 4, {}),
+        (1, 1, 2048, 16, 8, dict(threads=1024)),
+        (4, 4, 8192, 16, 8, dict(threads=1024)),
         (4, 1, 1032, 16, 2, {}),
-        (4, 1, 1032, 16, 8, {}),
-        (1, 4, 520, 32, 8, {}),
+        (4, 1, 1032, 16, 8, dict(threads=1024)),
+        (1, 4, 520, 32, 8, dict(threads=1024)),
         (1, 1, 2048, 16, 1, dict(has_block_lens=False)),
         (4, 4, 2048, 16, 1, dict(rope_table=True)),
         (4, 1, 8192, 16, 1, dict(ring_slots=True, slot_dtype=torch.int64)),
         (4, 4, 8192, 16, 2, dict(use_pdl=True)),
-        (1, 1, 2048, 16, 1, dict(threads=512)),
-        (4, 1, 8192, 64, 2, dict(threads=512)),
+        (1, 1, 2048, 16, 1, dict(threads=1024)),
+        (4, 1, 8192, 64, 2, dict(threads=1024)),
+        (4, 4, 8192, 16, 1, dict(threads=1024, rope_table=True)),
     ]
     for b in (1, 4):
         for s_q in (1, 4):
@@ -624,7 +616,10 @@ def _t2_cells():
     for s_q in (1, 4):
         for n in (2048, 8192, 32768):
             for page in (16, 32, 64):
-                big.append((32, s_q, n, page, 8, {}))
+                big.append((32, s_q, n, page, 4, {}))
+    for s_q in (1, 4):
+        for page in (16, 64):
+            big.append((32, s_q, 8192, page, 8, dict(threads=1024)))
     return small, big
 
 
@@ -765,6 +760,7 @@ def test_degenerate_inputs_follow_the_matrix(row):
         case = _case(4, 1, 520, 16, kv=[4 * 500, 4 * 513, 4 * 520, 4 * 100], seed=308)  # counts 500 / 513 (one past the identity) / 520 / 100
     elif row.startswith("dead_units"):
         units, nbm = (2, 1032) if row == "dead_units_u2_1032" else (8, 1032) if row == "dead_units_u8_1032" else (8, 520)
+        kw = dict(threads=1024) if units == 8 else {}  # 8 units fit the 1024-thread knob alone
         case = _case(2, 1, nbm, 16, kv=[4 * nbm, 4 * (nbm - 130) + 3], seed=309)
     else:  # pragma: no cover
         raise AssertionError(row)
@@ -823,15 +819,18 @@ _LAUNCHES = int(os.environ.get("QSA_FUSED_LAUNCHES", "100"))
 
 @needs_cuda
 def test_counters_are_zero_after_every_launch_in_fresh_processes():
-    """The fresh-process screen: 12 interpreters x 100 launches of one plan (half at units 2, half at units 8, ``check_arrivals`` armed in
-    every one): the counters read zero after every launch and every launch is bitwise the first and the three-launch reference."""
+    """The fresh-process screen: 12 interpreters x 100 launches of one plan (half at units 2 on the default block size, half at units 8 on
+    the 1024-thread knob, ``check_arrivals`` armed in every one): the counters read zero after every launch and every launch is bitwise the
+    first and the three-launch reference."""
     case = _case(4, 1, 2048, 16, seed=5)
-    _fused(case, units=2, check_arrivals=True)  # the stub / the decline, named here before any child is spawned
+    _fused(case, units=2, check_arrivals=True)  # the decline, named here before any child is spawned
     _skip_unless_reference()
     for i in range(_PROCESSES):
-        units = 2 if i % 2 == 0 else 8
+        units, threads = (2, F.DEFAULT_THREADS) if i % 2 == 0 else (8, 1024)
         proc, res = _child(
-            "launches", dict(batch=4, s_q=1, n_blocks_max=2048, page=16, units=units, check_arrivals=True, launches=_LAUNCHES, seed=100 + i), timeout=1500
+            "launches",
+            dict(batch=4, s_q=1, n_blocks_max=2048, page=16, units=units, threads=threads, check_arrivals=True, launches=_LAUNCHES, seed=100 + i),
+            timeout=1500,
         )
         assert proc.returncode == 0 and res.get("ok"), f"process {i} (units {units}): {res}"
 
@@ -923,7 +922,7 @@ def test_fused_indexer_grid_larger_than_the_resident_capacity_terminates(b, s_q,
     a trap or a hang here is the forward-progress assumption failing on this part + driver."""
     tb = _table(b, s_q, nbm, units, 1024)
     assert tb.n_ctas == ctas and tb.n_ctas > _sm_count(), (tb, _sm_count())
-    _, res = _child("trap", dict(batch=b, s_q=s_q, n_blocks_max=nbm, page=16, units=units, deadline_s=2.0, seed=31), timeout=1500)
+    _, res = _child("trap", dict(batch=b, s_q=s_q, n_blocks_max=nbm, page=16, units=units, threads=1024, deadline_s=2.0, seed=31), timeout=1500)
     assert res["completed"] and not res["trapped"], res
     assert res["counters_zero"] and res["differs_from_reference"] == [], res
 
@@ -979,11 +978,17 @@ _RENDER_PROBE = textwrap.dedent("""
     sys.path.insert(0, harness_dir)
     import torch
     import qsa_indexer_fused_step as H
+    import cudnn.frost.device as DEV
     from cudnn.frost.device import build_device
     from cudnn.gated_attention_block.kernels import qsa_indexer_fused as F
+    # the host has no target device: the front door reads the TARGET's device facts here (cc 10.7; the part's opt-in and oversized
+    # SMEM ceilings, 227 KiB / 327 KiB), so the compile takes the target's limits under the arch override, as the launch on the node does
+    DEV.compute_capability = lambda d: (10, 7)
+    DEV.shared_memory_per_block_optin = lambda d: 232448
+    DEV.oversized_shared_memory_per_block = lambda d: 334848
     keys = H.fused_compile_keys(H.FLASH_NEXT, s_q=kw["s_q"], page=kw["page"], n_blocks_max=kw["n_blocks_max"], units=kw["units"], threads=kw["threads"],
                                 use_pdl=kw.get("use_pdl", False), check_arrivals=kw.get("check_arrivals", False), deadline_ns=kw.get("deadline_ns"),
-                                roles=kw.get("roles"), device=0)
+                                roles=kw.get("roles"), order=kw.get("order"), device=0)
     with build_device(0):  # the compile key's device index, pinned: the trace needs no CUDA device (CUTE_DSL_ARCH names the target)
         try:
             F.compile_qsa_indexer_fused(**keys)
@@ -1085,10 +1090,14 @@ _CENSUS_CELLS = [
     ("u1_t512_s1_cap32768", dict(s_q=1, page=16, n_blocks_max=32768, units=1, threads=512)),
     ("u2_t1024_s1_cap8192_check_arrivals", dict(s_q=1, page=16, n_blocks_max=8192, units=2, threads=1024, check_arrivals=True)),
     ("u1_t1024_s1_cap8192_deadline", dict(s_q=1, page=16, n_blocks_max=8192, units=1, threads=1024, deadline_ns=2_000_000_000)),
+    (
+        "u1_t512_s1_cap8192_deadline_global",
+        dict(s_q=1, page=16, n_blocks_max=8192, units=1, threads=512, deadline_ns=2_000_000_000, order="consumers-first-global"),
+    ),
+    ("u4_t512_s4_cap32768", dict(s_q=4, page=16, n_blocks_max=32768, units=4, threads=512)),
 ]
 
 
-@needs_body
 @pytest.mark.parametrize("tag,kw", _CENSUS_CELLS, ids=[c[0] for c in _CENSUS_CELLS])
 def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
     """The counter sites of the tables in the sm_107a PTX: ``red.release.gpu.global.add.u64`` x S_q (the arrival count of the ledger, one
@@ -1121,18 +1130,38 @@ def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
         assert c[".local"] == 0, c
 
 
-@needs_body
-@pytest.mark.parametrize("role,units", [("prepare", 1), ("scorer", 1), ("topk", 1), ("scorer", 8), ("scorer", 2)], ids=lambda v: str(v))
-def test_no_local_memory_spill_per_role_at_1024_threads(tmp_path, role, units):
+_ROLE_PIN_DSL = ("nvidia-cutlass-dsl 4.8.0", "ptxas 13.4.59")  # the DSL build (the distribution string, the bundled assembler) the figures were taken under
+_ROLE_PINS = [
+    # (role, units, threads, (STL, LDL)) of the role-isolated sm_107a rendering at S_q 1 and 8192 columns: the register census's figures, EXACT
+    ("prepare", 1, 512, (0, 0)),
+    ("scorer", 1, 512, (0, 0)),
+    ("scorer", 2, 512, (0, 0)),
+    ("scorer", 4, 512, (0, 0)),
+    ("topk", 1, 512, (0, 0)),
+    ("prepare", 1, 1024, (0, 0)),
+    ("scorer", 1, 1024, (0, 0)),
+    ("scorer", 2, 1024, (0, 0)),
+    ("scorer", 8, 1024, (1, 1)),  # the knob's recorded pair at 64 registers (the scorer at MMA batch 1): the figure that made 512 the default
+    ("topk", 1, 1024, (0, 0)),
+]
+
+
+@pytest.mark.parametrize("role,units,threads,expect", _ROLE_PINS, ids=[f"{r}_u{u}_t{t}" for r, u, t, _ in _ROLE_PINS])
+def test_per_role_local_memory_matches_the_register_census(tmp_path, role, units, threads, expect):
     """The register pin BEFORE any GPU time: a role-isolated sm_107a rendering (the ``roles`` compile key traces the other branches empty at
-    the SAME block size, SMEM and ABI) at 1024 threads = 64 registers flat holds no ``STL`` / ``LDL`` for the prepare and the scorer (at
-    every served units) and for the top-k at 8192 columns; ``REG`` reads at most 64.  A spill in the scorer is the recorded 512-thread
-    fallback, never a silent default."""
-    kw = dict(s_q=1, page=16, n_blocks_max=8192, units=units, threads=1024, roles=[role])
-    ptx, cubin = _render(tmp_path, f"only_{role}_u{units}", kw)
+    the SAME block size, SMEM and ABI).  At the DEFAULT 512 threads (128 registers) every role is spill-free at every served units; at the
+    1024-thread knob (64 registers flat) the prepare, the top-k at 8192 columns and the scorer at 1 / 2 units are spill-free and the scorer
+    at 8 units holds exactly the recorded ``STL`` / ``LDL`` pair -- the figure that made 512 the default, never a silent one.  EXACT pins (a
+    change in either direction is a change to record), valid for the DSL build they were taken under: another build skips naming both
+    sides, or fails under ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1`` (the cubin pins' contract); ``REG`` reads at most the file over the block."""
+    cps.check_arch()
+    cps.check_dsl(_ROLE_PIN_DSL[0])
+    kw = dict(s_q=1, page=16, n_blocks_max=8192, units=units, threads=threads, roles=[role])
+    ptx, cubin = _render(tmp_path, f"only_{role}_u{units}_t{threads}", kw)
     assert ptx.count(".local") == 0, f"{role}: local memory in the PTX"
     assert cubin is not None, "no cubin was kept"
+    cps.check_compiler(_ROLE_PIN_DSL[1], cps.compiler_of_cubin(cubin))
     reg, stl, ldl = _sass_counts(cubin)
-    print(f"\n[{role} u{units}] REG {reg} STL {stl} LDL {ldl}")
-    assert 0 < reg <= 64, reg
-    assert stl == 0 and ldl == 0, f"{role} at units {units}: STL {stl} / LDL {ldl} at 1024 threads"
+    print(f"\n[{role} u{units} t{threads}] REG {reg} STL {stl} LDL {ldl}")
+    assert 0 < reg <= 65536 // threads, reg
+    assert (stl, ldl) == expect, f"{role} at units {units} / {threads} threads: STL {stl} / LDL {ldl}; the census recorded {expect}"
