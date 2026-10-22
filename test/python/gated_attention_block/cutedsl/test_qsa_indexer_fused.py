@@ -16,6 +16,7 @@ facts come through the scorer's front door).
 import itertools
 
 import pytest
+import torch
 
 from cudnn.frost.buffers import cutedsl_requirement_error
 from cudnn.gated_attention_block.kernels import qsa_indexer_fused as F
@@ -129,7 +130,9 @@ def test_mirrored_constants_equal_the_kernels_own():
 
     assert F.TOPK_MAX_EPT == qsa_topk_decode.MAX_EPT
     assert F.TOPK_MAX_ROWS == qsa_topk_decode.MAX_ROWS
-    assert set(F.FUSED_THREAD_COUNTS) == set(qsa_topk_decode.THREAD_COUNTS) and F.DEFAULT_THREADS == qsa_topk_decode.DEFAULT_THREADS_PER_CTA
+    assert set(F.FUSED_THREAD_COUNTS) == set(qsa_topk_decode.THREAD_COUNTS) and F.DEFAULT_THREADS in F.FUSED_THREAD_COUNTS
+    assert F.DEFAULT_THREADS == 512  # the register census's verdict: the 64-register scorer spills at 1024 (the module docstring of DEFAULT_THREADS)
+    assert F.scorer_mma_batch_for(1024) == F.SCORER_MMA_BATCH_AT_64_REGS == 1 and F.scorer_mma_batch_for(512) == 0
     assert F._ELEMS_PER_ACCESS == qk_norm_rope.ELEMS_PER_ACCESS
     for d in (64, 128, 256, 512):
         assert F._lanes_per_row(d) == qk_norm_rope.lanes_per_row(d)
@@ -309,11 +312,56 @@ def test_module_docstring_carries_the_pre_development_tables_and_the_contract():
     assert "No performance number is claimed" in doc
 
 
-def test_unserved_entries_decline_by_name():
-    with pytest.raises(NotImplementedError, match="not served yet"):
-        F.compile_qsa_indexer_fused()
-    with pytest.raises(NotImplementedError, match="not served yet"):
-        F.run_qsa_indexer_fused()
+def test_served_entries_gate_before_the_kernel_module(monkeypatch):
+    """The two served entries keep Rule 7's order: the DSL floor is read FIRST (a modeled sub-floor DSL is a typed decline naming it), the
+    form refusals of the fused declaration (the query arm, a step wider than the compress ratio, the mis-ordered table without the trap's
+    deadline) are typed and raised before the kernel module is imported; the compile keys stay in the docstrings (``cols_cap, top_k``, the
+    test-only ``deadline_ns`` / ``check_arrivals``), the counter contract in the run entry's; the counter-word checks are DSL-free."""
+    import sys
+    from typing import NamedTuple
+
+    class _Arms(NamedTuple):  # the prepare's QsaPrepareIndexArms record, field for field (that class lives in the kernel module: not imported here)
+        heads: int
+        head_dim: int
+        raw_pool: bool = True
+        query: bool = False
+        compress: bool = False
+        n_commit: bool = False
+        pool: int = 4
+        paged: bool = False
+        ring_slots: bool = False
+        rope_table: bool = False
+
+    kernel_module = "cudnn.gated_attention_block.kernels.qsa_indexer_fused_kernel"
+    before = kernel_module in sys.modules
+    arms = _Arms(heads=INDEX_HEADS, head_dim=INDEX_HEAD_DIM, raw_pool=False, query=False, compress=True, pool=4, paged=True)
+    base = dict(dtype=torch.bfloat16, h_q=H_Q, h_kv=H_KV, d=D, rope_dim=64, eps=1e-6, page_size=16, index=arms, s_q=1, n_blocks_max=2048, top_k=TOP_K, units=1)
+    monkeypatch.setattr(F, "cutedsl_requirement_error", lambda what: f"{what} requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2")
+    with pytest.raises(NotImplementedError, match="qsa_indexer_fused requires nvidia-cutlass-dsl >= 4.7.0; found 4.6.2"):
+        F.compile_qsa_indexer_fused(**base)
+    monkeypatch.setattr(F, "cutedsl_requirement_error", lambda what: None)
+    with pytest.raises(ValueError, match="index.query must be False"):
+        F.compile_qsa_indexer_fused(**dict(base, index=arms._replace(query=True)))
+    with pytest.raises(ValueError, match="compress=True and paged=True"):
+        F.compile_qsa_indexer_fused(**dict(base, index=arms._replace(paged=False)))
+    with pytest.raises(NotImplementedError, match="exceed the compress ratio pool"):
+        F.compile_qsa_indexer_fused(**dict(base, s_q=5))
+    with pytest.raises(NotImplementedError, match="bf16 activations"):
+        F.compile_qsa_indexer_fused(**dict(base, dtype=torch.float16))
+    with pytest.raises(ValueError, match="served only with deadline_ns"):
+        F.compile_qsa_indexer_fused(**dict(base, order="consumers-first"))
+    with pytest.raises(ValueError, match="roles must be a non-empty subset"):
+        F.compile_qsa_indexer_fused(**dict(base, roles=("tile",)))
+    with pytest.raises(ValueError, match="units must be one of"):
+        F.compile_qsa_indexer_fused(**dict(base, units=3))
+    assert (kernel_module in sys.modules) == before, "a typed decline imported the kernel module"
     assert "cols_cap, top_k" in F.compile_qsa_indexer_fused.__doc__ and "deadline_ns" in F.compile_qsa_indexer_fused.__doc__
     assert "check_arrivals" in F.compile_qsa_indexer_fused.__doc__
     assert "cnt_row" in F.run_qsa_indexer_fused.__doc__
+    # the plan-owned counter words: int64, 1-D, contiguous, CUDA, >= T words -- each a typed ValueError (no device needed for the refusals)
+    with pytest.raises(ValueError, match="int64"):
+        F._check_counter_words(torch.zeros(4, dtype=torch.int32), 4, torch.device("cpu"))
+    with pytest.raises(ValueError, match="contiguous 1-D CUDA tensor"):
+        F._check_counter_words(torch.zeros(4, dtype=torch.int64), 4, torch.device("cpu"))
+    with pytest.raises(ValueError, match="contiguous 1-D CUDA tensor"):
+        F._check_counter_words(torch.zeros(2, 2, dtype=torch.int64), 4, torch.device("cpu"))

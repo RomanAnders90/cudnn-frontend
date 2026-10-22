@@ -55,7 +55,11 @@ stage of the pipeline in ``api.py``::
     qsa_indexer_fused.py        the three decode-indexer launches above (prepare, paged scorer, decode top-k) as ONE kernel whose CTAs
                                 take a ROLE from ``blockIdx`` against a host dispatch table; the scorer role derives its own indexer rows
                                 (the prepare off the critical path), per-row GMEM counters release the top-k -- the pre-development
-                                tables (dispatch / counter / barrier / SMEM) and the host dispatch table (no kernel module imported) land first, the body later
+                                tables (dispatch / counter / barrier / SMEM), the host dispatch table and the served compile / run entries
+                                (the Rule 7 front door: no kernel module imported at import time)
+    qsa_indexer_fused_kernel.py the fused indexer's kernel half: the role branch over ``prepare_role`` / ``score_role`` (fused, derive) /
+                                ``topk_role`` (fused), its launch wrapper, the fake-argument builder of the host renderings, the lowered
+                                compile / launch
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the

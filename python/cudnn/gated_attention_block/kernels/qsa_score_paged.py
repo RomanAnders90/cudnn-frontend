@@ -143,7 +143,7 @@ name                  kind                                    issuing lanes     
                       served rendering traces it yet)                                                                      stay the CTA's and the counters' barriers); the standalone kernel never traces it
 ``bar.sync 2+units,`` the CTA-wide PUBLISH barrier (``score_role``  all ``128 x units`` threads of the CTA  128 x units == the  the SAME site again, rendered INSTEAD of the per-unit barrier under ``derive``: the
 ``128 x units``       ``fused=True, derive=True`` only; the      (4 x units warps x 32), once: SUM =   CTA's units          derive warps' ``st.shared`` of the query tile (and of the completing row) must reach
-                      derive arm is a stub today)                128 x units                                               EVERY unit's fragment reads, and the per-unit barrier would order nothing there (no
+                      fused indexer kernel's rendering)          128 x units                                               EVERY unit's fragment reads, and the per-unit barrier would order nothing there (no
                                                                                                                            query-tile ``cp.async`` under ``derive``, the key rings per warp): ONE barrier at the
                                                                                                                            site serves both jobs; the standalone kernel never traces it
 ====================  ======================================  ==================================  ===================  ===============================================================================
@@ -172,10 +172,13 @@ the kernel it was before the body moved (the test module's ``sm_107a`` cubin pin
 ``renderings/md5_qsa_score_paged_sm_107a.txt``).  A fused indexer kernel runs ``units`` of them per wider CTA from one SMEM union sized
 by :func:`score_smem_elems` (the unit's rings at ``unit x ring_elems_per_unit``, one shared query tile) and takes the ``fused`` /
 ``derive`` seams: the named barriers above (the unit's under ``fused``, the CTA-wide one under ``derive``), the ``counts`` write by the
-unit that scores chunk 0 alone, the per-row counter release after the CTA's last store -- every thread of the CTA's units joins it and
-ONE warp of the CTA signals it, ``warp_gate = (unit == 0) & (warp_in_unit == 0)`` (``warp_in_unit == 0`` alone holds on one warp of EVERY
-unit and would arrive ``units`` times per CTA) --, the query tile derived in SMEM instead of copied from ``mQ``.  No served rendering
-traces either flag yet (both raise ``NotImplementedError`` by name at trace time; the test module's seam cells trace them to the stubs).
+unit that scores chunk 0 alone, the per-row counter release after the CTA's last store (``gsync.release_add_rows``: one fence and one
+named barrier, then the ``S_q`` words' ``red.release`` by ONE elected lane) -- every thread of the CTA's units joins it and ONE warp of
+the CTA signals it, ``warp_gate = (unit == 0) & (warp_in_unit == 0)`` (``warp_in_unit == 0`` alone holds on one warp of EVERY unit and
+would arrive ``units`` times per CTA) --, the query tile and the completing compressed-key row derived in SMEM by unit 0's warps 0-2
+(:func:`_derive_indexer_rows`: the prepare's own helpers in the prepare's lane geometry) instead of copied from ``mQ``, the owning warp's
+lane-matched overwrite of the slot row holding that column.  The standalone kernel traces neither flag; the fused indexer kernel
+(``qsa_indexer_fused.py``) renders both, and the test module's seam cells trace the arms through a wrapper kernel.
 
 PDL sites (under the ``use_pdl`` compile key, the launch attribute set with it): ``griddepcontrol.wait`` is the kernel's first
 instruction -- ahead of the ``kv_lens`` / table / ``qi`` reads and so of every cache read --, ``griddepcontrol.launch_dependents``
@@ -231,10 +234,17 @@ from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirem
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import compute_capability, current_device
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.gsync import release_add_rows
 from cudnn.frost.tile_dsl.mma import mma_m16n8k16_f32, mma_m16n8k32_f32
-from cudnn.frost.tile_dsl.pointwise import opaque_f32_zero, opaque_i32
-from cudnn.frost.tile_dsl.tma import ld_global, st_global, st_global_v2
+from cudnn.frost.tile_dsl.pointwise import f16x2_to_f32, fp32_to_fp16, opaque_f32_zero, opaque_i32, rmsnorm_rstd, rope_rotate_half
+from cudnn.frost.tile_dsl.tma import ld_global, ld_global_v4, st_global, st_global_v2
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+
+# the derive arm of the fused indexer kernel re-derives the prepare's indexer rows with the prepare's OWN helpers in the prepare's lane
+# geometry (the bitwise claim of the fused form rests on this); the standalone scorer folds the arm out and never traces them
+from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, vec_chunks
+from .qsa_compress import paged_block_row, ring_entry, ring_row_address, step_position
+from .qsa_prepare import _rope_row_addrs, _step_row_position
 
 # the kernel's host-side facts live in the DSL-free front door (Rule 7: a declaration reads them without importing this module)
 from cudnn.QSA.selection_paged import (
@@ -261,6 +271,8 @@ from cudnn.QSA.selection_paged import (
 
 __all__ = [
     "QsaScorePagedRecipe",
+    "SNEW_ELEMS",
+    "SNEW_WORD_ELEM",
     "score_role",  # the body as a role function (a fused indexer kernel calls it per unit); frost_qsa_score_paged is its one-unit standalone rendering
     "score_smem_elems",
     "dsl_decline_reason",
@@ -352,6 +364,15 @@ def _resolve_l2_hint(l2_hint: Optional[bool]) -> bool:
             raise NotImplementedError(why)
         return True
     return False
+
+
+_DERIVE_ROW_BYTES = row_bytes(2)  # the derive arm packs bf16 rows (the fused indexer serves the bf16 cache; the e4m3 cache is its typed decline)
+SNEW_ELEMS = (_DERIVE_ROW_BYTES + 16) // 4
+"""The derive arm's completing-row staging ``sNew`` in Int32 elements: one 256-B bf16 row (16 granules, written by the 16 lanes of one row
+group, read lane-matched by the owning warp's 16 copying lanes of that slot row -- no swizzle: the writer and the reader of granule ``c`` are
+the same lane index) + one 16-B slot holding the presence / column word (``blk_new``, or -1 when this step completes no block)."""
+SNEW_WORD_ELEM = _DERIVE_ROW_BYTES // 4
+"""The element index of the presence / column word inside ``sNew``."""
 
 
 # --------------------------------------------------------------------------------------------- the kernel
@@ -544,6 +565,251 @@ def score_smem_elems(h_i: int, s_q: int, units_per_warp: int, ring_depth: int, e
 
 
 @cute.jit
+def _derive_indexer_rows(
+    sA,  # the CTA's padded (s, h) query tile (an Int32 SMEM array): written here in the copy's c ^ (4 x (row & 1)) granule layout
+    sNew,  # the CTA's completing-row staging (an Int32 SMEM array of SNEW_ELEMS): the bf16 row + the presence word
+    mIQsrc: cute.Tensor,  # [T, H_i, D_i] the slab's indexer-query band (token / head strides symbolic)
+    mIKsrc: cute.Tensor,  # [T, 1, D_i] the slab's raw-key band (token stride symbolic)
+    mWiq: cute.Tensor,  # [D_i] the indexer queries' norm weight
+    mWik: cute.Tensor,  # [D_i] the compressed keys' norm weight
+    mCos: Optional[cute.Tensor],  # [T, rope_dim] per-token rows, or None: the RoPE-table arm reads mCosPos / mSinPos at the row's position
+    mSin: Optional[cute.Tensor],
+    mCosPos: cute.Tensor,  # [1 or B, S_pos, rope_dim] position-indexed (the compress arm's tables)
+    mSinPos: cute.Tensor,
+    mKvLens: cute.Tensor,  # [B] int32: the KV length AFTER the step
+    mNCommit: Optional[cute.Tensor],  # [B] int32 (the accepted prefix), or None (= every row)
+    mRing: cute.Tensor,  # [blocks, cap, 1, D_i] the paged raw-key ring
+    mStateTable: cute.Tensor,  # [B, 1] int32: the ring's block table
+    mTable: cute.Tensor,  # [B, max_pages] int32: the MAIN block table
+    mKbar: cute.Tensor,  # [num_pages, R, D_i] the compressed-key cache: its shape facts name the prepare's -2 predicate (nothing is read from it)
+    b: cutlass.Int32,
+    warp: cutlass.Int32,  # the derive warp: 0 / 1 the query rows, 2 the completing row (the caller gates unit 0's warps 0-2)
+    lane: cutlass.Int32,  # 0..31
+    eps_i: cutlass.Float32,
+    w_offset_i: cutlass.Float32,
+    h_i: cutlass.Constexpr[int],
+    s_q: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    pool: cutlass.Constexpr[int],
+) -> None:
+    """The fused indexer kernel's DERIVE prologue (the scorer role under ``derive``): the indexer rows this step's prepare would hand the
+    scorer, computed from data that exists when the kernel starts -- so the prepare role is off the scorer's critical path.
+
+    Warps 0 and 1 write EVERY row of the padded (s, h) query tile ``sA``: a live row is ``qsa_prepare``'s indexer-query arm op for op
+    (``qsa_compress`` at pool 1: ``acc = 0 + x``, ``pooled = acc x 1.0``, ``rmsnorm_rstd``, ``pooled x rstd x (w + w_offset)``,
+    ``rope_rotate_half`` at the token's position from the per-token rows or the position tables) in the arm's 16-lane row geometry and
+    the ``cp.async`` copy's granule layout; a padding row (``h >= H_i``, ``s >= S_q``) is ZERO, as the copy's zero-fill made it, and so is a
+    row at or past the RoPE table under the table arm (the prepare stores nothing for it and reports it ``-2``: a contract violation,
+    never a served step).  Warp 2 computes the ONE compressed-key row this step completes (``(pos0 + j + 1) % pool == 0`` for the one
+    ``j < S_q`` such a row can have at ``S_q <= pool``): ``qsa_prepare``'s compress arm op for op -- the ``pool`` raw keys in position order
+    (the ring rows below ``pos0`` through ``ring_row_address``, this step's rows from the slab band), ``mean``, ``rstd``, ``x (w + w_offset)``,
+    ``rope_rotate_half`` at the block START from the position tables -- under the SAME predicate the prepare writes the block with
+    (``committed & completes & fits & in_table``: ``ring_entry`` / ``paged_block_row`` on the same tables), into ``sNew`` with the block id
+    as its presence word, or ``-1`` (no substitution anywhere) when the step completes no block or the prepare would report ``-2``.
+    Every lane of the three warps computes (the group shuffles are warp-collective); the stores are the row groups' own.  The CTA-wide
+    publish barrier that follows (``bar.sync 2 + units, 128 x units`` at the query-tile site of :func:`score_role`) orders these generic
+    ``st.shared`` before every unit's fragment reads and the owning warp's ``sNew`` read."""
+    rm = query_row_map(s_q, h_i)
+    d_i = cutlass.const_expr(INDEX_HEAD_DIM)
+    rb = _DERIVE_ROW_BYTES  # the bf16 row the derive writes (256 B; the caller's cache is bf16 under derive)
+    a_tile_elems = MMA_M * rb // 4  # one m-tile of the padded query tile, in Int32 elements
+    lanes_i = cutlass.const_expr(lanes_per_row(d_i))  # 16 lanes per 128-wide row
+    chunks_i = cutlass.const_expr(vec_chunks(d_i))  # one 16-B granule per lane
+    if cutlass.const_expr(chunks_i != 1 or lanes_i != 16):
+        raise NotImplementedError(
+            f"_derive_indexer_rows: the derive follows the copy's 16-granule rows (index_head_dim {INDEX_HEAD_DIM}), got lanes {lanes_i} chunks {chunks_i}"
+        )
+    rope_lanes = cutlass.const_expr(rope_dim // ELEMS_PER_ACCESS)
+    half_lanes = cutlass.const_expr(rope_lanes // 2)
+    has_n_commit = cutlass.const_expr(mNCommit is not None)
+    table_dtype = mCosPos.element_type if cutlass.const_expr(mCos is None) else mCos.element_type
+    io_dtype = mIQsrc.element_type
+    bpe = cutlass.Int64(2)
+    zero_i = cutlass.Int32(0)
+    s_q_i = cutlass.Int32(s_q)
+    lane_g = lane & cutlass.Int32(lanes_i - 1)  # the warp lane's index inside its 16-lane row group = the granule it holds
+    half = lane >> cutlass.Int32(4)  # the row group of the warp (0 / 1)
+    lane_off = lane_g.to(cutlass.Int64) * cutlass.Int64(ACCESS_BYTES)
+    if warp < cutlass.Int32(2):
+        # ---- the S_q x H_i indexer-query rows, every row of the padded tile (two rows per warp per step; a padding row is zero) ---------
+        q_base = mIQsrc.iterator.toint()
+        q_s0 = cutlass.Int64(mIQsrc.stride[0])
+        q_s1 = cutlass.Int64(mIQsrc.stride[1])
+        w_base = mWiq.iterator.toint()
+        for t in cutlass.range_constexpr(rm.m_tiles):
+            for it in cutlass.range_constexpr(MMA_M // 4):
+                r = cutlass.Int32(4 * it) + warp * cutlass.Int32(2) + half  # the tile row (0..15) of the calling lane group
+                g = r & cutlass.Int32(7)
+                hf = r >> cutlass.Int32(3)
+                if cutlass.const_expr(rm.tile_rows == 1):
+                    s_row = cutlass.Int32(t * rm.queries_per_tile) + hf * cutlass.Int32(8) + g
+                    h_row = zero_i
+                else:
+                    s_row = cutlass.Int32((t // rm.tiles_per_query) * rm.queries_per_tile) + (g >> cutlass.Int32(rm.stages))
+                    h_row = cutlass.Int32(16 * (t % rm.tiles_per_query)) + hf + (g & cutlass.Int32(rm.group - 1)) * cutlass.Int32(2)
+                valid = (s_row < s_q_i) & (h_row < cutlass.Int32(h_i))
+                s_c = s_row if s_row < s_q_i else s_q_i - cutlass.Int32(1)
+                h_c = h_row if h_row < cutlass.Int32(h_i) else cutlass.Int32(h_i - 1)
+                token = b * s_q_i + s_c
+                token64 = token.to(cutlass.Int64)
+                src_addr = q_base + (token64 * q_s0 + h_c.to(cutlass.Int64) * q_s1) * bpe
+                store_qi = valid
+                pos_t = zero_i
+                b_t = zero_i
+                if cutlass.const_expr(mCos is None):
+                    pos_t, b_t = _step_row_position(None, mKvLens, token, s_q_i)
+                    store_qi = store_qi & (pos_t < cutlass.Int32(mCosPos.shape[1]))
+                # pool = 1: acc = 0 + x, pooled = acc * 1.0 -- the compress kernel's own arithmetic, kept so the bits agree
+                acc = []
+                for _ in cutlass.range_constexpr(chunks_i):
+                    acc.append([cutlass.Float32(0.0)] * ELEMS_PER_ACCESS)
+                for c in cutlass.range_constexpr(chunks_i):
+                    coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+                    pairs = [f16x2_to_f32(wd, dtype=io_dtype) for wd in ld_global_v4(src_addr + coff, cutlass.Int32)]
+                    vals = [v for pair in pairs for v in pair]
+                    for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                        acc[c][i] = acc[c][i] + vals[i]
+                inv_pool = cutlass.Float32(1.0)
+                pooled = []
+                for c in cutlass.range_constexpr(chunks_i):
+                    pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+                ssq = cutlass.Float32(0.0)
+                for c in cutlass.range_constexpr(chunks_i):
+                    for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                        ssq = ssq + pooled[c][i] * pooled[c][i]
+                rstd = rmsnorm_rstd(ssq, lanes_i, d_i, eps_i)
+                ys = []
+                for c in cutlass.range_constexpr(chunks_i):
+                    coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+                    w_pairs = [f16x2_to_f32(wd, dtype=mWiq.element_type) for wd in ld_global_v4(w_base + coff, cutlass.Int32)]
+                    w_vals = [v for pair in w_pairs for v in pair]
+                    ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)])
+                if cutlass.const_expr(rope_dim > 0):
+                    in_rope = lane_g < cutlass.Int32(rope_lanes)
+                    cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+                    sin_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+                    if in_rope:
+                        c_addr, s_addr = _rope_row_addrs(mCos, mSin, mCosPos, mSinPos, pos_t, b_t, token, lane_off, bpe)
+                        c_pairs = [f16x2_to_f32(wd, dtype=table_dtype) for wd in ld_global_v4(c_addr, cutlass.Int32)]
+                        s_pairs = [f16x2_to_f32(wd, dtype=table_dtype) for wd in ld_global_v4(s_addr, cutlass.Int32)]
+                        cos_v = [v for pair in c_pairs for v in pair]
+                        sin_v = [v for pair in s_pairs for v in pair]
+                    # the shuffle inside rope_rotate_half is unconditional (every lane of the warp reaches it); only the rope lanes keep it
+                    for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                        rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane_g, half_lanes)
+                        ys[0][i] = rotated if in_rope else ys[0][i]
+                for c in cutlass.range_constexpr(chunks_i):
+                    y = ys[c]
+                    packed = [fp32_to_fp16(y[i], y[i + 1], dtype=io_dtype) for i in range(0, ELEMS_PER_ACCESS, 2)]
+                    words = []
+                    for x in cutlass.range_constexpr(_WORDS_PER_CHUNK):
+                        words.append(packed[x] if store_qi else zero_i)
+                    # the copy's destination: tile t, row r, granule c ^ (4 x (r & 1)) -- the fragment reads' swizzle
+                    dst = (
+                        cutlass.Int32(t * a_tile_elems)
+                        + r * cutlass.Int32(rb // 4)
+                        + ((lane_g + cutlass.Int32(c * lanes_i)) ^ ((r & cutlass.Int32(1)) * cutlass.Int32(4))) * cutlass.Int32(_WORDS_PER_CHUNK)
+                    )
+                    sA.store(cutlass.Vector.from_elements((words[0], words[1], words[2], words[3]), cutlass.Int32), dst, vector_size=4, alignment=16)
+    else:
+        # ---- the block this step completes: qsa_prepare's compress arm (the step form of qsa_compress) op for op; both row groups of the
+        # warp compute the same row (the group shuffles stay warp-collective), the first stores it
+        raw_tok = cutlass.Int64(mIKsrc.stride[0]) * bpe
+        b64 = b.to(cutlass.Int64)
+        pos0 = step_position(None, mKvLens, b, s_q_i)
+        n_commit = s_q_i
+        if cutlass.const_expr(has_n_commit):
+            nc = ld_global(mNCommit.iterator.toint() + b64 * cutlass.Int64(4), cutlass.Int32)
+            nc = nc if nc > zero_i else zero_i
+            n_commit = nc if nc < s_q_i else s_q_i
+        # the one row of the step whose position is pool - 1 mod pool (at S_q <= pool there is at most one; a row below position 0 is dead)
+        jr = (cutlass.Int32(pool - 1) - (pos0 & cutlass.Int32(pool - 1))) & cutlass.Int32(pool - 1)
+        p_raw = pos0 + jr
+        pos_ok = p_raw >= zero_i
+        p = p_raw if pos_ok else zero_i
+        committed = (jr < s_q_i) & (jr < n_commit) & pos_ok
+        completes = (p % cutlass.Int32(pool)) == cutlass.Int32(pool - 1)
+        blk = p // cutlass.Int32(pool)
+        tok0 = blk * cutlass.Int32(pool)
+        entry, owns_ring = ring_entry(mStateTable, b, mRing)
+        _, fits = paged_block_row(mKbar, mTable, b, blk, bpe)
+        # a block that needs ring rows (it starts below pos0) from a sequence that owns no ring: -2, never the null block's rows
+        fits = fits & (owns_ring | (tok0 >= pos0))
+        in_table = cutlass.Boolean(True)
+        s_pos = cutlass.Int32(1)
+        if cutlass.const_expr(rope_dim > 0):
+            s_pos = cutlass.Int32(mCosPos.shape[1])
+            in_table = p < s_pos
+        write_blk = committed & completes & fits & in_table
+        # pool the block's rows in POSITION order: below pos0 from the ring, at or above it from this step's rows
+        seq_base = mIKsrc.iterator.toint() + (b * s_q_i).to(cutlass.Int64) * raw_tok
+        acc = []
+        for _ in cutlass.range_constexpr(chunks_i):
+            acc.append([cutlass.Float32(0.0)] * ELEMS_PER_ACCESS)
+        for r in cutlass.range_constexpr(pool):
+            q = tok0 + cutlass.Int32(r)
+            from_new = q >= pos0
+            row_new = q - pos0
+            row_new = row_new if row_new > zero_i else zero_i
+            row_new = row_new if row_new < s_q_i else s_q_i - cutlass.Int32(1)
+            addr_new = seq_base + row_new.to(cutlass.Int64) * raw_tok
+            addr_ring = ring_row_address(mRing, entry, q, bpe)
+            row_base = addr_new if from_new else addr_ring
+            for c in cutlass.range_constexpr(chunks_i):
+                coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+                pairs = [f16x2_to_f32(wd, dtype=mIKsrc.element_type) for wd in ld_global_v4(row_base + coff, cutlass.Int32)]
+                vals = [v for pair in pairs for v in pair]
+                for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                    acc[c][i] = acc[c][i] + vals[i]
+        inv_pool = cutlass.Float32(1.0 / pool)
+        pooled = []
+        for c in cutlass.range_constexpr(chunks_i):
+            pooled.append([acc[c][i] * inv_pool for i in range(ELEMS_PER_ACCESS)])
+        ssq = cutlass.Float32(0.0)
+        for c in cutlass.range_constexpr(chunks_i):
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                ssq = ssq + pooled[c][i] * pooled[c][i]
+        rstd = rmsnorm_rstd(ssq, lanes_i, d_i, eps_i)
+        w_base = mWik.iterator.toint()
+        ys = []
+        for c in cutlass.range_constexpr(chunks_i):
+            coff = cutlass.Int64((c * lanes_i) * ACCESS_BYTES) + lane_off
+            w_pairs = [f16x2_to_f32(wd, dtype=mWik.element_type) for wd in ld_global_v4(w_base + coff, cutlass.Int32)]
+            w_vals = [v for pair in w_pairs for v in pair]
+            ys.append([pooled[c][i] * rstd * (w_vals[i] + w_offset_i) for i in range(ELEMS_PER_ACCESS)])
+        if cutlass.const_expr(rope_dim > 0):
+            in_rope = lane_g < cutlass.Int32(rope_lanes)
+            bc = b if cutlass.Int32(mCosPos.shape[0]) > cutlass.Int32(1) else zero_i
+            bc64 = bc.to(cutlass.Int64)
+            tok0_r = tok0 if tok0 < s_pos else s_pos - cutlass.Int32(1)
+            pos64 = tok0_r.to(cutlass.Int64)
+            cos_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+            sin_v = [cutlass.Float32(0.0)] * ELEMS_PER_ACCESS
+            if in_rope:
+                c_addr = mCosPos.iterator.toint() + (bc64 * cutlass.Int64(mCosPos.stride[0]) + pos64 * cutlass.Int64(mCosPos.stride[1])) * bpe + lane_off
+                s_addr = mSinPos.iterator.toint() + (bc64 * cutlass.Int64(mSinPos.stride[0]) + pos64 * cutlass.Int64(mSinPos.stride[1])) * bpe + lane_off
+                c_pairs = [f16x2_to_f32(wd, dtype=mCosPos.element_type) for wd in ld_global_v4(c_addr, cutlass.Int32)]
+                s_pairs = [f16x2_to_f32(wd, dtype=mSinPos.element_type) for wd in ld_global_v4(s_addr, cutlass.Int32)]
+                cos_v = [v for pair in c_pairs for v in pair]
+                sin_v = [v for pair in s_pairs for v in pair]
+            for i in cutlass.range_constexpr(ELEMS_PER_ACCESS):
+                rotated = rope_rotate_half(ys[0][i], cos_v[i], sin_v[i], lane_g, half_lanes)
+                ys[0][i] = rotated if in_rope else ys[0][i]
+        for c in cutlass.range_constexpr(chunks_i):
+            y = ys[c]
+            packed = [fp32_to_fp16(y[i], y[i + 1], dtype=mIKsrc.element_type) for i in range(0, ELEMS_PER_ACCESS, 2)]
+            if half == zero_i:
+                sNew.store(
+                    cutlass.Vector.from_elements((packed[0], packed[1], packed[2], packed[3]), cutlass.Int32),
+                    (lane_g + cutlass.Int32(c * lanes_i)) * cutlass.Int32(_WORDS_PER_CHUNK),
+                    vector_size=4,
+                    alignment=16,
+                )
+        if lane == zero_i:
+            sNew[SNEW_WORD_ELEM] = blk if write_blk else cutlass.Int32(-1)
+
+
+@cute.jit
 def score_role(
     mQ: Optional[cute.Tensor],  # [T, H_i, D] bf16 or e4m3 (the cache dtype); token / head strides symbolic (Int64), D contiguous; None under `derive`
     mKbar: cute.Tensor,  # [num_pages, R, D] in the same dtype; page / row strides symbolic (Int64), D contiguous
@@ -573,6 +839,26 @@ def score_role(
     derive: cutlass.Constexpr[bool],
     cnt_row_ptr: Optional[cutlass.Int64] = None,  # the fused form: the address of the sequence's S_q per-row counter words (None standalone)
     units: cutlass.Constexpr[int] = 1,  # the scorer units per CTA (1 standalone): under `derive` the publish barrier is id 2 + units over 128 x units threads
+    # ---- the derive arm's operands (every one None / default standalone: a trailing None folds out of the standalone rendering) ----
+    mIQsrc: Optional[cute.Tensor] = None,  # derive: [T, H_i, D_i] the slab's indexer-query band (token / head strides symbolic)
+    mIKsrc: Optional[cute.Tensor] = None,  # derive: [T, 1, D_i] the slab's raw-key band
+    mWiq: Optional[cute.Tensor] = None,  # derive: [D_i] the indexer queries' norm weight
+    mWik: Optional[cute.Tensor] = None,  # derive: [D_i] the compressed keys' norm weight
+    mCos: Optional[cute.Tensor] = None,  # derive: [T, rope_dim] per-token rows (None under the RoPE-table arm)
+    mSin: Optional[cute.Tensor] = None,
+    mCosPos: Optional[cute.Tensor] = None,  # derive: [1 or B, S_pos, rope_dim] position-indexed tables
+    mSinPos: Optional[cute.Tensor] = None,
+    mRing: Optional[cute.Tensor] = None,  # derive: [blocks, cap, 1, D_i] the paged raw-key ring
+    mStateTable: Optional[cute.Tensor] = None,  # derive: [B, 1] the ring's block table
+    mNCommit: Optional[cute.Tensor] = None,  # derive: [B] the accepted prefix, or None (= every row)
+    sNew=None,  # derive: the CTA's completing-row staging (an Int32 SMEM array of SNEW_ELEMS)
+    eps_i=None,  # derive: the indexer norms' epsilon (Float32)
+    w_offset_i=None,  # derive: the indexer norms' weight offset (Float32)
+    rope_dim: cutlass.Constexpr[int] = 0,  # derive: the rotated prefix of a row
+    pool: cutlass.Constexpr[int] = BLOCK_SIZE,  # derive: tokens per compressed block
+    mma_batch: cutlass.Constexpr[
+        int
+    ] = 0,  # the n-tiles per MMA batch: 0 = the standalone rule (4 at units_per_warp 1, 2 above); a fused caller at a smaller register budget sets 1 / 2
 ) -> None:
     """The scorer's body as a ROLE: one 4-warp unit scores chunk ``chunk_id`` of sequence ``b`` (module docstring).  The standalone kernel
     :func:`frost_qsa_score_paged` calls it once per CTA with ``unit = unit_smem_base = 0``, ``fused = derive = False`` and renders byte for
@@ -638,10 +924,41 @@ def score_role(
     words = []  # the table word of this lane's key, per n-tile (issued two units ahead of the key loads)
     for i in cutlass.range_constexpr(min(2 * depth, n_tiles)):
         words.append(_page_word(tb_row, k_warp0 + cutlass.Int32(i * KEYS_PER_NTILE) + g, n_blocks_max, rows_per_page))
+    if cutlass.const_expr(derive and fp8):
+        raise NotImplementedError("score_role(derive=True): the derive arm writes bf16 rows; the e4m3 cache is served by the standalone kernel alone")
     if cutlass.const_expr(derive):
-        # the fused form's prologue: the unit's warps derive the (s, h) rows from the slab band straight into sA (the same layout the copy
-        # writes); nothing is read from mQ.  Lands with the fused indexer kernel -- a typed stub until then.
-        raise NotImplementedError("score_role(derive=True): the derived query tile is not served yet; the standalone kernel renders derive=False")
+        # the fused form's prologue: unit 0's warps 0-2 derive the (s, h) query rows straight into sA (the layout the copy writes) and the
+        # completing compressed-key row into sNew -- the prepare's own helpers in the prepare's lane geometry (_derive_indexer_rows); nothing
+        # is read from mQ (None).  The loads ride this memory flight with kv_lens and the table words; the CTA-wide publish barrier below
+        # orders the stores before every unit's fragment reads
+        if (unit == zero_i) & (warp < cutlass.Int32(3)):
+            _derive_indexer_rows(
+                sA,
+                sNew,
+                mIQsrc,
+                mIKsrc,
+                mWiq,
+                mWik,
+                mCos,
+                mSin,
+                mCosPos,
+                mSinPos,
+                mKvLens,
+                mNCommit,
+                mRing,
+                mStateTable,
+                mTable,
+                mKbar,
+                b,
+                warp,
+                lane,
+                eps_i,
+                w_offset_i,
+                h_i,
+                s_q,
+                rope_dim,
+                pool,
+            )
     else:
         # the query tile: every thread copies its granule of two rows per m-tile (one cp.async group for the whole tile)
         q_base = mQ.iterator.toint()
@@ -759,13 +1076,23 @@ def score_role(
             ent_addr.append(lg_base + (t0 + s_c).to(cutlass.Int64) * lg_s0 * four)
         # ---- the key stream: the rolling ring (`depth` n-tiles in flight, the table words two units ahead)
         twb = [tw[i] for i in range(len(tw))]  # the branch's own list of table words (appended below; the outer one stays as it is)
+        if cutlass.const_expr(derive):
+            # the completing row's column: this warp OWNS it when blk_new lies in its key range (warp-uniform); the slot row is overwritten
+            # from sNew by the 16 lanes that copied that row (lane_row == r_new & 1 at bf16), each exactly the 16 B its own cp.async wrote
+            blk_new = sNew[SNEW_WORD_ELEM]
+            rel_new = blk_new - k_warp0
+            owns_new = (blk_new >= zero_i) & (rel_new >= zero_i) & (rel_new < cutlass.Int32(keys_per_warp(units_per_warp)))
+            i_new = rel_new >> cutlass.Int32(3)  # the n-tile of the warp holding blk_new
+            r_new = rel_new & cutlass.Int32(7)  # its row inside the n-tile
+            new_half = r_new & cutlass.Int32(1)
+            new_row_elems = r_new * cutlass.Int32(rb // 4) + ((c_lane ^ (new_half * cutlass.Int32(4))) * cutlass.Int32(_WORDS_PER_CHUNK))
         zeros = []
         for _ in cutlass.range_constexpr(4):
             zeros.append(opaque_f32_zero())  # the accumulator seeds (a constant reaching the mma's inline ptx would ICE libNVVM)
         k_col0 = k_warp0 + qd * cutlass.Int32(2)
-        mma_batch = 4 if units_per_warp == 1 else 2  # n-tiles whose HMMA chains interleave (register cost 16 per n-tile)
-        for i0 in cutlass.range_constexpr(0, n_tiles, mma_batch):
-            batch = list(range(i0, min(i0 + mma_batch, n_tiles)))
+        batch_n = (4 if units_per_warp == 1 else 2) if mma_batch == 0 else mma_batch  # n-tiles whose HMMA chains interleave (register cost 16 per n-tile)
+        for i0 in cutlass.range_constexpr(0, n_tiles, batch_n):
+            batch = list(range(i0, min(i0 + batch_n, n_tiles)))
             kws = []
             for bi0 in cutlass.range_constexpr(len(batch)):
                 i = batch[bi0]
@@ -773,6 +1100,14 @@ def score_role(
                     twb.append(_page_word(tb_row, k_warp0 + cutlass.Int32((i + 2 * depth) * KEYS_PER_NTILE) + g, n_blocks_max, rows_per_page))
                 # group i complete: min(n_tiles, depth + i) groups were committed before this point, the i + 1 oldest must be done
                 cute.arch.cp_async_wait_group(min(n_tiles, depth + i) - i - 1)
+                if cutlass.const_expr(derive):
+                    # the derive's substitution: between the calling lane's wait (its own copies of the n-tile have landed) and the warp sync that
+                    # publishes the slot to the reader lanes -- the owning warp's 16 copying lanes of row r_new overwrite their own granule
+                    # with the completing row from sNew (no second warp sync, never a CTA barrier)
+                    if owns_new & (i_new == cutlass.Int32(i)):
+                        if lane_row == new_half:  # bf16: lane_row = the lane's row parity in its 2-row copy (the derive arm is the bf16 form)
+                            v_new = sNew.load(c_lane * cutlass.Int32(_WORDS_PER_CHUNK), vector_size=4, alignment=16)
+                            sK.store(v_new, ring_elems + cutlass.Int32((i % ring_slots) * slot_elems) + new_row_elems, vector_size=4, alignment=16)
                 cute.arch.sync_warp()  # the copies of the OTHER lanes visible; last step's fragment reads ordered before the slot's reuse below
                 kws.append(_read_key_frags(sK, ring_elems + cutlass.Int32((i % ring_slots) * slot_elems), g, qd, rb))
                 if cutlass.const_expr(i + depth < n_tiles):
@@ -884,11 +1219,11 @@ def score_role(
                         st_global(addr, out0, cutlass.Float32)
     if cutlass.const_expr(fused):
         # the fused form's release site: after the CTA's last logits / counts store (the live and the dead warps alike -- the arrival count
-        # is the protocol's, never the data's), every thread of the CTA's units joins the release of the S_q counter words at cnt_row_ptr:
-        # release_add(cnt_row_ptr + 8 s, 1, warp_gate=(unit == 0) & (warp_in_unit == 0), bar_id=1, bar_threads=128 x units) for s in
-        # 0 .. S_q - 1 -- the gate names ONE warp of the whole CTA (warp_in_unit == 0 alone would signal once per unit: units x n_chunks
-        # arrivals on a word whose target is n_chunks).  Lands with the fused indexer kernel and its counter module -- a typed stub until then.
-        raise NotImplementedError("score_role(fused=True): the per-row counter release is not served yet; the standalone kernel renders fused=False")
+        # is the protocol's, never the data's), every thread of the CTA's units joins ONE release of the S_q consecutive counter words at
+        # cnt_row_ptr (one fence.acq_rel.gpu by every thread, one named barrier id 1 over 128 x units threads, then S_q
+        # red.release.gpu.global.add.u64 by ONE elected lane); the gate names ONE warp of the whole CTA -- warp_in_unit == 0 alone would
+        # signal once per unit: units x n_chunks arrivals on a word whose target is n_chunks
+        release_add_rows(cnt_row_ptr, s_q, 1, warp_gate=(unit == zero_i) & (warp == zero_i), bar_id=1, bar_threads=THREADS * units)
 
 
 @cute.kernel

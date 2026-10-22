@@ -144,8 +144,9 @@ The single-CTA body is the ROLE function ``topk_role`` (``@cute.jit``): the quer
 ``frost_qsa_topk_decode`` passes ``block_idx.y``; a fused indexer kernel hands a CTA of its grid this role from its dispatch table),
 the role carves its own dynamic shared memory from the CTA's base, and a compile-time ``fused`` flag puts the fused form's two counter
 sites -- the acquire of the row's counter word before the first ``counts`` / ``logits`` load (the identity path included) and its reset
-right after -- behind a seam that is declined at trace time until the grid-scope counter module lands; ``fused=False`` renders the
-body exactly as before (the test module pins every served single-CTA cubin byte-identical to the pre-refactor record).
+right after (``_fused_counter_seam``: the grid-scope counter module's ``acquire_geq`` + ``counter_store_u64``, the test-only
+``check_arrivals`` re-read and the bounded-poll ``deadline_ns``) -- behind a seam the fused indexer kernel renders; ``fused=False`` renders
+the body exactly as before (the test module pins every served single-CTA cubin byte-identical to the pre-refactor record).
 
 Programmatic dependent launch (``use_pdl``): ``griddepcontrol.wait`` before the FIRST dependent global read (the counts and the
 speculated logits: the scorer writes both), ``griddepcontrol.launch_dependents`` once per CTA right after the ``counts`` read -- before the
@@ -214,7 +215,10 @@ from cudnn.frost.buffers import cutedsl_arch_requirement_error, cutedsl_requirem
 from cudnn.frost.compiled_cache import compile_cached, template_key
 from cudnn.frost.device import compute_capability, current_device, shared_memory_per_block_optin
 from cudnn.frost.tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
+from cudnn.frost.tile_dsl.gsync import acquire_geq, counter_store_u64, ld_acquire_gpu_u64
 from cudnn.frost.tile_dsl.tma import ld_global, st_global
+from cutlass.cute.arch.nvvm_wrappers import inline_ptx
+from cutlass.experimental import primitives as nvvm
 
 __all__ = [
     "FROST_SOURCE_DIGEST",
@@ -468,23 +472,51 @@ def _scan_find(s_hist, hbuf: cutlass.Constexpr[int], s_wsum, s_found, need, corr
     cute.arch.barrier()  # B3
 
 
-def _fused_counter_seam(cnt_row_ptr, cnt_target, row, warp, lane, threads_per_cta):
-    """The fused indexer's C1 seam of the top-k role (plain Python, reached only under ``topk_role(fused=True)``): the acquire of the
-    row's counter word ``cnt_row[row] >= cnt_target`` (the scorer CTAs' releases; one polling lane, the CTA's threads parked in a named
-    barrier that publishes the acquire) BEFORE the role's first ``counts`` / ``logits`` load -- the identity path included -- and the
-    reset ``cnt_row[row] = 0`` right after (every arrival observed; no other reader in the launch).  The sites, exactly:
+TOPK_ACQUIRE_TRAP_CODE = 7
+"""The seam code the top-k role's deadline trap writes to the diagnostic word (the test-only ``deadline_ns`` rendering)."""
+
+
+@cute.jit
+def _fused_counter_seam(
+    cnt_row_ptr,
+    cnt_target,
+    warp,
+    threads_per_cta: cutlass.Constexpr[int],
+    check_arrivals: cutlass.Constexpr[bool],
+    deadline_ns,
+    diag_addr,
+):
+    """The fused indexer's C1 seam of the top-k role (reached only under ``topk_role(fused=True)``): the acquire of the row's counter word
+    ``cnt_row[row] >= cnt_target`` (the scorer CTAs' releases; one polling lane, the CTA's threads parked in a named barrier that publishes
+    the acquire) BEFORE the role's first ``counts`` / ``logits`` load -- the identity path included -- and the reset ``cnt_row[row] = 0``
+    right after (every arrival observed; no other reader in the launch).  The sites, exactly:
     ``acquire_geq(addr, cnt_target, warp_gate=warp == 0, bar_id=1, bar_threads=threads_per_cta)`` by every thread (``warp`` is this
     role's CTA-level warp index: ONE warp of the CTA), then ``if warp == 0: if nvvm.elect_sync(): counter_store_u64(addr,
     cutlass.Int64(0))`` -- the acquire exposes no acquiring lane (its elect is internal), so the reset is its own one-lane site, and the
     literal is an ``Int64``, never a Python ``0`` into inline PTX.  Under the test-only compile key ``check_arrivals`` the resetting lane
     re-reads the word (``ld_acquire_gpu_u64``) before the store and traps unless it equals ``cnt_target`` exactly: the over-arrival
-    detector (a scorer release gated once per unit instead of once per CTA) that the reset otherwise erases.  The entries are the
-    grid-scope release / acquire module's ``acquire_geq`` + ``counter_store_u64``; until the fused kernel binds them the fused form is
-    declined HERE at trace time, never rendered half-way."""
-    raise NotImplementedError(
-        "topk_role(fused=True): the per-row counter acquire + reset need the grid-scope counter module (acquire_geq / counter_store_u64), "
-        "which this tree does not carry; the standalone kernel runs fused=False"
+    detector (a scorer release gated once per unit instead of once per CTA) that the reset otherwise erases.  ``deadline_ns`` /
+    ``diag_addr`` (``Int64`` values, or ``None``: the production rendering) arm the grid-scope module's bounded poll -- past the deadline
+    the polling lane writes ``TOPK_ACQUIRE_TRAP_CODE`` and the last value seen to ``diag_addr`` and traps, so a lost producer is a launch
+    failure that names its seam, never a hang."""
+    zero = cutlass.Int32(0)
+    acquire_geq(
+        cnt_row_ptr,
+        cnt_target,
+        warp_gate=warp == zero,
+        bar_id=1,
+        bar_threads=threads_per_cta,
+        deadline_ns=deadline_ns,
+        diag_addr=diag_addr,
+        code=TOPK_ACQUIRE_TRAP_CODE,
     )
+    if warp == zero:
+        if nvvm.elect_sync():
+            if cutlass.const_expr(check_arrivals):
+                seen = ld_acquire_gpu_u64(cnt_row_ptr)
+                if seen != cutlass.Int64(cnt_target):
+                    inline_ptx("trap;", write_only_types=[], read_only_args=[])
+            counter_store_u64(cnt_row_ptr, cutlass.Int64(0))
 
 
 @cute.jit
@@ -498,8 +530,11 @@ def topk_role(
     threads_per_cta: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     fused: cutlass.Constexpr[bool],
-    cnt_row_ptr,  # fused only: the plan-owned u64 counter words, one per query row (None otherwise)
+    cnt_row_ptr,  # fused only: the address (Int64) of THIS row's plan-owned u64 counter word (None otherwise)
     cnt_target,  # fused only: the arrivals the row's word must reach (the scorer CTAs per sequence; None otherwise)
+    check_arrivals: cutlass.Constexpr[bool] = False,  # fused, test-only: the resetting lane traps unless the word equals cnt_target exactly
+    deadline_ns=None,  # fused, test-only: the poll's %globaltimer deadline (Int64) -- None renders no timer and no trap
+    diag_addr=None,  # fused, test-only: two u64 words the trap writes (the seam code, the last value seen)
 ):
     """The decode top-k's single-CTA body as a ROLE: every thread of a ``threads_per_cta``-thread CTA enters, selects the top-k of
     query row ``row`` (an ARGUMENT, so a fused kernel can hand a CTA of its grid this role from its own dispatch table) and writes
@@ -509,10 +544,11 @@ def topk_role(
     ``use_pdl`` keeps the standalone kernel's two ``griddepcontrol`` sites in the body.
 
     ``fused`` (compile-time): under ``True`` the role sits behind the fused indexer's scorer CTAs, which release the row's counter
-    word after their last ``logits`` / ``counts`` store -- so the role acquires ``cnt_row_ptr[row] >= cnt_target`` BEFORE its first
-    ``counts`` / ``logits`` load (the identity path included: the counts load decides it) and resets the word right after
-    (:func:`_fused_counter_seam`, the C1 row of the fused kernel's counter table).  ``False`` (the standalone kernel) renders the
-    body exactly as before the refactor: the served single-CTA cubins are pinned byte-identical by the test module's record.
+    word after their last ``logits`` / ``counts`` store -- so the role acquires ``*cnt_row_ptr >= cnt_target`` (``cnt_row_ptr`` the
+    address of THIS row's word) BEFORE its first ``counts`` / ``logits`` load (the identity path included: the counts load decides it)
+    and resets the word right after (:func:`_fused_counter_seam`, the C1 row of the fused kernel's counter table; the trailing
+    ``check_arrivals`` / ``deadline_ns`` / ``diag_addr`` are its test-only arms).  ``False`` (the standalone kernel) renders the body
+    exactly as before the refactor: the served single-CTA cubins are pinned byte-identical by the test module's record.
 
     The SM issues ~4 warp instructions per cycle for the whole CTA, so every instruction of a per-element sweep costs
     ``EPT x nwarps / 4`` cycles: the body is written for the fewest instructions per element (no per-element predicate on the
@@ -569,7 +605,7 @@ def topk_role(
         wait_on_dependent_grids()
     if cutlass.const_expr(fused):
         # the fused indexer's C1 seam: the row's counter acquired (>= cnt_target) and reset before the first counts / logits load
-        _fused_counter_seam(cnt_row_ptr, cnt_target, row, warp, lane, threads_per_cta)
+        _fused_counter_seam(cnt_row_ptr, cnt_target, warp, threads_per_cta, check_arrivals, deadline_ns, diag_addr)
 
     cols = cutlass.Int32(mLogits.shape[1])
     row_ptr = mLogits.iterator + row64 * cutlass.Int64(mLogits.stride[0])

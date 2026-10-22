@@ -1027,50 +1027,74 @@ def test_single_cta_cubin_is_byte_identical_to_the_record(tmp_path, key):
     assert md5 == want[_pin_id(key)], f"{_pin_id(key)}: cubin md5 {md5} != the record's {want[_pin_id(key)]} -- the single-CTA rendering changed"
 
 
-# The role's fused seam: a wrapper kernel hands topk_role a row and the flag; fused=True must be DECLINED at trace time (the counter
-# module the two sites call is not in this tree), fused=False through the same wrapper must trace and compile (the standalone kernel's path).
+# The role's fused seam: a wrapper kernel hands topk_role a row, the flag and (under fused) the row's counter address + the target;
+# fused=False through the wrapper is the standalone kernel's path; fused=True renders the C1 seam -- the acquire (two ld.acquire sites: the
+# poll's first test and its loop, a nanosleep between tests), the one-lane reset (st.relaxed), and under check_arrivals the re-read + trap.
 _ROLE_PROBE = textwrap.dedent("""
-    import os, sys
+    import glob, os, re, sys
+    FUSED, CHECK, DUMP = sys.argv[1] == "1", sys.argv[2] == "1", sys.argv[3]
     os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUTE_DSL_DUMP_DIR"] = DUMP
+    os.environ["CUTE_DSL_KEEP"] = "ptx"
     os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
     import cuda.bindings.driver as cuda
     import cutlass, cutlass.cute as cute
     from cutlass.cute.runtime import make_fake_stream, make_fake_compact_tensor
     from cudnn.gated_attention_block.kernels import qsa_topk_decode as M
-    FUSED = sys.argv[1] == "1"
 
     @cute.kernel
-    def wrapper(mLogits: cute.Tensor, mCounts: cute.Tensor, mOut: cute.Tensor, fused: cutlass.Constexpr[bool]):
+    def wrapper(mLogits: cute.Tensor, mCounts: cute.Tensor, mOut: cute.Tensor, cnt: cutlass.Int64, target: cutlass.Int32, fused: cutlass.Constexpr[bool],
+                check: cutlass.Constexpr[bool]):
         row = cutlass.Int32(cute.arch.block_idx()[1])
-        M.topk_role(mLogits, mCounts, mOut, row, 8192, 512, 1024, False, fused, None, None)
+        if cutlass.const_expr(fused):
+            M.topk_role(mLogits, mCounts, mOut, row, 8192, 512, 1024, False, True, cnt + row.to(cutlass.Int64) * cutlass.Int64(8), target, check)
+        else:
+            M.topk_role(mLogits, mCounts, mOut, row, 8192, 512, 1024, False, False, None, None)
 
     @cute.jit
-    def launch(logits: cute.Tensor, counts: cute.Tensor, out: cute.Tensor, fused: cutlass.Constexpr[bool], stream: cuda.CUstream):
-        wrapper(logits, counts, out, fused).launch(grid=(1, 1, 1), block=(1024, 1, 1), smem=M.smem_bytes_for(8192, 1, 1024, 512), stream=stream)
+    def launch(logits: cute.Tensor, counts: cute.Tensor, out: cute.Tensor, cnt: cutlass.Int64, target: cutlass.Int32, fused: cutlass.Constexpr[bool],
+               check: cutlass.Constexpr[bool], stream: cuda.CUstream):
+        wrapper(logits, counts, out, cnt, target, fused, check).launch(grid=(1, 1, 1), block=(1024, 1, 1), smem=M.smem_bytes_for(8192, 1, 1024, 512), stream=stream)
 
     try:
         cute.compile(launch, M._fake_rows(cutlass.Int32),
                      make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
-                     M._fake_rows(cutlass.Int32), FUSED, make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+                     M._fake_rows(cutlass.Int32), cutlass.Int64(0), cutlass.Int32(1), FUSED, CHECK, make_fake_stream(use_tvm_ffi_env_stream=False),
+                     options="--enable-tvm-ffi --gpu-arch sm_107a --keep-ptx")
+        ptx = sorted(glob.glob(os.path.join(DUMP, "*.ptx")), key=os.path.getmtime)
+        txt = open(ptx[-1]).read()
+        for k in ("ld.acquire.gpu.global.u64", "st.relaxed.gpu.global.u64", "nanosleep", "red.release", "atom.acq_rel", "fence.acq_rel.gpu", "trap;", "%globaltimer", ".cluster"):
+            print("COUNT", k, len(re.findall(re.escape(k), txt)))
         print("OUTCOME compiled")
     except NotImplementedError as e:
         print("OUTCOME declined", str(e).replace(chr(10), " "))
     """)
 
 
-@pytest.mark.parametrize("fused", [False, True], ids=["unfused", "fused"])
-def test_topk_role_traces_unfused_and_declines_the_fused_seam_until_the_counter_module_lands(tmp_path, fused):
-    """``topk_role`` called from a wrapper kernel with the row as an argument: ``fused=False`` traces and compiles for sm_107a (no GPU);
-    ``fused=True`` raises ``NotImplementedError`` at TRACE time naming the counter module -- the seam is declined whole, never rendered
-    without its acquire / reset.  (The probe runs from a file: the DSL needs the wrapper's source, which a ``-c`` program has not.)"""
+@pytest.mark.parametrize("arm", ["unfused", "fused", "fused_check"])
+def test_topk_role_traces_unfused_and_renders_the_fused_counter_seam(tmp_path, arm):
+    """``topk_role`` called from a wrapper kernel with the row as an argument, for sm_107a (no GPU): ``fused=False`` is the standalone path (no
+    counter site); ``fused=True`` renders the C1 seam -- ``ld.acquire.gpu.global.u64`` x 2 (the poll's first test and its loop) with a
+    ``nanosleep`` between tests, the one-lane reset ``st.relaxed.gpu.global.u64`` x 1, no release / last-arriver atom (the top-k is the
+    consumer), no ``%globaltimer`` / ``trap`` without the deadline; ``check_arrivals`` adds the resetting lane's re-read (x 3) and its
+    ``trap``.  Nothing ``.cluster`` in any arm.  (The probe runs from a file: the DSL needs the wrapper's source, which a ``-c`` program
+    has not.)"""
     if not _arch_known("sm_107a"):
         pytest.skip("this CuTe DSL has no sm_107a target")
+    fused, check = {"unfused": (False, False), "fused": (True, False), "fused_check": (True, True)}[arm]
     probe = tmp_path / "topk_role_probe.py"
     probe.write_text(_ROLE_PROBE)
-    proc = subprocess.run([sys.executable, str(probe), "1" if fused else "0"], capture_output=True, text=True, timeout=900)
+    dump = tmp_path / f"dump_{arm}"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, str(probe), "1" if fused else "0", "1" if check else "0", str(dump)], capture_output=True, text=True, timeout=900)
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     outcome = next((ln for ln in proc.stdout.splitlines() if ln.startswith("OUTCOME ")), "")
-    if fused:
-        assert outcome.startswith("OUTCOME declined") and "counter" in outcome and "fused=False" in outcome, proc.stdout[-2000:]
+    assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
+    counts = {m.group(1): int(m.group(2)) for m in re.finditer(r"COUNT (\S+) (\d+)$", proc.stdout, re.M)}
+    assert counts[".cluster"] == 0 and counts["red.release"] == 0 and counts["atom.acq_rel"] == 0, counts
+    if not fused:
+        assert counts["ld.acquire.gpu.global.u64"] == 0 and counts["st.relaxed.gpu.global.u64"] == 0 and counts["nanosleep"] == 0, counts
     else:
-        assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
+        assert counts["ld.acquire.gpu.global.u64"] == (3 if check else 2), counts
+        assert counts["st.relaxed.gpu.global.u64"] == 1 and counts["nanosleep"] >= 1, counts
+        assert counts["trap;"] == (1 if check else 0) and counts["%globaltimer"] == 0, counts

@@ -429,50 +429,81 @@ def test_served_renderings_are_byte_identical_to_the_record(tmp_path_factory, ke
     )
 
 
-# The role's fused / derive seams: a 2-unit wrapper kernel hands score_role the ids and the flags.  fused=True must trace THROUGH the unit's
-# named barrier, the per-unit ring base and the counts guard and be DECLINED at the release stub (the counter release is not served yet);
-# derive=True must be declined at the prologue, ABOVE the barrier site; fused=False / derive=False through the same wrapper must trace and
-# compile (the standalone kernel's path).  The probe prints the raise site's line in the kernel module beside the outcome.
-_ROLE_PROBE = """
-import os, sys, traceback
+# The role's fused / derive seams: a 2-unit wrapper kernel hands score_role the ids, the flags and (under derive) the derive operands.
+# fused=True traces THROUGH the unit's named barrier, the per-unit ring base, the counts guard and the per-row counter release (S_q
+# red.release sites after ONE fence + ONE named barrier); derive=True renders the derive prologue (the query rows and the completing row
+# into SMEM), the CTA-wide publish barrier 'bar.sync 2 + units, 128 x units' AT the query-tile site in place of the per-unit one, and the
+# owning warp's slot overwrite; fused=False / derive=False through the same wrapper is the standalone kernel's path.  The probe keeps the
+# PTX and prints a census of the sites (it runs from a file: the DSL needs the wrapper's source, which a ``-c`` program has not).
+_ROLE_PROBE = r"""
+import glob, os, re, sys, traceback
+UNITS, FUSED, DERIVE, DUMP = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3] == "1", sys.argv[4]
 os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+os.environ["CUTE_DSL_DUMP_DIR"] = DUMP
+os.environ["CUTE_DSL_KEEP"] = "ptx"
 os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
 from typing import Optional
 import cuda.bindings.driver as cuda
 import cutlass, cutlass.cute as cute
+import torch
 from cutlass.cute.runtime import make_fake_stream
 from cudnn.gated_attention_block.kernels import qsa_score_paged as sp
-UNITS, FUSED, DERIVE = int(sys.argv[1]), sys.argv[2] == "1", sys.argv[3] == "1"
+from cudnn.gated_attention_block.kernels.qk_norm_rope import _fake, fake_rowmajor_dynamic_token_stride
+from cudnn.gated_attention_block.kernels.qsa_compress import _fake_compact, _fake_i32_table, _fake_paged_state, _fake_strided
 
 
 @cute.kernel
 def wrapper(mQ: Optional[cute.Tensor], mKbar: cute.Tensor, mTable: cute.Tensor, mKvLens: cute.Tensor, mLogits: cute.Tensor, mCounts: cute.Tensor,
-            mBlockLens: Optional[cute.Tensor], top_k: cutlass.Int32, scale: cutlass.Float32, units: cutlass.Constexpr[int],
-            fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool]):
+            mBlockLens: Optional[cute.Tensor], mIQsrc: Optional[cute.Tensor], mIKsrc: Optional[cute.Tensor], mWiq: Optional[cute.Tensor],
+            mWik: Optional[cute.Tensor], mCos: Optional[cute.Tensor], mSin: Optional[cute.Tensor], mCosPos: Optional[cute.Tensor],
+            mSinPos: Optional[cute.Tensor], mRing: Optional[cute.Tensor], mStateTable: Optional[cute.Tensor], top_k: cutlass.Int32,
+            scale: cutlass.Float32, cnt: cutlass.Int64, units: cutlass.Constexpr[int], fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool]):
     ring, tile = sp.score_smem_elems(4, 1, 1, 4)
     sK = cutlass.Array(cutlass.Int32, units * ring, alignment=128, space=cutlass.AddressSpace.smem)
     sA = cutlass.Array(cutlass.Int32, tile, alignment=128, space=cutlass.AddressSpace.smem)
+    sNew = cutlass.Array(cutlass.Int32, sp.SNEW_ELEMS, alignment=16, space=cutlass.AddressSpace.smem)
     tidx = cutlass.Int32(cute.arch.thread_idx()[0])
     unit = tidx >> cutlass.Int32(7)
     tidx_in_unit = tidx & cutlass.Int32(127)
     warp_in_unit = tidx_in_unit >> cutlass.Int32(5)
     bidx, bidy, _ = cute.arch.block_idx()
     sp.score_role(mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, sK, sA, top_k, scale, cutlass.Int32(bidx), cutlass.Int32(bidy), unit,
-                  warp_in_unit, tidx_in_unit, unit * cutlass.Int32(ring), 4, 1, 4, 1, 4, False, False, fused, derive, cutlass.Int64(0), units)
+                  warp_in_unit, tidx_in_unit, unit * cutlass.Int32(ring), 4, 1, 4, 1, 4, False, False, fused, derive, cnt, units,
+                  mIQsrc, mIKsrc, mWiq, mWik, mCos, mSin, mCosPos, mSinPos, mRing, mStateTable, None, sNew, cutlass.Float32(1e-6), cutlass.Float32(0.0), 64, 4)
 
 
 @cute.jit
 def launch(mQ: Optional[cute.Tensor], mKbar: cute.Tensor, mTable: cute.Tensor, mKvLens: cute.Tensor, mLogits: cute.Tensor, mCounts: cute.Tensor,
-           mBlockLens: Optional[cute.Tensor], top_k: cutlass.Int32, scale: cutlass.Float32, units: cutlass.Constexpr[int],
-           fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool], stream: cuda.CUstream):
-    wrapper(mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, top_k, scale, units, fused, derive).launch(
-        grid=(1, 1, 1), block=(128 * units, 1, 1), stream=stream)
+           mBlockLens: Optional[cute.Tensor], mIQsrc: Optional[cute.Tensor], mIKsrc: Optional[cute.Tensor], mWiq: Optional[cute.Tensor],
+           mWik: Optional[cute.Tensor], mCos: Optional[cute.Tensor], mSin: Optional[cute.Tensor], mCosPos: Optional[cute.Tensor],
+           mSinPos: Optional[cute.Tensor], mRing: Optional[cute.Tensor], mStateTable: Optional[cute.Tensor], top_k: cutlass.Int32,
+           scale: cutlass.Float32, cnt: cutlass.Int64, units: cutlass.Constexpr[int], fused: cutlass.Constexpr[bool], derive: cutlass.Constexpr[bool],
+           stream: cuda.CUstream):
+    wrapper(mQ, mKbar, mTable, mKvLens, mLogits, mCounts, mBlockLens, mIQsrc, mIKsrc, mWiq, mWik, mCos, mSin, mCosPos, mSinPos, mRing, mStateTable,
+            top_k, scale, cnt, units, fused, derive).launch(grid=(1, 1, 1), block=(128 * units, 1, 1), stream=stream)
 
 
+tok, batch, dt = cute.sym_int(), cute.sym_int(), torch.bfloat16
+if DERIVE:
+    dv = [fake_rowmajor_dynamic_token_stride(dt, tok, 4, 128), fake_rowmajor_dynamic_token_stride(dt, tok, 1, 128), _fake(dt, (128,), (0,)), _fake(dt, (128,), (0,)),
+          _fake(dt, (tok, 64), (1, 0)), _fake(dt, (tok, 64), (1, 0)),
+          _fake_strided(dt, (cute.sym_int(), cute.sym_int(), 64), (cute.sym_int(), cute.sym_int(), 1)),
+          _fake_strided(dt, (cute.sym_int(), cute.sym_int(), 64), (cute.sym_int(), cute.sym_int(), 1)),
+          _fake_paged_state(dt, 128), _fake_i32_table((batch, 1), (cute.sym_int(), 1))]
+else:
+    dv = [None] * 10
 try:
     cute.compile(launch, None if DERIVE else sp._fake_q(4), sp._fake_kbar(4), sp._fake_i32_2d(), sp._fake_i32_1d(), sp._fake_f32_2d(),
-                 sp._fake_i32_1d(), sp._fake_i32_1d(), cutlass.Int32(0), cutlass.Float32(0.0), UNITS, FUSED, DERIVE,
-                 make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+                 sp._fake_i32_1d(), sp._fake_i32_1d(), *dv, cutlass.Int32(0), cutlass.Float32(0.0), cutlass.Int64(0), UNITS, FUSED, DERIVE,
+                 make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a --keep-ptx")
+    ptx = sorted(glob.glob(os.path.join(DUMP, "*.ptx")), key=os.path.getmtime)
+    txt = open(ptx[-1]).read()
+    # the sites by regex (ptxas' spelling separates the opcode and its operands by a tab): the CTA barrier, the per-unit NAMED barrier (a register
+    # id, 128 threads), the CTA-wide publish barrier (id 2 + units = 4, 128 x units = 256 threads), the counter release and its fence
+    for k, rx in (("red.release", r"red\.release\.gpu\.global\.add\.u64"), ("fence.acq_rel.gpu", r"fence\.acq_rel\.gpu"), ("bar.sync 4, 256", r"bar\.sync\s+4, 256;"),
+                  ("bar.sync %r, 128", r"bar\.sync\s+%r\d+, 128;"), ("bar.sync 0", r"bar\.sync\s+0;"), ("cp.async.cg", r"cp\.async\.cg"),
+                  ("st.shared.v4", r"st\.shared\.v4"), ("ld.shared.v4", r"ld\.shared\.v4"), (".local", r"\.local")):
+        print("COUNT", k, len(re.findall(rx, txt)))
     print("OUTCOME compiled")
 except NotImplementedError as e:
     lines = [f.lineno for f in traceback.extract_tb(e.__traceback__) if f.filename.endswith("qsa_score_paged.py")]
@@ -481,35 +512,43 @@ except NotImplementedError as e:
 
 
 @pytest.mark.parametrize("arm", ["standalone", "fused", "derive"])
-def test_score_role_traces_the_standalone_shape_and_declines_the_fused_and_derive_seams(tmp_path, arm):
-    """``score_role`` called from a 2-unit wrapper kernel for sm_107a (no GPU): ``fused=True, derive=False`` traces THROUGH the unit's named
-    barrier, the per-unit ring base and the counts guard and raises ``NotImplementedError`` naming ``score_role(fused=True)`` at the release
-    stub -- the raise site lies BELOW the barrier site in the source, so the seam is declined whole, after everything the fused form
-    renders today; ``derive=True`` raises naming ``derive`` at the prologue, ABOVE the barrier site; ``fused=False, derive=False`` through
-    the same wrapper traces and compiles (the standalone kernel's path).  (The probe runs from a file: the DSL needs the wrapper's source,
-    which a ``-c`` program has not.)"""
+def test_score_role_traces_the_standalone_shape_and_renders_the_fused_and_derive_seams(tmp_path, arm):
+    """``score_role`` called from a 2-unit wrapper kernel for sm_107a (no GPU).  ``fused=False, derive=False``: the standalone kernel's path --
+    no counter site, the CTA barrier ``bar.sync 0``, the query tile copied by ``cp.async``.  ``fused=True, derive=False``: the unit's NAMED
+    barrier (a register id: ``bar.sync %r, 128``) in place of ``bar.sync 0``, the query tile still copied, and the release seam -- ONE
+    ``fence.acq_rel.gpu`` and ``S_q`` (= 1 here) ``red.release.gpu.global.add.u64`` sites.  ``fused=True, derive=True``: no ``cp.async`` of a
+    query tile (the derive's ``st.shared.v4`` write it), the CTA-wide publish barrier ``bar.sync 4, 256`` (``2 + units`` over ``128 x units``)
+    rendered AT the query-tile site in place of the per-unit one, the same release seam; no local memory in any arm.  (The probe runs from
+    a file: the DSL needs the wrapper's source, which a ``-c`` program has not.)"""
     if not renderings.arch_known():
         pytest.skip(f"this CuTe DSL has no {renderings.ARCH} target")
     units, fused, derive = {"standalone": (1, False, False), "fused": (2, True, False), "derive": (2, True, True)}[arm]
     probe = tmp_path / "score_role_probe.py"
     probe.write_text(_ROLE_PROBE)
-    proc = subprocess.run([sys.executable, str(probe), str(units), "1" if fused else "0", "1" if derive else "0"], capture_output=True, text=True, timeout=900)
+    dump = tmp_path / f"dump_{arm}"
+    dump.mkdir()
+    proc = subprocess.run(
+        [sys.executable, str(probe), str(units), "1" if fused else "0", "1" if derive else "0", str(dump)], capture_output=True, text=True, timeout=900
+    )
     assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
     outcome = next((ln for ln in proc.stdout.splitlines() if ln.startswith("OUTCOME ")), "")
+    assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
+    counts = {m.group(1): int(m.group(2)) for m in re.finditer(r"COUNT (\S.*?) (\d+)$", proc.stdout, re.M)}
+    assert counts[".local"] == 0, counts
     if arm == "standalone":
-        assert outcome == "OUTCOME compiled", proc.stdout[-2000:]
-        return
-    m = re.match(r"OUTCOME declined line=(-?\d+) (.*)", outcome)
-    assert m, proc.stdout[-2000:]
-    line, msg = int(m.group(1)), m.group(2)
-    src = Path(sp.__file__).read_text().splitlines()
-    barrier_line = next(i for i, ln in enumerate(src, 1) if "barrier_id=cutlass.Int32(2) + unit" in ln)  # the per-unit barrier site
-    if arm == "fused":
-        assert "score_role(fused=True)" in msg and "counter release" in msg and "fused=False" in msg, msg
-        assert line > barrier_line, (line, barrier_line)
+        assert counts["red.release"] == 0 and counts["fence.acq_rel.gpu"] == 0, counts
+        assert counts["bar.sync 0"] == 1 and counts["bar.sync 4, 256"] == 0 and counts["bar.sync %r, 128"] == 0, counts
+        assert counts["cp.async.cg"] >= 1, counts
+    elif arm == "fused":
+        assert counts["red.release"] == 1 and counts["fence.acq_rel.gpu"] == 1, counts  # S_q = 1: one red site, one fence
+        assert counts["bar.sync %r, 128"] == 1 and counts["bar.sync 0"] == 0 and counts["bar.sync 4, 256"] == 0, counts
+        assert counts["cp.async.cg"] >= 1, counts
     else:
-        assert "score_role(derive=True)" in msg and "derive=False" in msg, msg
-        assert line < barrier_line, (line, barrier_line)
+        assert counts["red.release"] == 1 and counts["fence.acq_rel.gpu"] == 1, counts
+        assert (
+            counts["bar.sync 4, 256"] == 1 and counts["bar.sync 0"] == 0 and counts["bar.sync %r, 128"] == 0
+        ), counts  # the publish barrier at the query-tile site
+        assert counts["st.shared.v4"] >= 2, counts  # the derive's query-tile rows and the completing row (+ the slot overwrite)
 
 
 # The fresh-process probes' shared prelude: the installed DSL modeled as the public 4.6.2 wheel two ways at once -- the version discovery
