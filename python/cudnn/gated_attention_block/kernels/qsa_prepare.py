@@ -237,66 +237,70 @@ def _rope_row_addrs(
     return c_addr, s_addr
 
 
-@cute.kernel
-def frost_qsa_prepare(
-    mQ: cute.Tensor,  # [T, H_q,  D] in: the slab's Q band (token stride symbolic)
-    mK: cute.Tensor,  # [T, H_kv, D] in: the K band
-    mV: cute.Tensor,  # [T, H_kv, D] in: the V band (never modified; copied into its pool)
-    mQo: cute.Tensor,  # [T, H_q,  D] out (may alias mQ)
-    mKo: cute.Tensor,  # [T, H_kv, D] out (may alias mK)
-    mWq: Optional[cute.Tensor],  # [D], or None: RoPE-only Q / K (no RMSNorm, no weight loads)
-    mWk: Optional[cute.Tensor],  # [D], or None (both or neither -- the host checks)
-    mCos: Optional[cute.Tensor],  # [T, ROPE_DIM] per-token rows (the attention's tables), or None: the RoPE-table arm reads mCosPos / mSinPos at pos0 + j
-    mSin: Optional[cute.Tensor],  # [T, ROPE_DIM], or None with mCos
-    mKPool: cute.Tensor,  # [P, H_kv, page_size, D]: strides symbolic (HND compact or NHD), D contiguous
-    mVPool: cute.Tensor,  # same form
-    mSlot: cute.Tensor,  # [T] int32 or int64, contiguous
-    mIKsrc: Optional[cute.Tensor],  # [T, 1, D_i] the band's raw indexer key (token stride symbolic), or None (no raw-key arm)
-    mIKpool: Optional[cute.Tensor],  # [P, 1, page_size, D_i] the raw key's pool, or None
-    mIQsrc: Optional[cute.Tensor],  # [T, H_i, D_i] the band's indexer query heads (token stride symbolic), or None (no query arm)
-    mIQout: Optional[cute.Tensor],  # [T, H_i, D_i] compact out
-    mWiq: Optional[cute.Tensor],  # [D_i] the indexer queries' norm weight
-    mRing: Optional[cute.Tensor],  # [B, RING, D_i] compact: row p % RING holds position p's raw key, or None (no compress arm); paged: [blocks, cap, 1, D_i]
-    mComp: Optional[cute.Tensor],  # [B, NB, D_i] compact: the compressed-key cache, row blk = block blk; paged: [num_pages, P / pool, 1, D_i]
-    mWik: Optional[cute.Tensor],  # [D_i] the compressed keys' norm weight
-    mCosPos: Optional[cute.Tensor],  # [Bc, S_pos, ROPE_DIM] position-indexed, Bc in {1, B}
-    mSinPos: Optional[cute.Tensor],  # same shape
-    mPos0: Optional[cute.Tensor],  # [B] int32: the position of row 0 of every sequence (= the KV length before the step); None on the paged form
-    mNCommit: Optional[cute.Tensor],  # [B] int32: the accepted prefix of the step's rows, or None (= every row)
-    mCSlot: Optional[cute.Tensor],  # [B, S_q] int32 out: the block id written per row, -1 (none) or -2 (capacity)
-    mKvLens: Optional[cute.Tensor],  # [B] int32: the KV length AFTER the step (the paged form's position source), or None
-    mBlockTable: Optional[cute.Tensor],  # [B, max_pages] int32: the MAIN block table (the paged form), or None
-    mStateTable: Optional[cute.Tensor],  # [B, 1] int32: the ring's block table (the paged form), or None
-    mRingSlots: Optional[cute.Tensor],  # [T] int32 / int64 (the slot dtype): the stack's own ring slots (paged, ring_slots), or None
-    n_tok: cutlass.Int32,  # T
-    s_q: cutlass.Int32,  # rows per sequence (T = B * S_q); only the compress arm reads it
-    n_slots: cutlass.Int64,  # P * page_size of the SMALLER K / V pool: a slot outside [0, n_slots) writes nothing
-    n_islots: cutlass.Int64,  # the raw key's pool capacity (0 when it is absent)
+@cute.jit
+def prepare_role(
+    mQ: cute.Tensor,
+    mK: cute.Tensor,
+    mV: cute.Tensor,
+    mQo: cute.Tensor,
+    mKo: cute.Tensor,
+    mWq: Optional[cute.Tensor],
+    mWk: Optional[cute.Tensor],
+    mCos: Optional[cute.Tensor],
+    mSin: Optional[cute.Tensor],
+    mKPool: cute.Tensor,
+    mVPool: cute.Tensor,
+    mSlot: cute.Tensor,
+    mIKsrc: Optional[cute.Tensor],
+    mIKpool: Optional[cute.Tensor],
+    mIQsrc: Optional[cute.Tensor],
+    mIQout: Optional[cute.Tensor],
+    mWiq: Optional[cute.Tensor],
+    mRing: Optional[cute.Tensor],
+    mComp: Optional[cute.Tensor],
+    mWik: Optional[cute.Tensor],
+    mCosPos: Optional[cute.Tensor],
+    mSinPos: Optional[cute.Tensor],
+    mPos0: Optional[cute.Tensor],
+    mNCommit: Optional[cute.Tensor],
+    mCSlot: Optional[cute.Tensor],
+    mKvLens: Optional[cute.Tensor],
+    mBlockTable: Optional[cute.Tensor],
+    mStateTable: Optional[cute.Tensor],
+    mRingSlots: Optional[cute.Tensor],
+    n_tok: cutlass.Int32,
+    s_q: cutlass.Int32,
+    n_slots: cutlass.Int64,
+    n_islots: cutlass.Int64,
     h_q: cutlass.Int32,
     h_kv: cutlass.Int32,
     h_i: cutlass.Int32,
-    eps: cutlass.Float32,  # the attention norms' epsilon
-    eps_i: cutlass.Float32,  # the indexer norms' epsilon
-    w_offset_i: cutlass.Float32,  # the indexer norms' weight offset (0.0 = the pre-folded (1 + w) form, 1.0 = the checkpoint's w)
+    eps: cutlass.Float32,
+    eps_i: cutlass.Float32,
+    w_offset_i: cutlass.Float32,
     d: cutlass.Constexpr[int],
     d_i: cutlass.Constexpr[int],
     rope_dim: cutlass.Constexpr[int],
     pool: cutlass.Constexpr[int],
     page_size: cutlass.Constexpr[int],
     slot_i64: cutlass.Constexpr[bool],
-    threads_per_cta: cutlass.Constexpr[int],
     h_q_ct: cutlass.Constexpr[int],
     h_kv_ct: cutlass.Constexpr[int],
     h_i_ct: cutlass.Constexpr[int],
     const_head_counts: cutlass.Constexpr[bool],
-    use_pdl: cutlass.Constexpr[bool],
+    wid: cutlass.Int32,
+    lane32: cutlass.Int32,
+    tidx: cutlass.Int32,
 ) -> None:
-    """One warp = ``32 // lanes_per_row`` consecutive rows of one arm (module docstring); the arm boundaries are the warp
-    counts :func:`prepare_warp_counts` derives, recomputed here from ``n_tok`` so the host's grid and the device's row map
-    share one formula."""
-    if cutlass.const_expr(use_pdl):
-        wait_on_dependent_grids()
-
+    """The PREPARE body as a ROLE: the three arms of :func:`frost_qsa_prepare` for the warp unit ``wid`` -- its GLOBAL warp id over the
+    launch's flat warp space (the standalone kernel passes ``blockIdx.x * warps_per_cta + tidx // 32``; a fused launch that carries the
+    prepare as one of several roles passes the warp's id relative to its role's first CTA) -- with ``lane32`` the warp lane and
+    ``tidx`` the thread in the CTA.  The operands and constants are the kernel's, in its order (their contracts are on the kernel's
+    signature); the launch-only ``threads_per_cta`` / ``use_pdl`` and the PDL pair stay in the kernel.  No shared memory, no barrier
+    (the module docstring: both pre-development tables empty), so a caller needs no SMEM carve and no barrier budget for this role; every
+    store is gated by the row's own validity as before, a unit past the last arm's warp count computes on clamped rows and stores nothing.
+    Traced inline into its caller: the standalone kernel renders byte for byte the cubin it rendered before the seam (the test module's
+    committed record pins every served rendering)."""
     apply_norm = cutlass.const_expr(mWq is not None)
     has_raw = cutlass.const_expr(mIKsrc is not None)
     has_raw_pool = cutlass.const_expr(mIKpool is not None)
@@ -306,7 +310,6 @@ def frost_qsa_prepare(
     paged = cutlass.const_expr(mBlockTable is not None)
     has_ring_slots = cutlass.const_expr(mRingSlots is not None)
     table_dtype = mCosPos.element_type if cutlass.const_expr(mCos is None) else mCos.element_type  # the RoPE-table arm reads the position-indexed tables
-    warps_per_cta = cutlass.const_expr(threads_per_cta // _WARP)
     lanes_a = cutlass.const_expr(lanes_per_row(d))
     chunks_a = cutlass.const_expr(vec_chunks(d))
     rpw_a = cutlass.const_expr(_WARP // lanes_a)
@@ -320,10 +323,6 @@ def frost_qsa_prepare(
     _hq = cutlass.Int32(h_q_ct) if cutlass.const_expr(const_head_counts) else h_q
     _hkv = cutlass.Int32(h_kv_ct) if cutlass.const_expr(const_head_counts) else h_kv
     _hi = cutlass.Int32(h_i_ct) if cutlass.const_expr(const_head_counts) else h_i
-
-    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
-    lane32 = tidx % cutlass.Int32(_WARP)
-    wid = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(warps_per_cta) + tidx // cutlass.Int32(_WARP)
 
     # The arm boundaries, in warps -- prepare_warp_counts on device.
     n_q_rows = n_tok * _hq
@@ -687,6 +686,127 @@ def frost_qsa_prepare(
                     ) * cutlass.Int64(4)
                     st_global(slot_addr, slot_val, cutlass.Int32)
 
+
+@cute.kernel
+def frost_qsa_prepare(
+    mQ: cute.Tensor,  # [T, H_q,  D] in: the slab's Q band (token stride symbolic)
+    mK: cute.Tensor,  # [T, H_kv, D] in: the K band
+    mV: cute.Tensor,  # [T, H_kv, D] in: the V band (never modified; copied into its pool)
+    mQo: cute.Tensor,  # [T, H_q,  D] out (may alias mQ)
+    mKo: cute.Tensor,  # [T, H_kv, D] out (may alias mK)
+    mWq: Optional[cute.Tensor],  # [D], or None: RoPE-only Q / K (no RMSNorm, no weight loads)
+    mWk: Optional[cute.Tensor],  # [D], or None (both or neither -- the host checks)
+    mCos: Optional[cute.Tensor],  # [T, ROPE_DIM] per-token rows (the attention's tables), or None: the RoPE-table arm reads mCosPos / mSinPos at pos0 + j
+    mSin: Optional[cute.Tensor],  # [T, ROPE_DIM], or None with mCos
+    mKPool: cute.Tensor,  # [P, H_kv, page_size, D]: strides symbolic (HND compact or NHD), D contiguous
+    mVPool: cute.Tensor,  # same form
+    mSlot: cute.Tensor,  # [T] int32 or int64, contiguous
+    mIKsrc: Optional[cute.Tensor],  # [T, 1, D_i] the band's raw indexer key (token stride symbolic), or None (no raw-key arm)
+    mIKpool: Optional[cute.Tensor],  # [P, 1, page_size, D_i] the raw key's pool, or None
+    mIQsrc: Optional[cute.Tensor],  # [T, H_i, D_i] the band's indexer query heads (token stride symbolic), or None (no query arm)
+    mIQout: Optional[cute.Tensor],  # [T, H_i, D_i] compact out
+    mWiq: Optional[cute.Tensor],  # [D_i] the indexer queries' norm weight
+    mRing: Optional[cute.Tensor],  # [B, RING, D_i] compact: row p % RING holds position p's raw key, or None (no compress arm); paged: [blocks, cap, 1, D_i]
+    mComp: Optional[cute.Tensor],  # [B, NB, D_i] compact: the compressed-key cache, row blk = block blk; paged: [num_pages, P / pool, 1, D_i]
+    mWik: Optional[cute.Tensor],  # [D_i] the compressed keys' norm weight
+    mCosPos: Optional[cute.Tensor],  # [Bc, S_pos, ROPE_DIM] position-indexed, Bc in {1, B}
+    mSinPos: Optional[cute.Tensor],  # same shape
+    mPos0: Optional[cute.Tensor],  # [B] int32: the position of row 0 of every sequence (= the KV length before the step); None on the paged form
+    mNCommit: Optional[cute.Tensor],  # [B] int32: the accepted prefix of the step's rows, or None (= every row)
+    mCSlot: Optional[cute.Tensor],  # [B, S_q] int32 out: the block id written per row, -1 (none) or -2 (capacity)
+    mKvLens: Optional[cute.Tensor],  # [B] int32: the KV length AFTER the step (the paged form's position source), or None
+    mBlockTable: Optional[cute.Tensor],  # [B, max_pages] int32: the MAIN block table (the paged form), or None
+    mStateTable: Optional[cute.Tensor],  # [B, 1] int32: the ring's block table (the paged form), or None
+    mRingSlots: Optional[cute.Tensor],  # [T] int32 / int64 (the slot dtype): the stack's own ring slots (paged, ring_slots), or None
+    n_tok: cutlass.Int32,  # T
+    s_q: cutlass.Int32,  # rows per sequence (T = B * S_q); only the compress arm reads it
+    n_slots: cutlass.Int64,  # P * page_size of the SMALLER K / V pool: a slot outside [0, n_slots) writes nothing
+    n_islots: cutlass.Int64,  # the raw key's pool capacity (0 when it is absent)
+    h_q: cutlass.Int32,
+    h_kv: cutlass.Int32,
+    h_i: cutlass.Int32,
+    eps: cutlass.Float32,  # the attention norms' epsilon
+    eps_i: cutlass.Float32,  # the indexer norms' epsilon
+    w_offset_i: cutlass.Float32,  # the indexer norms' weight offset (0.0 = the pre-folded (1 + w) form, 1.0 = the checkpoint's w)
+    d: cutlass.Constexpr[int],
+    d_i: cutlass.Constexpr[int],
+    rope_dim: cutlass.Constexpr[int],
+    pool: cutlass.Constexpr[int],
+    page_size: cutlass.Constexpr[int],
+    slot_i64: cutlass.Constexpr[bool],
+    threads_per_cta: cutlass.Constexpr[int],
+    h_q_ct: cutlass.Constexpr[int],
+    h_kv_ct: cutlass.Constexpr[int],
+    h_i_ct: cutlass.Constexpr[int],
+    const_head_counts: cutlass.Constexpr[bool],
+    use_pdl: cutlass.Constexpr[bool],
+) -> None:
+    """One warp = ``32 // lanes_per_row`` consecutive rows of one arm (module docstring); the arm boundaries are the warp
+    counts :func:`prepare_warp_counts` derives, recomputed on device from ``n_tok`` so the host's grid and the device's row map
+    share one formula.  The body is :func:`prepare_role` (the warp's global id ``wid`` computed here, the PDL pair around it);
+    the launch is the role's only standalone form."""
+    if cutlass.const_expr(use_pdl):
+        wait_on_dependent_grids()
+
+    warps_per_cta = cutlass.const_expr(threads_per_cta // _WARP)
+    tidx = cutlass.Int32(cute.arch.thread_idx()[0])
+    lane32 = tidx % cutlass.Int32(_WARP)
+    wid = cutlass.Int32(cute.arch.block_idx()[0]) * cutlass.Int32(warps_per_cta) + tidx // cutlass.Int32(_WARP)
+
+    prepare_role(
+        mQ,
+        mK,
+        mV,
+        mQo,
+        mKo,
+        mWq,
+        mWk,
+        mCos,
+        mSin,
+        mKPool,
+        mVPool,
+        mSlot,
+        mIKsrc,
+        mIKpool,
+        mIQsrc,
+        mIQout,
+        mWiq,
+        mRing,
+        mComp,
+        mWik,
+        mCosPos,
+        mSinPos,
+        mPos0,
+        mNCommit,
+        mCSlot,
+        mKvLens,
+        mBlockTable,
+        mStateTable,
+        mRingSlots,
+        n_tok,
+        s_q,
+        n_slots,
+        n_islots,
+        h_q,
+        h_kv,
+        h_i,
+        eps,
+        eps_i,
+        w_offset_i,
+        d,
+        d_i,
+        rope_dim,
+        pool,
+        page_size,
+        slot_i64,
+        h_q_ct,
+        h_kv_ct,
+        h_i_ct,
+        const_head_counts,
+        wid,
+        lane32,
+        tidx,
+    )
     if cutlass.const_expr(use_pdl):
         launch_dependent_grids()
 
