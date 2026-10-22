@@ -1,0 +1,27 @@
+# The decode top-k's SINGLE-CTA form (`frost_qsa_topk_decode`, cluster_ctas 1): the cubin md5 of every served rendering the test module
+# exercises, host trace-compiled for sm_107a (CUTE_DSL_KEEP=cubin, CUTE_DSL_ARCH=sm_107a, the compiled-plan cache disabled; the probe is
+# test_qsa_topk_decode.py's _CUBIN_PROBE) from the kernel BEFORE its body became the role function `topk_role` (the base tree at f2aa360e5,
+# qsa_topk_decode.py source digest 4a22915e0d397e1a; first taken at 0a07d4ee2 / digest 98a0b3041d391d08 and re-rendered from f2aa360e5 after
+# the restack: every md5 identical -- the base's own change between the two touched the compile gates only).  The role refactor must keep
+# every line byte-identical; a later kernel change that
+# moves a rendering re-records its line with the reason here.  A record stays valid for the DSL build it names -- the version string AND
+# the assembler the cubins carry (the cubin is a function of the DSL's bundled compiler); on another build the pin skips naming both
+# sides (or fails under CUDNN_FROST_REQUIRE_CUBIN_PINS=1) and the record is re-rendered.
+# Lines: dsl=<distribution> <version>; compiler=ptxas <version>; qsa_topk_decode sm_107a c<cols_cap>_k<top_k>_t<threads_per_cta>_p<use_pdl> rc=0 cubin_md5=<md5>.
+dsl=nvidia-cutlass-dsl 4.8.0
+compiler=ptxas 13.4.59
+qsa_topk_decode sm_107a c1024_k512_t1024_p0 rc=0 cubin_md5=95edaa39568c8af945800d126db48d1a
+qsa_topk_decode sm_107a c512_k512_t512_p0 rc=0 cubin_md5=54951c6dfa7bdcfac75cc1dbf90bffeb
+qsa_topk_decode sm_107a c1024_k512_t512_p0 rc=0 cubin_md5=dcdcf068f5fe43f81c313eb643f13fef
+qsa_topk_decode sm_107a c2048_k512_t1024_p0 rc=0 cubin_md5=d21cfaeec80677516f002ff44ef6ff10
+qsa_topk_decode sm_107a c2048_k512_t512_p0 rc=0 cubin_md5=9a99b82290b7daf20bb39a194caba8ea
+qsa_topk_decode sm_107a c8192_k512_t1024_p0 rc=0 cubin_md5=7a665d65e74b77e50cc11dd9fe858e77
+qsa_topk_decode sm_107a c8192_k512_t512_p0 rc=0 cubin_md5=714be13ca681d7e86d8306969dd77df1
+qsa_topk_decode sm_107a c32768_k512_t1024_p0 rc=0 cubin_md5=bf1b11aea4a55f573d8d93888c392352
+qsa_topk_decode sm_107a c32768_k512_t512_p0 rc=0 cubin_md5=7cc1160c05030c400d964eeca0469e4f
+qsa_topk_decode sm_107a c4096_k1_t1024_p0 rc=0 cubin_md5=bd6a5188eb328602972cf7eaeda4e051
+qsa_topk_decode sm_107a c4096_k4_t1024_p0 rc=0 cubin_md5=9bb8f1e1422e81f1173981ccc743b134
+qsa_topk_decode sm_107a c4096_k100_t1024_p0 rc=0 cubin_md5=0c008279f4ae72db64d1fde09328775c
+qsa_topk_decode sm_107a c4096_k2048_t1024_p0 rc=0 cubin_md5=233de107c0ce675eb013861d5736cc29
+qsa_topk_decode sm_107a c8192_k512_t1024_p1 rc=0 cubin_md5=e9552781ff82bf489fe65791a0678779
+qsa_topk_decode sm_107a c4096_k512_t1024_p1 rc=0 cubin_md5=d0fea4dd399ea15261da5f8f247e8278

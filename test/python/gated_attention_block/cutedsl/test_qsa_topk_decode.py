@@ -900,3 +900,112 @@ def test_sm_107a_rendering_of_the_cluster_form_carries_the_exchange_structure(tm
     assert counts["st.async"] >= 5 and counts["mapa"] >= 5 and counts["mbarrier.init"] == 5 and counts["mbarrier.arrive.expect_tx"] >= 5, counts
     assert counts["ld.shared::cluster"] == 0 and counts["match.any.sync"] == 0 and counts["lanemask_lt"] == 0, counts
     assert counts["griddepcontrol.wait"] == counts["griddepcontrol.launch_dependents"] == (1 if use_pdl else 0), counts
+
+
+# --------------------------------------------------------------------------------------------- the single-CTA cubin pin (host, sm_107a)
+
+_RENDERINGS = Path(__file__).resolve().parent / "renderings"
+_CUBIN_RECORD = _RENDERINGS / "md5_qsa_topk_decode_single_cta_sm_107a.txt"
+# the served single-CTA renderings this module exercises -- (cols_cap, top_k, threads_per_cta, use_pdl): the accept cells' column
+# widths at both thread counts (cols_cap_for(cols, 1, threads)), the other list widths at 4096 columns (1 / 4 / 100 and the fallback-only
+# form at 2048, whose staging regions exceed STAGE_POOL_MAX_BYTES), and the two use_pdl arms the module compiles
+_PINNED_SINGLE_CTA_KEYS = (
+    (1024, 512, 1024, False),
+    (512, 512, 512, False),
+    (1024, 512, 512, False),
+    (2048, 512, 1024, False),
+    (2048, 512, 512, False),
+    (8192, 512, 1024, False),
+    (8192, 512, 512, False),
+    (32768, 512, 1024, False),
+    (32768, 512, 512, False),
+    (4096, 1, 1024, False),
+    (4096, 4, 1024, False),
+    (4096, 100, 1024, False),
+    (4096, 2048, 1024, False),
+    (8192, 512, 1024, True),
+    (4096, 512, 1024, True),
+)
+
+
+def _pin_id(key):
+    cap, top_k, threads, use_pdl = key
+    return f"c{cap}_k{top_k}_t{threads}_p{int(use_pdl)}"
+
+
+# The probe: one fresh interpreter per rendering, the dump dir / the kept artifact / the arch fixed BEFORE the first cutlass import (the
+# DSL reads them once), the persistent compiled-plan cache disabled (a hit skips ptxas and dumps no cubin), the launch wrapper compiled
+# exactly as compile_qsa_topk_decode does (the same fake tensors, the single-CTA form), then the md5 of the newest cubin in the dump.
+_CUBIN_PROBE = textwrap.dedent("""
+    import glob, hashlib, os, sys
+    dump, cap, top_k, thr, pdl = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5] == "1"
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump
+    os.environ["CUTE_DSL_KEEP"] = "cubin"
+    os.environ["CUTE_DSL_ARCH"] = "sm_107a"
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"
+    import cutlass, cutlass.cute as cute
+    from cutlass.cute.runtime import make_fake_stream, make_fake_compact_tensor
+    from cudnn.gated_attention_block.kernels import qsa_topk_decode as M
+    cute.compile(M.qsa_topk_decode_launch, M._fake_rows(cutlass.Int32),
+                 make_fake_compact_tensor(dtype=cutlass.Int32, shape=(cute.sym_int(),), stride_order=(0,), assumed_align=4),
+                 M._fake_rows(cutlass.Int32), cutlass.Int32(1), cap, top_k, 1, thr, pdl, M.smem_bytes_for(cap, 1, thr, top_k),
+                 make_fake_stream(use_tvm_ffi_env_stream=False), options="--enable-tvm-ffi --gpu-arch sm_107a")
+    cubins = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    if not cubins:
+        print("FAIL no cubin dumped into", dump, os.listdir(dump)); sys.exit(3)
+    print("CUBIN_MD5", hashlib.md5(open(cubins[-1], "rb").read()).hexdigest())
+    """)
+
+
+def _cubin_record():
+    """``(dsl, {pin id: md5})`` from the committed record."""
+    assert _CUBIN_RECORD.is_file(), _CUBIN_RECORD
+    dsl, want = None, {}
+    for ln in _CUBIN_RECORD.read_text().splitlines():
+        if ln.startswith("dsl="):
+            dsl = ln[len("dsl=") :].strip()
+        m = re.match(r"qsa_topk_decode sm_107a (\S+) rc=0 cubin_md5=([0-9a-f]{32})$", ln)
+        if m:
+            want[m.group(1)] = m.group(2)
+    return dsl, want
+
+
+def _render_cubin_md5(tmp_path, key):
+    cap, top_k, threads, use_pdl = key
+    dump = tmp_path / f"cubin_{_pin_id(key)}"
+    dump.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "-c", _CUBIN_PROBE, str(dump), str(cap), str(top_k), str(threads), "1" if use_pdl else "0"],
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    assert proc.returncode == 0, proc.stdout[-3000:] + proc.stderr[-3000:]
+    md5 = next((ln.split()[1] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN_MD5 ")), "")
+    assert re.fullmatch(r"[0-9a-f]{32}", md5), proc.stdout[-2000:]
+    return md5
+
+
+def test_single_cta_cubin_record_is_committed_and_complete():
+    """The record names its DSL build and holds exactly the pinned keys (a key added here lands in the record, or the pin goes red)."""
+    dsl, want = _cubin_record()
+    assert dsl and dsl.startswith("nvidia-cutlass-dsl "), dsl
+    assert set(want) == {_pin_id(k) for k in _PINNED_SINGLE_CTA_KEYS}, (sorted(want), sorted(_pin_id(k) for k in _PINNED_SINGLE_CTA_KEYS))
+
+
+@pytest.mark.parametrize("key", _PINNED_SINGLE_CTA_KEYS, ids=_pin_id)
+def test_single_cta_cubin_is_byte_identical_to_the_record(tmp_path, key):
+    """A host trace-compile for sm_107a (no GPU) of the single-CTA form at this served rendering md5-equals the committed record: the
+    body's move into the role function ``topk_role`` (the row as an argument, the fused-form counter seams behind a ``Constexpr`` flag
+    that is False here) changed no byte of the standalone kernel.  Skips on another DSL build (the cubin is a function of it)."""
+    from cudnn.frost.buffers import cutedsl_state
+
+    if not _arch_known("sm_107a"):
+        pytest.skip("this CuTe DSL has no sm_107a target")
+    dsl, want = _cubin_record()
+    _installed, version = cutedsl_state()
+    have = " ".join(version) if version else None
+    if dsl is not None and have != dsl:
+        pytest.skip(f"the md5 record was rendered with {dsl}; installed {have}: the cubin is a function of the DSL build, re-render the record")
+    md5 = _render_cubin_md5(tmp_path, key)
+    assert md5 == want[_pin_id(key)], f"{_pin_id(key)}: cubin md5 {md5} != the record's {want[_pin_id(key)]} -- the single-CTA rendering changed"
