@@ -106,15 +106,20 @@ def test_dispatch_table_places_every_producer_before_its_consumers(b, s_q, nbm, 
     assert tb.n_prep_ctas >= 1 and tb.n_chunks >= 1
 
 
+@pytest.mark.parametrize("order", [o for o in F.DISPATCH_ORDERS if o != "sequence-major"])
 @pytest.mark.parametrize("b,s_q,nbm", CELLS, ids=[f"B{b}_S{s}_N{n}" for b, s, n in CELLS])
-def test_the_mis_ordered_twin_fails_the_pin(b, s_q, nbm):
-    """The trap rendering's input: the consumers-first order is REFUSED by the same pin -- the detector of the forward-progress
-    assumption is live, not vacuous."""
-    tb = _table(b, s_q, nbm, 1, 1024, order="consumers-first")
+def test_the_mis_ordered_twin_fails_the_pin(b, s_q, nbm, order):
+    """The trap rendering's inputs: both mis-orders are REFUSED by the same pin -- the detector of the forward-progress assumption is
+    live, not vacuous.  Only the GLOBAL twin places every sequence's top-k CTAs ahead of the first scorer CTA (the per-sequence twin keeps
+    forward progress under in-order dispatch: at most one sequence's consumers wait on undispatched producers)."""
+    tb = _table(b, s_q, nbm, 1, 1024, order=order)
     assert not tb.producers_before_consumers()
     v = tb.first_violation()
     assert v is not None and v[2] > v[3], v
     assert tb.n_ctas == _table(b, s_q, nbm, 1, 1024).n_ctas  # the same grid, only the order differs
+    first_producer = min(tb.linear_index(F.ROLE_SCORER, bb, k) for bb in range(b) for k in range(tb.n_chunks))
+    ahead = sum(1 for bb in range(b) for s in range(s_q) if tb.linear_index(F.ROLE_TOPK, bb, s) < first_producer)
+    assert ahead == (b * s_q if order == "consumers-first-global" else s_q), (order, ahead)
 
 
 @pytest.mark.parametrize("units,threads", [k for k in KNOBS if _served(*k)], ids=[f"u{u}_t{t}" for u, t in KNOBS if _served(u, t)])
@@ -331,7 +336,7 @@ def test_module_docstring_carries_the_pre_development_tables_and_the_contract():
     assert "sNew" in doc and "sA" in doc and "260.3 KiB" in doc and "113.4 KiB" in doc and "196 KiB" in doc and "OVERSIZED" in doc
     # the assumption, its detectors and its denial
     assert "non-decreasing linear ``blockIdx`` order" in doc and "NOT: a CUDA programming-model guarantee" in doc
-    assert "deadline_ns" in doc and "consumers-first" in doc
+    assert "deadline_ns" in doc and "consumers-first" in doc and "consumers-first-global" in doc
     # P17: the wait is the first instruction of every role; the dependent's obligation is stated
     assert "FIRST instruction of every role" in doc and "MUST issue its own ``griddepcontrol.wait``" in doc
     # the degenerate matrix names every row the plan lists
@@ -380,6 +385,10 @@ def test_served_entries_gate_before_the_kernel_module(monkeypatch):
         F.compile_qsa_indexer_fused(**dict(base, dtype=torch.float16))
     with pytest.raises(ValueError, match="served only with deadline_ns"):
         F.compile_qsa_indexer_fused(**dict(base, order="consumers-first"))
+    with pytest.raises(ValueError, match="served only with deadline_ns"):
+        F.compile_qsa_indexer_fused(**dict(base, order="consumers-first-global"))
+    with pytest.raises(ValueError, match="order must be one of"):
+        F.compile_qsa_indexer_fused(**dict(base, order="random", deadline_ns=1))
     with pytest.raises(ValueError, match="roles must be a non-empty subset"):
         F.compile_qsa_indexer_fused(**dict(base, roles=("tile",)))
     with pytest.raises(ValueError, match="units must be one of"):

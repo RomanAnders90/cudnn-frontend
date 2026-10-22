@@ -55,6 +55,12 @@ Dispatch table (sequence-major: every consumer right behind its producers; ``n_c
     order: [R0 x n_prep] [R1(b=0) x n_chunks] [R2(b=0) x S_q] [R1(b=1) x n_chunks] [R2(b=1) x S_q] ...
     decode on device (warp-uniform; kernel scalars n_prep, n_chunks, s_q): bidx < n_prep -> R0;  r = bidx - n_prep;
     b = r / (n_chunks + s_q); k = r % (n_chunks + s_q); k < n_chunks -> R1 chunk k of b; else R2 row b x s_q + (k - n_chunks).
+    the test-only twins (served with ``deadline_ns`` alone, never by a plan): consumers-first = [R0] [R2(b=0) x S_q] [R1(b=0) x n_chunks]
+    ... (k < s_q -> R2 row b x s_q + k; else R1 chunk k - s_q of b) -- it violates the pin but keeps forward progress under in-order
+    dispatch (at most one sequence's consumers wait on undispatched producers), so it can never make the trap fire;
+    consumers-first-global = [R0] [R2 x T] [R1 x B x n_chunks] (r < T -> R2 row r; else r' = r - T: R1 chunk r' % n_chunks of
+    b = r' / n_chunks) -- EVERY sequence's top-k CTAs ahead of EVERY scorer CTA: with more rows than resident slots every slot holds a
+    consumer whose producers cannot be dispatched, the one table that strands the machine = the trap test's detector input.
 
     cell (B x KV tokens x S_q; units)   R0   R1 per seq   R2 per seq   total   waves at 1 CTA / SM (212 SMs)
     B 1 x 8K x 1 (1)                     1    16           1            18      1
@@ -186,7 +192,8 @@ the kernel timeout, or the deadline trap in tests: ``deadline_ns``, a test-only 
 bigger timeout), never as a wrong answer.  Other kernels on the GPU (another stream, MPS) only shrink the resident capacity: a slower
 step, never a deadlock.  No cluster launch in the fused grid (the top-k's cluster form is kept OUT of it: a cluster launch would cluster
 every role's CTAs and the argument would move to cluster granularity).  :meth:`DispatchTable.producers_before_consumers` is the host
-pin of the placement; the mis-ordered twin (``order = "consumers-first"``) is the trap rendering's input, RED on purpose.
+pin of the placement; the mis-ordered twins (``order = "consumers-first"`` per sequence, ``"consumers-first-global"`` across the grid --
+the latter the trap rendering's input, since only a GLOBAL mis-order strands the resident capacity) are RED on purpose.
 
 PDL sites per role (P17; under the ``use_pdl`` compile key only, the launch attribute set with it; AUTO stays off until the chain's
 table): ``griddepcontrol.wait`` is the FIRST instruction of every role -- ahead of R0's slab-band / ``kv_lens`` / table reads, of R1's
@@ -295,9 +302,12 @@ ROLE_SCORER = 1
 ROLE_TOPK = 2
 ROLE_NAMES = ("prepare", "scorer", "topk")
 
-DISPATCH_ORDERS = ("sequence-major", "consumers-first")
+DISPATCH_ORDERS = ("sequence-major", "consumers-first", "consumers-first-global")
 """``sequence-major`` is the served order (every R2(b) right behind every R1(b)); ``consumers-first`` puts a sequence's top-k CTAs
-AHEAD of its scorer CTAs -- the deliberately mis-ordered table of the trap test, never launched by a plan."""
+AHEAD of its scorer CTAs (the deliberately mis-ordered table of the host pin: it violates the placement, yet keeps forward progress under
+in-order dispatch); ``consumers-first-global`` puts EVERY sequence's top-k CTAs ahead of EVERY scorer CTA -- the table that strands the
+machine, the trap test's detector input.  Neither twin is ever launched by a plan (the compile serves them with ``deadline_ns`` alone);
+the tuple is append-only."""
 
 DEFAULT_THREADS = 512
 """The fused block size the register census of the host rendering chose (the go / no-go before any GPU time): at 1024 threads every role
@@ -387,8 +397,9 @@ class DispatchTable(NamedTuple):
     """The CTA ranges of one fused launch (plan constants handed to the kernel as scalars).
 
     ``n_prep_ctas`` R0 CTAs first, then per sequence ``n_chunks`` R1 CTAs followed by ``s_q`` R2 CTAs (``order = "sequence-major"``, the
-    served order), or -- the trap test's twin -- the ``s_q`` R2 CTAs AHEAD of the ``n_chunks`` R1 CTAs (``"consumers-first"``).
-    ``units`` is the scorer units per R1 CTA, ``threads`` the block size of every CTA."""
+    served order), or -- the host pin's twin -- the ``s_q`` R2 CTAs AHEAD of the ``n_chunks`` R1 CTAs inside every sequence's range
+    (``"consumers-first"``), or -- the trap test's twin -- ALL ``T`` R2 CTAs ahead of ALL ``B x n_chunks`` R1 CTAs
+    (``"consumers-first-global"``).  ``units`` is the scorer units per R1 CTA, ``threads`` the block size of every CTA."""
 
     n_prep_ctas: int
     n_chunks: int
@@ -437,10 +448,14 @@ class DispatchTable(NamedTuple):
         if role == ROLE_SCORER:
             if not 0 <= k < self.n_chunks:
                 raise ValueError(f"scorer chunk {k} outside [0, {self.n_chunks})")
+            if self.order == "consumers-first-global":
+                return self.n_prep_ctas + self.n_rows + b * self.n_chunks + k
             return base + (k if self.order == "sequence-major" else self.s_q + k)
         if role == ROLE_TOPK:
             if not 0 <= k < self.s_q:
                 raise ValueError(f"top-k row {k} outside [0, {self.s_q})")
+            if self.order == "consumers-first-global":
+                return self.n_prep_ctas + b * self.s_q + k
             return base + (self.n_chunks + k if self.order == "sequence-major" else k)
         raise ValueError(f"role must be one of {ROLE_NAMES} (0 / 1 / 2), got {role}")
 
@@ -451,6 +466,10 @@ class DispatchTable(NamedTuple):
         if bidx < self.n_prep_ctas:
             return ROLE_PREPARE, 0, bidx
         r = bidx - self.n_prep_ctas
+        if self.order == "consumers-first-global":
+            if r < self.n_rows:
+                return (ROLE_TOPK,) + divmod(r, self.s_q)
+            return (ROLE_SCORER,) + divmod(r - self.n_rows, self.n_chunks)
         b, k = divmod(r, self.per_sequence)
         if self.order == "sequence-major":
             return (ROLE_SCORER, b, k) if k < self.n_chunks else (ROLE_TOPK, b, k - self.n_chunks)
@@ -459,6 +478,11 @@ class DispatchTable(NamedTuple):
     def ranges(self) -> List[Tuple[int, int, int, int]]:
         """``(role, b, start, stop)`` per contiguous range, in linear order."""
         out = [(ROLE_PREPARE, 0, 0, self.n_prep_ctas)]
+        if self.order == "consumers-first-global":
+            out += [(ROLE_TOPK, b, self.n_prep_ctas + b * self.s_q, self.n_prep_ctas + (b + 1) * self.s_q) for b in range(self.batch)]
+            first = self.n_prep_ctas + self.n_rows
+            out += [(ROLE_SCORER, b, first + b * self.n_chunks, first + (b + 1) * self.n_chunks) for b in range(self.batch)]
+            return out
         for b in range(self.batch):
             base = self.n_prep_ctas + b * self.per_sequence
             if self.order == "sequence-major":
@@ -642,7 +666,7 @@ def compile_qsa_indexer_fused(
     ``units``, ``threads`` (1024 / 512), ``use_pdl``, the device; the test-only ``deadline_ns`` (the trap rendering: a ``%globaltimer`` deadline
     on the top-k's acquire, the launch then takes the deadline and a diagnostic buffer), ``check_arrivals`` (the top-k role's exact-count
     trap before its counter reset), ``roles`` (a role-isolated rendering for the per-role register census) and ``order``
-    (``"consumers-first"``: the mis-ordered dispatch table, served only with the deadline).  The dynamic SMEM = :func:`dynamic_smem_bytes`
+    (``"consumers-first"`` / ``"consumers-first-global"``: the mis-ordered dispatch tables, served only with the deadline).  The dynamic SMEM = :func:`dynamic_smem_bytes`
     over the compiled roles, checked against the device's ceiling -- the standard opt-in limit, or the oversized carveout where the part
     has one (a figure above the standard carveout names it; past both the declaration is declined by name).  Rule 7's facade gates (the
     DSL floor, the ``sm_107a`` target on cc 10.7 -- the public wheel carries it from 4.8.0 --, cc 9.0 for PDL) decline by name before any
@@ -682,9 +706,11 @@ def compile_qsa_indexer_fused(
     if not isinstance(roles, (tuple, list)) or not roles or any(r not in ROLES for r in roles):
         raise ValueError(f"roles must be a non-empty subset of {ROLES}, got {roles!r}")
     roles = tuple(r for r in ROLES if r in roles)
-    if order == "consumers-first" and deadline_ns is None:
+    if order not in DISPATCH_ORDERS:
+        raise ValueError(f"order must be one of {DISPATCH_ORDERS}, got {order!r}")
+    if order != "sequence-major" and deadline_ns is None:
         raise ValueError(
-            "order='consumers-first' is the trap rendering's mis-ordered dispatch table: it is served only with deadline_ns (a lost dependency must trap, never hang)"
+            f"order={order!r} is a trap rendering's mis-ordered dispatch table: it is served only with deadline_ns (a lost dependency must trap, never hang)"
         )
     if deadline_ns is not None and int(deadline_ns) < 1:
         raise ValueError(f"deadline_ns must be a positive nanosecond count, got {deadline_ns!r}")
@@ -760,6 +786,7 @@ def compile_qsa_indexer_fused(
         consumers_first=order == "consumers-first",
         roles=roles,
         device=dev,
+        consumers_global=order == "consumers-first-global",
         scorer_l2_hint=l2_hint_available(),  # the scorer's key copies: the hinted form where the DSL's compiler serves it (the standalone scorer's default arm)
     )
     compiled = km.compile_fused(key)

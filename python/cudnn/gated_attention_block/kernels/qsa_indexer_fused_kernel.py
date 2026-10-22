@@ -24,6 +24,11 @@ decoded on device from the three kernel scalars ``n_prep`` / ``n_chunks`` / ``s_
   (``128 x units`` threads), writes no counts (chunk 0's unit alone does) and the release stays ONE warp of the CTA.
 * R2, the ``s_q`` CTAs behind them: ``topk_role(row = b x s_q + s, fused=True)`` with the row's counter word and the target ``n_chunks``;
   the acquire + reset seam (and its test-only ``check_arrivals`` / deadline arms) is the role's own.
+* The two test-only mis-orders render only with the deadline (the front door refuses them without it): ``consumers_first`` puts a
+  sequence's top-k CTAs ahead of its scorer CTAs inside the sequence's range; ``consumers_global`` puts EVERY sequence's top-k CTAs ahead
+  of EVERY scorer CTA (``[R2 x T][R1 x B x n_chunks]``, decoded from ``n_tok``) -- the table that strands every resident slot on a
+  consumer under in-order dispatch (the per-sequence twin never does: at most one sequence's consumers wait on undispatched producers),
+  so it is the trap test's detector input.
 
 The SMEM carve: the scorer's three buffers are declared INSIDE the R1 branch and the top-k's allocator runs inside the R2 branch; the launch
 passes the plan's union (``dynamic_smem_bytes``) as ``smem`` and ``smem_merge_branch_allocs`` so the two mutually exclusive branches alias
@@ -155,7 +160,8 @@ def frost_qsa_indexer_fused(
     units: cutlass.Constexpr[int],
     threads: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
-    consumers_first: cutlass.Constexpr[bool],  # test-only: the mis-ordered dispatch table (the trap rendering's input)
+    consumers_first: cutlass.Constexpr[bool],  # test-only: the mis-ordered dispatch table (a sequence's top-k CTAs ahead of its scorer CTAs)
+    consumers_global: cutlass.Constexpr[bool],  # test-only: EVERY sequence's top-k CTAs ahead of EVERY scorer CTA (the trap test's stranding table)
     check_arrivals: cutlass.Constexpr[bool],  # test-only: the top-k's exact-count trap before its reset
     with_deadline: cutlass.Constexpr[bool],  # test-only: the bounded poll + trap
     with_prepare: cutlass.Constexpr[bool],  # test-only role isolation (the served rendering has all three)
@@ -235,17 +241,27 @@ def frost_qsa_indexer_fused(
                 launch_dependent_grids()
     else:
         r = bidx - n_prep
-        per_seq = n_chunks + s_q_i
-        b = r // per_seq
-        k = r - b * per_seq
-        if cutlass.const_expr(consumers_first):
-            is_scorer = k >= s_q_i
-            chunk_k = k - s_q_i
-            row_k = k
+        if cutlass.const_expr(consumers_global):
+            # the test-only stranding table: [R2 x T][R1 x B x n_chunks] (every sequence's top-k CTAs ahead of every scorer CTA)
+            is_scorer = r >= n_tok
+            r_s = r - n_tok
+            b_scorer = r_s // n_chunks
+            chunk_k = r_s - b_scorer * n_chunks
+            b_topk = r // s_q_i
+            row_k = r - b_topk * s_q_i
         else:
-            is_scorer = k < n_chunks
-            chunk_k = k
-            row_k = k - n_chunks
+            per_seq = n_chunks + s_q_i
+            b_scorer = r // per_seq
+            b_topk = b_scorer
+            k = r - b_scorer * per_seq
+            if cutlass.const_expr(consumers_first):
+                is_scorer = k >= s_q_i
+                chunk_k = k - s_q_i
+                row_k = k
+            else:
+                is_scorer = k < n_chunks
+                chunk_k = k
+                row_k = k - n_chunks
         if is_scorer:
             # ---------------- R1: `units` scorer units over one SMEM carve; the warps past them take no role ----------------
             if cutlass.const_expr(with_scorer):
@@ -271,7 +287,7 @@ def frost_qsa_indexer_fused(
                         cutlass.Int32(top_k),
                         scale,
                         chunk_id,
-                        b,
+                        b_scorer,
                         unit,
                         warp_in_unit,
                         tidx_in_unit,
@@ -285,7 +301,7 @@ def frost_qsa_indexer_fused(
                         scorer_l2_hint,
                         True,  # fused
                         True,  # derive
-                        cnt_row_base + (b * s_q_i).to(cutlass.Int64) * eight,  # the sequence's S_q consecutive counter words
+                        cnt_row_base + (b_scorer * s_q_i).to(cutlass.Int64) * eight,  # the sequence's S_q consecutive counter words
                         units,
                         mIQsrc,
                         mIKsrc,
@@ -308,7 +324,7 @@ def frost_qsa_indexer_fused(
         else:
             # ---------------- R2: the top-k of one row behind its sequence's scorer CTAs ----------------
             if cutlass.const_expr(with_topk):
-                row = b * s_q_i + row_k
+                row = b_topk * s_q_i + row_k
                 topk_role(
                     mLogitsBits,
                     mCounts,
@@ -403,6 +419,7 @@ def qsa_indexer_fused_launch(
     threads: cutlass.Constexpr[int],
     use_pdl: cutlass.Constexpr[bool],
     consumers_first: cutlass.Constexpr[bool],
+    consumers_global: cutlass.Constexpr[bool],
     check_arrivals: cutlass.Constexpr[bool],
     with_deadline: cutlass.Constexpr[bool],
     with_prepare: cutlass.Constexpr[bool],
@@ -482,6 +499,7 @@ def qsa_indexer_fused_launch(
         threads,
         use_pdl,
         consumers_first,
+        consumers_global,
         check_arrivals,
         with_deadline,
         with_prepare,
@@ -523,6 +541,7 @@ class FusedKey(NamedTuple):
     consumers_first: bool
     roles: tuple
     device: int
+    consumers_global: bool = False  # appended (the key is append-only): the global mis-order of the trap test
     scorer_l2_hint: bool = True  # appended: the scorer's key-copy arm as BUILT (the front door resolves the DSL compiler's floor like the standalone scorer)
 
 
@@ -627,6 +646,7 @@ def fused_fake_args(key: FusedKey, *, stream=None) -> list:
         int(key.threads),
         bool(key.use_pdl),
         bool(key.consumers_first),
+        bool(key.consumers_global),
         bool(key.check_arrivals),
         bool(key.with_deadline),
         "prepare" in roles,
