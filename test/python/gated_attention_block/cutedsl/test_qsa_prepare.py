@@ -73,6 +73,7 @@ from cudnn.gated_attention_block.kernels.qsa_prepare import (  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import cubin_pin_support as pin  # noqa: E402  (the cubin pins' skip-or-fail contract: the DSL string, the bundled assembler, the target)
 from gated_block_qsa_reference import full_block_ids  # noqa: E402
 from gated_block_reference import RefGeometry, make_inputs  # noqa: E402
 
@@ -1355,3 +1356,140 @@ def test_paged_fused_prepare_e4m3_store_arm_is_bitwise_the_step_form_and_the_bf1
     if names is not None:
         (fused,) = names
         assert len(fused) == 1 and "frost_qsa_prepare" in fused[0], fused
+
+
+# --------------------------------------------------------------------------- the served renderings' cubin pin (host sm_107a trace-compile)
+# The kernel's body is a ROLE the indexer megakernel calls from a fused launch; every refactor of it is held to "no behaviour change" by the
+# strongest tripwire available without a GPU: the cubin of every served rendering, byte for byte, against this committed record (the sdpa
+# suite's method: ``test_sdpa_bias_sm107.py``).  The record names the renderings the block route binds (the raw-pool arm, both slot dtypes,
+# with and without PDL), the RoPE-only and no-band forms, the dense indexer arms, the 256-thread / runtime-head-count form and the decode
+# step's PAGED forms (the ring slots, the RoPE table, the commit prefix, every arm at once); each is trace-compiled for sm_107a in a fresh
+# interpreter (``CUTE_DSL_ARCH`` needs no matching device; the compile key's device index is pinned by ``build_device(0)``, so no CUDA
+# device is needed either) and md5-compared.  A record is valid for the DSL build it names -- the version string AND the assembler the
+# cubins carry (the cubin is a function of the DSL's bundled ptxas): another build skips naming both sides, or FAILS under
+# ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1`` (the pin-owning CI job; ``cubin_pin_support``).  Re-record on purpose only -- run every
+# rendering's ``compile`` entry through :func:`render_cubin` on the UNCHANGED kernel and write the md5s back -- and say why in the commit.
+
+_CUBIN_RECORD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "qsa_prepare_cubin_record_sm_107a.json")
+_CUBIN_RECORD_RENDERINGS = (
+    "block_raw_pool_bf16_i32",
+    "block_raw_pool_bf16_i64_pdl",
+    "attention_only_no_index_band_f16",
+    "rope_only_raw_pool_bf16",
+    "d128_raw_pool_and_compress_dense_i64",
+    "small_query_only_bf16",
+    "small_compress_only_n_commit_bf16",
+    "threads_256_const_heads_off_all_dense_arms_bf16",
+    "decode_paged_query_compress_bf16_i32",
+    "decode_paged_ring_slots_rope_table_bf16_i64_pdl",
+    "decode_paged_n_commit_rope_table_bf16_i32",
+    "decode_paged_all_arms_f16_i64_pdl_p32",
+    "decode_paged_query_compress_e4m3_cache_bf16_i32",  # the e4m3 store arm (index_cache_dtype=float8_e4m3fn) on the decode step's paged arms
+    "decode_paged_all_arms_e4m3_cache_bf16_i64_pdl_p32",
+)
+_CUBIN_PROBE = """
+import glob, hashlib, json, os, re, sys
+dump, arch, kw_json = sys.argv[1], sys.argv[2], sys.argv[3]
+os.environ["CUTE_DSL_DUMP_DIR"] = dump                      # read once, at the first cutlass import
+os.environ["CUTE_DSL_KEEP"] = "cubin"                       # keep the cubin
+os.environ["CUTE_DSL_ARCH"] = arch                          # unconditional: an inherited value would pin another target
+os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"   # a compiled-plan cache HIT skips ptxas and dumps no cubin
+for k in ("CUTE_DSL_LINEINFO", "CUTE_DSL_LOC_TRACEBACKS"):  # debug line tables would move the bytes
+    os.environ.pop(k, None)
+import torch
+import cudnn.frost.device as DEV
+import cudnn.gated_attention_block.kernels.qsa_compress as QC
+from cudnn.frost.device import build_device
+from cudnn.gated_attention_block.kernels.qsa_prepare import QsaPrepareIndexArms, compile_qsa_prepare
+kw = json.loads(kw_json)
+kw["dtype"] = getattr(torch, kw["dtype"])
+kw["slot_dtype"] = getattr(torch, kw["slot_dtype"])
+if kw.get("index_cache_dtype") is not None:
+    kw["index_cache_dtype"] = getattr(torch, kw["index_cache_dtype"])  # the e4m3 store arm's cache dtype
+if kw["index"] is not None:
+    kw["index"] = QsaPrepareIndexArms(**kw["index"])
+# the host has no target device: the compile reads the TARGET's compute capability here (the e4m3 store arm's cvt is gated on sm_89+ at
+# compile time, Rule 7), so the trace takes the target's gates under the arch override whatever GPU the host carries
+DEV.compute_capability = QC.compute_capability = lambda d: (10, 7)  # the compress module binds the name itself (check_e4m3_store_target)
+with build_device(0):  # the compile key's device index, pinned: the trace needs no CUDA device (CUTE_DSL_ARCH names the target)
+    compile_qsa_prepare(**kw)
+cubins = glob.glob(os.path.join(dump, "*.cubin"))
+if len(cubins) != 1:
+    print("FAIL expected exactly one cubin in", dump, sorted(os.listdir(dump))); sys.exit(3)
+data = open(cubins[0], "rb").read()
+m = re.search(rb"Cuda compilation tools, release (\\d+\\.\\d+), V(\\d+\\.\\d+\\.\\d+)", data)  # the assembler's own string in the cubin
+print("CUBIN_COMPILER", "ptxas " + m.group(2).decode() if m else "unknown")
+print("CUBIN_MD5", hashlib.md5(data).hexdigest())
+"""
+
+
+def _cubin_record() -> dict:
+    import json
+
+    if not os.path.isfile(_CUBIN_RECORD):
+        return {"renderings": {}}
+    with open(_CUBIN_RECORD) as f:
+        return json.load(f)
+
+
+def render_cubin(tmp_path, rid: str, compile_kw: dict, arch: str = "sm_107a", timeout: int = 900):
+    """Trace-compile ONE rendering of ``frost_qsa_prepare`` for ``arch`` in a fresh interpreter (``compile_kw`` = the record's ``compile``
+    entry, JSON form: dtype names, the arms as a dict) and return ``(md5, compiler)`` of the dumped cubin -- its md5 and the assembler
+    string it carries (``ptxas <version>``).  A compile failure fails."""
+    import json
+    import subprocess
+
+    dump = tmp_path / f"{arch}_{rid}"
+    dump.mkdir()
+    proc = subprocess.run([sys.executable, "-c", _CUBIN_PROBE, str(dump), arch, json.dumps(compile_kw)], capture_output=True, text=True, timeout=timeout)
+    assert proc.returncode == 0, f"{arch} trace-compile of {rid} failed:\n{proc.stdout[-4000:]}\n{proc.stderr[-4000:]}"
+    md5 = next((ln.split()[1] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN_MD5 ")), "")
+    assert re.fullmatch(r"[0-9a-f]{32}", md5), proc.stdout[-2000:]
+    compiler = next((ln.split(" ", 1)[1] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN_COMPILER ")), pin.COMPILER_UNKNOWN)
+    return md5, compiler
+
+
+def render_cubin_md5(tmp_path, rid: str, compile_kw: dict, arch: str = "sm_107a", timeout: int = 900) -> str:
+    """The md5 of :func:`render_cubin`."""
+    return render_cubin(tmp_path, rid, compile_kw, arch=arch, timeout=timeout)[0]
+
+
+def test_cubin_record_is_committed_and_names_the_served_renderings():
+    rec = _cubin_record()
+    assert os.path.isfile(_CUBIN_RECORD), _CUBIN_RECORD
+    assert rec["kernel"] == "frost_qsa_prepare" and rec["arch"] == "sm_107a"
+    assert rec["dsl"].startswith("nvidia-cutlass-dsl "), rec["dsl"]
+    assert re.fullmatch(r"ptxas \d+\.\d+\.\d+", rec.get("compiler", "")), rec.get("compiler")  # the assembler beside the version string
+    assert set(rec["renderings"]) == set(_CUBIN_RECORD_RENDERINGS), (sorted(rec["renderings"]), _CUBIN_RECORD_RENDERINGS)
+    md5s = [r["cubin_md5"] for r in rec["renderings"].values()]
+    assert all(re.fullmatch(r"[0-9a-f]{32}", m) for m in md5s) and len(set(md5s)) == len(md5s), "every rendering is a distinct cubin"
+    for rid, r in rec["renderings"].items():
+        kw = r["compile"]
+        assert {"dtype", "h_q", "h_kv", "d", "rope_dim", "eps", "page_size", "slot_dtype", "apply_norm", "index"} <= set(kw), rid
+        if kw["index"] is not None:  # every arm the record claims is a legal QsaPrepareIndexArms
+            QsaPrepareIndexArms(**kw["index"])
+    # the block route's arms and the decode step's paged arms are both pinned
+    assert rec["renderings"]["block_raw_pool_bf16_i32"]["compile"]["index"] == dict(heads=4, head_dim=128, raw_pool=True, query=False, compress=False)
+    decode = rec["renderings"]["decode_paged_query_compress_bf16_i32"]["compile"]["index"]
+    assert decode == dict(heads=4, head_dim=128, raw_pool=False, query=True, compress=True, paged=True)
+    e4m3 = rec["renderings"]["decode_paged_query_compress_e4m3_cache_bf16_i32"]["compile"]
+    assert e4m3["index"] == decode and e4m3["dtype"] == "bfloat16" and e4m3["index_cache_dtype"] == "float8_e4m3fn"  # the e4m3 store arm, bf16 io
+
+
+@pytest.mark.parametrize("rid", _CUBIN_RECORD_RENDERINGS)
+def test_qsa_prepare_cubin_is_byte_identical_to_the_record(tmp_path, rid):
+    """Every served rendering of ``frost_qsa_prepare`` trace-compiles for sm_107a to the cubin the record pins, byte for byte: the kernel's
+    body (the three arms, as the role the fused indexer launch calls) renders the same SASS whether it is traced from this kernel or moved
+    behind a ``@cute.jit`` seam -- a refactor is "no behaviour change" when this cell stays green on every rendering.  No CUDA device is
+    needed (the probe pins the compile key's device index).  Another DSL build (the version string or the bundled assembler) or a DSL
+    without the target skips naming both sides -- or FAILS under ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1``, the pin-owning CI job."""
+    rec = _cubin_record()
+    if rid not in rec["renderings"]:
+        pytest.fail(f"{rid} is not in the committed record {_CUBIN_RECORD}")
+    pin.check_dsl(rec.get("dsl"))
+    pin.check_arch(rec["arch"])
+    want = rec["renderings"][rid]["cubin_md5"]
+    have_md5, have_compiler = render_cubin(tmp_path, rid, rec["renderings"][rid]["compile"], arch=rec["arch"])
+    pin.check_compiler(rec.get("compiler"), have_compiler)
+    print(f"\n{rid} {rec['arch']} cubin md5 {have_md5} (record {want}; {have_compiler})")
+    assert have_md5 == want, f"{rid}: cubin md5 {have_md5} != the record's {want} -- the rendering of frost_qsa_prepare changed"
