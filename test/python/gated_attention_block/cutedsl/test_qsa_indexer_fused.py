@@ -1,19 +1,45 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``qsa_indexer_fused``: the host half of the fused decode indexer -- the dispatch table and the pre-development tables.
+"""``qsa_indexer_fused``: the fused decode indexer's contract -- the host half (the dispatch table and the pre-development tables) and
+the kernel-level tiers against the public surface the tables and the compile / run entries define.
 
-The tables precede the body: no kernel body yet, so every cell here is a HOST cell (no GPU, no trace-compile).  The forward-progress
-placement is pinned over every served cell (``producers_before_consumers``: the linear index of every scorer CTA of a sequence below every
-top-k CTA of that sequence); beside it the dispatch table's CTA counts are pinned against the three standalone kernels' own grid
-arithmetic (the prepare's warp units, the scorer's ``(chunks, B)`` grid, the top-k's ``(1, rows)`` grid -- computed by THEIR functions and
-compared), the module's mirrored constants against the kernels' own, the docstring's dispatch rows against the function, the device
-decode against the host encoding, the mis-ordered twin against the pin (RED on purpose), and the docstring's tables for presence.  The
+HOST (no GPU, no trace-compile): the forward-progress placement is pinned over every served cell (``producers_before_consumers``: the
+linear index of every scorer CTA of a sequence below every top-k CTA of that sequence); beside it the dispatch table's CTA counts are
+pinned against the three standalone kernels' own grid arithmetic (the prepare's warp units, the scorer's ``(chunks, B)`` grid, the top-k's
+``(1, rows)`` grid -- computed by THEIR functions and compared), the module's mirrored constants against the kernels' own, the docstring's
+dispatch rows against the function, the device decode against the host encoding, the mis-ordered twin against the pin (RED on purpose),
+the docstring's tables for presence, and the dead units of the last scorer CTA (a chunk count that is not a multiple of ``units``).  The
 cells that import a kernel module skip below the CuTe DSL floor (Rule 7); the dispatch-table cells import no kernel module (the host
 facts come through the scorer's front door).
+
+KERNEL LEVEL (``qsa_indexer_fused_step.py`` is the harness: the step's operands, the three-launch reference = the standalone ``qsa_prepare``
+with the decode arms -> ``qsa_score_paged`` -> ``qsa_topk_decode`` on the same primed caches, the fused launch behind ONE adapter, the
+child-process entries): the fused launch is BITWISE the three-launch form (the list, ``counts``, ``block_lens``, the slot report, the Q / K
+bands, the K / V pool rows, the ring rows, the compressed-key cache rows, the logits buffer) over the dispatch rows' cells at the route's
+units and at units 2 / 8 with ``check_arrivals`` armed; the completing row is derived bitwise at every alignment; the degenerate matrix
+(a padding sequence, ``kv_lens < S_q``, a dead page under a visible block and under the completing block, a completing block past the
+table's width, the ring at its minimum cap, the identity region, the dead units of the last scorer CTA); the counter lifecycle (zero
+after every launch in fresh processes, a captured FIRST execute replaying bitwise with zero counters, two steps back to back on one
+plan); the trap rendering (a grid larger than the resident capacity terminates under an armed deadline; a placement that strands the
+consumers traps instead of hanging); the host PTX census of the fused rendering and the per-role local-memory pin.  Every kernel-level
+cell compiles the fused plan FIRST: against the pre-body module that is the stubs' ``NotImplementedError`` (RED by design; a missing
+compile key is the missing symbol), a Rule 7 decline by name (the DSL floor / target, the device family, the SMEM opt-in limit) is a
+skip, and a device the three-launch reference cannot run on skips by the scorer's own reason.  The census cells skip until the body is
+served (a rendering is needed).  The kernel timeout is never raised: a child that does not return within its budget FAILS naming the hang.
 """
 
+import importlib
 import itertools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import textwrap
+import time
+from pathlib import Path
 
 import pytest
 import torch
@@ -26,6 +52,10 @@ pytestmark = [pytest.mark.L0]
 
 _CUTEDSL_REQUIREMENT = cutedsl_requirement_error("qsa_indexer_fused")  # None at or above the floor
 needs_dsl = pytest.mark.skipif(_CUTEDSL_REQUIREMENT is not None, reason=str(_CUTEDSL_REQUIREMENT))
+needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA device is needed for the step's operands")
+requires_rubin = pytest.mark.requires_rubin  # the suite's registered marker (conftest.py): skipped off SM107
+_HERE = Path(__file__).resolve().parent
+_HARNESS = _HERE / "qsa_indexer_fused_step.py"
 
 # the Qwen 3.8 Flash-Next block's geometry (api.py's QsaSpec defaults: index_heads 4, index_head_dim 128; d_head 256)
 H_Q, H_KV, D, INDEX_HEADS, INDEX_HEAD_DIM, TOP_K = 24, 2, 256, 4, 128, 512
@@ -365,3 +395,735 @@ def test_served_entries_gate_before_the_kernel_module(monkeypatch):
         F._check_counter_words(torch.zeros(4, dtype=torch.int64), 4, torch.device("cpu"))
     with pytest.raises(ValueError, match="contiguous 1-D CUDA tensor"):
         F._check_counter_words(torch.zeros(2, 2, dtype=torch.int64), 4, torch.device("cpu"))
+
+
+# ===========================================================================================================================================
+# The host pins of the dispatch table's dead units and of the forward-progress wording (the re-audit's notes)
+# ===========================================================================================================================================
+
+
+@pytest.mark.parametrize("nbm,units,dead", [(520, 2, 1), (520, 8, 3), (1032, 2, 1), (1032, 8, 7), (8192, 8, 0), (2048, 2, 0)])
+def test_the_dead_units_of_the_last_scorer_cta_are_in_the_table(nbm, units, dead):
+    """``n_chunks = ceil(ceil(n_blocks_max / 128) / units)``: when the standalone chunk count is not a multiple of ``units`` the last R1
+    CTA holds ``dead`` units whose ``chunk_id >= ceil(n_blocks_max / 128)`` -- they take no scorer work, still join the CTA-wide barriers
+    their ledger counts, and the release stays one warp per CTA.  The dispatch table names that row."""
+    tb = _table(4, 1, nbm, units, 1024)
+    standalone = -(-nbm // SP.blocks_per_cta(1))
+    assert tb.n_chunks * units - standalone == dead
+    for k in range(tb.n_chunks):
+        for u in range(units):
+            chunk = k * units + u
+            assert (chunk >= standalone) == (k == tb.n_chunks - 1 and u >= units - dead), (k, u)
+    doc = " ".join(F.__doc__.split())
+    assert (
+        "dead unit" in doc.lower() and "chunk_id >=" in doc
+    ), "the dispatch table names no dead-unit row (a unit whose chunk_id >= the standalone chunk count)"
+
+
+def test_the_placement_docstring_names_this_grid_only():
+    """Under ``use_pdl`` every role waits on the PREVIOUS grid, so the host pin's docstring says 'nothing of this grid', never 'nothing'."""
+    doc = " ".join(F.DispatchTable.producers_before_consumers.__doc__.split())
+    assert "nothing of this grid" in doc, doc
+
+
+# ===========================================================================================================================================
+# The kernel-level tiers: the harness, the gates, the cells
+# ===========================================================================================================================================
+
+
+def _H():
+    """The step harness (it imports the three kernel modules, which import the DSL): loaded on demand below the Rule 7 gate."""
+    if _CUTEDSL_REQUIREMENT is not None:
+        pytest.skip(str(_CUTEDSL_REQUIREMENT))
+    if str(_HERE) not in sys.path:
+        sys.path.insert(0, str(_HERE))
+    return importlib.import_module("qsa_indexer_fused_step")
+
+
+def _body_served() -> bool:
+    """Whether ``compile_qsa_indexer_fused`` is the body or the pre-body stub (the stub raises 'not served yet' whatever it is given)."""
+    try:
+        F.compile_qsa_indexer_fused()
+    except NotImplementedError as e:
+        return "not served yet" not in str(e)
+    except Exception:  # noqa: BLE001 -- the body refuses an empty call by form (TypeError / ValueError): it is served
+        return True
+    return True
+
+
+needs_body = pytest.mark.skipif(
+    not _body_served(), reason="the fused indexer's body is not served yet (compile_qsa_indexer_fused is the stub): the census needs a rendering"
+)
+
+
+def _case(b, s_q, nbm, page=16, *, kv=None, seed=1, geom=None, **kw):
+    H = _H()
+    return H.StepCase(
+        H.FLASH_NEXT if geom is None else geom, batch=b, s_q=s_q, n_blocks_max=nbm, page=page, kv_lens=kv or H.kv_pattern(b, s_q, nbm), seed=seed, **kw
+    )
+
+
+def _fused(case, **kw):
+    """``FusedPlan(case, **kw)``: a Rule 7 decline of the fused compile skips by name; the pre-body stub's ``NotImplementedError`` and a missing
+    compile key (``TypeError``) are this module's RED and propagate."""
+    H = _H()
+    try:
+        return H.FusedPlan(case, **kw)
+    except NotImplementedError as e:
+        why = H.decline_reason(e)
+        if why is not None:
+            pytest.skip(f"the fused indexer declines here by name: {why}")
+        raise
+
+
+def _skip_unless_reference():
+    why = _H().reference_decline_reason()
+    if why is not None:
+        pytest.skip(why)
+
+
+def _step(case, *, units, check_arrivals=None, **kw):
+    """The fused plan FIRST (RED on the stub), then the three-launch reference and the fused launch on fresh copies of the same primed
+    buffers.  ``check_arrivals`` is armed at every ``units > 1`` (the over-arrival of a per-unit release gate shows only there)."""
+    H = _H()
+    plan = _fused(case, units=units, check_arrivals=(units > 1) if check_arrivals is None else check_arrivals, **kw)
+    _skip_unless_reference()
+    _, ref_x = H.run_reference(case, threads=plan.keys["threads"], has_block_lens=plan.keys["has_block_lens"], use_pdl=plan.keys["use_pdl"])
+    fused_x, cnt = H.run_fused_once(case, plan)
+    return plan, ref_x, fused_x, cnt
+
+
+def _child(mode, args, *, timeout):
+    """One child interpreter of the harness (``mode`` ``launches`` / ``trap``); its ONE ``RESULT`` line as a dict.  No RESULT = the child
+    died (the pre-body stub's traceback among the causes): a failure naming the output; a child past its budget is a HANG, named, never a
+    bigger timeout."""
+    env = dict(os.environ)
+    env.setdefault("CUDNN_FRONTEND_ENABLE_FROST_ENGINES", "1")
+    t0 = time.time()
+    try:
+        proc = subprocess.run([sys.executable, str(_HARNESS), mode, json.dumps(args)], capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode("utf-8", "replace")[-2000:] if isinstance(e.stdout, bytes) else str(e.stdout or "")[-2000:]
+        pytest.fail(f"HANG: the child did not return within {timeout} s (re-audit the counter / barrier tables; the timeout stays): {mode} {args}\n{out}")
+    lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT ")]
+    if not lines:
+        pytest.fail(
+            f"no RESULT line from the child (rc {proc.returncode}, {time.time() - t0:.1f} s): {mode} {args}\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+        )
+    res = json.loads(lines[-1][len("RESULT ") :])
+    if "declined" in res:
+        pytest.skip(f"the fused indexer declines here by name: {res['declined']}")
+    print(f"\n{mode} {args}: {res}")
+    return proc, res
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# the harness's own contract (no fused kernel involved): the three-launch reference on real hardware
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+
+def _assert_canonical_fp64_set(logits, counts, ids, top_k):
+    """The decode top-k's contract on the reference's own outputs: per row ``min(top_k, counts)`` ids strictly DESCENDING then -1, every id
+    below the count, the selected VALUES exactly the fp64 top-k's values, every id differing from ``torch.topk`` an exact tie."""
+    for t in range(logits.shape[0]):
+        n = int(min(max(int(counts[t]), 0), logits.shape[1]))
+        k_eff = min(top_k, n)
+        row = ids[t]
+        assert bool((row[k_eff:] == -1).all()), f"row {t}: the padding is not -1"
+        sel = row[:k_eff].long()
+        if k_eff == 0:
+            continue
+        assert bool((sel[1:] < sel[:-1]).all()) and bool((sel < n).all()) and bool((sel >= 0).all()), f"row {t}: not a descending id list below the count"
+        ref = torch.topk(logits[t, :n].double(), k_eff)
+        assert torch.equal(torch.sort(logits[t, sel].double(), descending=True).values, ref.values), f"row {t}: the selected values are not the fp64 top-k's"
+        kth = float(ref.values[-1])
+        for i in set(sel.tolist()) ^ set(ref.indices.tolist()):
+            assert float(logits[t, i]) == kth, f"row {t}: id {i} differs from torch.topk beyond an exact tie"
+
+
+@needs_cuda
+@pytest.mark.parametrize(
+    "b,s_q,nbm,page,kw", [(2, 4, 2048, 16, {}), (3, 1, 520, 32, {}), (2, 4, 2048, 16, dict(rope_table=True, ring_slots=True, slot_dtype=torch.int64))]
+)
+def test_the_three_launch_reference_is_self_consistent(b, s_q, nbm, page, kw):
+    """The oracle's own contract, independent of the fused kernel: the three-launch form run twice on fresh copies is bitwise; ``counts``
+    follow the count rule ``clamp(floor((pos + 1) / 4), 0, n_blocks_max)``; ``block_lens = min(top_k, counts)``; the list is canonical and its
+    set is the fp64 top-k of the written logits up to exact ties; the slot report names the block every completing row completes and that
+    block's cache row was written (it differs from the prime); the columns at or past the count keep the sentinel."""
+    H = _H()
+    _skip_unless_reference()
+    case = _case(b, s_q, nbm, page, seed=7, **kw)
+    _, x1 = H.run_reference(case)
+    _, x2 = H.run_reference(case)
+    a, c = case.outputs(x1, fused=False), case.outputs(x2, fused=False)
+    assert all(H.same(a[k], c[k]) for k in a), [k for k in a if not H.same(a[k], c[k])]
+    n_vis = case.n_vis().reshape(-1)
+    assert torch.equal(x1["counts"].long(), n_vis), "counts differ from the count rule"
+    assert torch.equal(x1["lens"].long(), n_vis.clamp(max=case.geom.top_k)), "block_lens differs from min(top_k, counts)"
+    for t in range(case.T):
+        n = int(n_vis[t])
+        assert bool((x1["logits"][t, :n] != H.LOGIT_SENTINEL).all()) and bool(
+            (x1["logits"][t, n:] == H.LOGIT_SENTINEL).all()
+        ), f"row {t}: the written columns are not exactly [0, {n})"
+    _assert_canonical_fp64_set(x1["logits"], x1["counts"], x1["ids"], case.geom.top_k)
+    for seq, hit in enumerate(case.completing()):
+        if hit is None:
+            assert bool((x1["cslot"][seq] == -1).all()), f"sequence {seq}: a slot report without a completing row"
+        else:
+            j, blk = hit
+            assert int(x1["cslot"][seq, j]) == blk and bool((x1["cslot"][seq, :j] == -1).all()) and bool((x1["cslot"][seq, j + 1 :] == -1).all()), x1["cslot"][
+                seq
+            ]
+            assert not H.same(case.kbar_row(x1, seq, blk), case.kbar_row({"comp": case.comp0}, seq, blk)), f"sequence {seq}: block {blk} was not written"
+    assert bool(torch.isnan(x1["qi"].float()).logical_not().all()), "the reference's indexer queries were not all written"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T2 -- the fused launch is bitwise the three-launch form
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+
+def _t2_cells():
+    """``(b, s_q, n_blocks_max, page, units, extra)``: the dispatch rows' cells at the route's units (1 at B <= 4 for 8K / 32K tokens, 2 at
+    128K, 8 at B 32), the units 2 / 8 variants with ``check_arrivals`` (two of them with a chunk count that is not a multiple of ``units``:
+    dead units in the last scorer CTA), the optional ``block_lens`` arm, the plan's other arms (the RoPE-table arm, the stack's ring slots
+    with int64 slots), the PDL pair, the 512-thread fallback.  The small grid first; the B 32 and the 128K cells carry a ``big_`` id."""
+    small, big = [], []
+    for b in (1, 4):
+        for s_q in (1, 4):
+            for n in (2048, 8192):
+                for page in (16, 32, 64):
+                    small.append((b, s_q, n, page, 1, {}))
+    small += [
+        (1, 1, 2048, 16, 2, {}),
+        (1, 1, 2048, 16, 8, {}),
+        (4, 4, 8192, 16, 8, {}),
+        (4, 1, 1032, 16, 2, {}),
+        (4, 1, 1032, 16, 8, {}),
+        (1, 4, 520, 32, 8, {}),
+        (1, 1, 2048, 16, 1, dict(has_block_lens=False)),
+        (4, 4, 2048, 16, 1, dict(rope_table=True)),
+        (4, 1, 8192, 16, 1, dict(ring_slots=True, slot_dtype=torch.int64)),
+        (4, 4, 8192, 16, 2, dict(use_pdl=True)),
+        (1, 1, 2048, 16, 1, dict(threads=512)),
+        (4, 1, 8192, 64, 2, dict(threads=512)),
+    ]
+    for b in (1, 4):
+        for s_q in (1, 4):
+            for page in (16, 32, 64):
+                big.append((b, s_q, 32768, page, 2, {}))
+    for s_q in (1, 4):
+        for n in (2048, 8192, 32768):
+            for page in (16, 32, 64):
+                big.append((32, s_q, n, page, 8, {}))
+    return small, big
+
+
+def _t2_id(cell, big=False):
+    b, s_q, n, page, units, extra = cell
+    tag = "".join(f"_{k}{int(v) if isinstance(v, bool) else str(v).replace('torch.', '')}" for k, v in extra.items())
+    return f"{'big_' if big else ''}B{b}_S{s_q}_N{n}_p{page}_u{units}{tag}"
+
+
+_T2_SMALL, _T2_BIG = _t2_cells()
+_T2 = _T2_SMALL + _T2_BIG
+_T2_IDS = [_t2_id(c) for c in _T2_SMALL] + [_t2_id(c, big=True) for c in _T2_BIG]
+_CASE_KW = ("rope_table", "ring_slots", "slot_dtype")  # the extras that shape the step; the rest are plan knobs
+
+
+@needs_cuda
+@pytest.mark.parametrize("cell", _T2, ids=_T2_IDS)
+def test_fused_indexer_is_bitwise_the_three_launch_form(cell):
+    """The oracle: ``out`` (the list), ``counts``, ``block_lens``, the slot report, the Q / K bands, the K / V pool rows, the ring rows, the
+    compressed-key cache rows and the logits buffer all ``torch.equal`` the three-launch form's on the same primed caches; the counters read
+    zero after the launch; the plan's grid is the dispatch table's.  ``check_arrivals`` is armed at units > 1 (an over-arriving release gate
+    traps there instead of hiding behind the reset)."""
+    H = _H()
+    b, s_q, n, page, units, extra = cell
+    case = _case(b, s_q, n, page, seed=1000 + _T2.index(cell), **{k: v for k, v in extra.items() if k in _CASE_KW})
+    plan, ref_x, fused_x, cnt = _step(case, units=units, **{k: v for k, v in extra.items() if k not in _CASE_KW})
+    label = _t2_id(cell)
+    H.assert_bitwise(case, ref_x, fused_x, label)
+    H.assert_counters_zero(cnt, label)
+    standalone = -(-n // SP.blocks_per_cta(1))
+    assert plan.table.n_chunks == -(-standalone // units) and plan.table.n_ctas == plan.table.n_prep_ctas + b * (plan.table.n_chunks + s_q)
+    assert bool((fused_x["ids"] != H.IDS_SENTINEL).all()), "a list slot was never written"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T3 -- the completing row is derived bitwise at every alignment
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+
+@needs_cuda
+@pytest.mark.parametrize("s_q,r", [(4, 0), (4, 1), (4, 2), (4, 3), (1, 0), (1, 1), (1, 2), (1, 3)], ids=lambda v: f"{v}")
+def test_the_completing_row_is_derived_bitwise_at_every_alignment(s_q, r):
+    """S_q 4 with ``pos0 % 4 == r`` (exactly one step row completes a block: row ``3 - r``) and S_q 1 with ``(pos0 + 1) % 4 == r`` (a
+    completing block iff ``r == 0``): the derived ``blk_new`` row -- substituted into the scorer role's ring slot while the prepare role
+    writes the cache row -- shows as the logits column ``blk_new`` of every row that sees it, bitwise the three-launch form's (which scored
+    the row the prepare had written), and the cache row written by the fused launch is bitwise the prepare's; the rows before the
+    completing one do not see the column; a step without a completing row writes no cache row of its sequence."""
+    H = _H()
+    nbm = 2048
+    base = [4 * 600, 4 * 637, 4 * (nbm - 2)]
+    pos0 = [k + (r if s_q == 4 else (r - 1) % 4) for k in base]
+    kv = [p + s_q for p in pos0]
+    case = _case(3, s_q, nbm, 16, kv=kv, seed=200 + 10 * s_q + r)
+    _, ref_x, fused_x, cnt = _step(case, units=1)
+    label = f"alignment S_q {s_q} r {r}"
+    H.assert_bitwise(case, ref_x, fused_x, label)
+    H.assert_counters_zero(cnt, label)
+    for seq, hit in enumerate(case.completing()):
+        if s_q == 4:
+            assert hit is not None and hit[0] == 3 - r, (seq, hit)
+        else:
+            assert (hit is not None) == (r == 0), (seq, hit, r)
+        rows = range(seq * s_q, (seq + 1) * s_q)
+        if hit is None:
+            assert bool((fused_x["cslot"][seq] == -1).all())
+            pages = case.block_table[seq].long()
+            assert H.same(fused_x["comp"][pages], case.comp0[pages]), f"sequence {seq}: a cache row written without a completing row"
+            continue
+        j, blk = hit
+        assert int(fused_x["cslot"][seq, j]) == blk and int(ref_x["cslot"][seq, j]) == blk
+        assert H.same(case.kbar_row(fused_x, seq, blk), case.kbar_row(ref_x, seq, blk)), f"sequence {seq}: the cache row of block {blk} differs"
+        assert not H.same(case.kbar_row(fused_x, seq, blk), case.kbar_row({"comp": case.comp0}, seq, blk)), f"sequence {seq}: block {blk} was not written"
+        for s, t in enumerate(rows):
+            col_f, col_r = fused_x["logits"][t, blk], ref_x["logits"][t, blk]
+            if s >= j:
+                assert float(col_f) != H.LOGIT_SENTINEL and H.same(col_f, col_r), f"row {t}: the derived column {blk} differs or was not scored"
+            else:
+                assert float(col_f) == H.LOGIT_SENTINEL == float(col_r), f"row {t}: column {blk} is not visible to a row before the completing one"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T4 -- the degenerate matrix
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+
+def _ids_identity(n, top_k, device):
+    out = torch.full((top_k,), -1, dtype=torch.int32, device=device)
+    out[:n] = torch.arange(n - 1, -1, -1, device=device, dtype=torch.int32)
+    return out
+
+
+_T4_ROWS = [
+    "kv_lens_zero_padding_sequence",
+    "kv_lens_below_s_q",
+    "dead_page_under_a_visible_block",
+    "dead_page_at_the_completing_block",
+    "completing_block_past_the_table_width",
+    "ring_at_its_minimum_cap_wraps_S4",
+    "ring_at_its_minimum_cap_wraps_S1",
+    "identity_region",
+    "dead_units_u2_1032",
+    "dead_units_u8_1032",
+    "dead_units_u8_520",
+]
+
+
+@needs_cuda
+@pytest.mark.parametrize("row", _T4_ROWS)
+def test_degenerate_inputs_follow_the_matrix(row):
+    """The module docstring's matrix, every row bitwise the three-launch form with the counters zero after the launch (every R1 CTA
+    arrives unconditionally: a dead sequence too), plus the row's own observable: every slot -1 / the identity list / no ring, cache or pool
+    row for a padding sequence; a zero logit under a dead page; the ``-2`` report with no cache row; the ring wrap at ``cap = S_q + 3``; the
+    dead units of the last scorer CTA."""
+    H = _H()
+    units, kw = 1, {}
+    if row == "kv_lens_zero_padding_sequence":
+        case = _case(3, 4, 2048, 16, kv=[4 * 600 + 2, 0, 4 * 33 + 1], padding=(1,), seed=301)
+    elif row == "kv_lens_below_s_q":
+        case = _case(3, 4, 2048, 16, kv=[2, 4 * 600 + 1, 3], seed=302)
+    elif row == "dead_page_under_a_visible_block":
+        case = _case(2, 1, 2048, 16, kv=[4 * 2048, 4 * 700], seed=303)
+        case.block_table[0, 10] = -1  # blocks 40..43 of sequence 0: a -1 page under visible blocks
+        case.block_table[1, 3] = case.n_kbar_pages + 5  # blocks 12..15 of sequence 1: an out-of-range page under visible blocks
+    elif row == "dead_page_at_the_completing_block":
+        case = _case(2, 4, 2048, 16, kv=[4 * 600, 4 * 601 + 2], seed=304)  # sequence 0: row 3 completes block 599 (page 149, row 3)
+        case.block_table[0, 599 // case.rpp] = -1
+    elif row == "completing_block_past_the_table_width":
+        case = _case(2, 4, 40, 16, kv=[164, 4 * 20 + 1], seed=305, max_pages=10)  # block 40 = page 10, past the 10-column table: -2
+    elif row == "ring_at_its_minimum_cap_wraps_S4":
+        # pos0 = 1191 / 295 (both 3 mod 4 and 1 mod 7): row 0 completes a block and pools ring positions pos0 - 3 .. pos0 - 1 = ring rows 5, 6, 0
+        # (the wrap), while the step writes rows 1 .. 4 -- disjoint, the host rule cap >= S_q + 3 at equality
+        case = _case(2, 4, 2048, 16, kv=[1191 + 4, 295 + 4], seed=306, ring_cap=7)
+    elif row == "ring_at_its_minimum_cap_wraps_S1":
+        case = _case(
+            2, 1, 2048, 16, kv=[4 * 300, 4 * 71], seed=307, ring_cap=4
+        )  # pos0 = 1199 / 283 (3 mod 4): the completing row pools ring rows 0, 1, 2 at the minimum cap
+    elif row == "identity_region":
+        case = _case(4, 1, 520, 16, kv=[4 * 500, 4 * 513, 4 * 520, 4 * 100], seed=308)  # counts 500 / 513 (one past the identity) / 520 / 100
+    elif row.startswith("dead_units"):
+        units, nbm = (2, 1032) if row == "dead_units_u2_1032" else (8, 1032) if row == "dead_units_u8_1032" else (8, 520)
+        case = _case(2, 1, nbm, 16, kv=[4 * nbm, 4 * (nbm - 130) + 3], seed=309)
+    else:  # pragma: no cover
+        raise AssertionError(row)
+    plan, ref_x, fused_x, cnt = _step(case, units=units, **kw)
+    H.assert_bitwise(case, ref_x, fused_x, row)
+    H.assert_counters_zero(cnt, row)
+    ids, counts, lens, cslot = fused_x["ids"], fused_x["counts"], fused_x["lens"], fused_x["cslot"]
+    if row == "kv_lens_zero_padding_sequence":
+        rows = slice(4, 8)
+        assert bool((ids[rows] == -1).all()) and counts[rows].tolist() == [0] * 4 and lens[rows].tolist() == [0] * 4 and bool((cslot[1] == -1).all())
+        assert H.same(fused_x["ring"][0], case.ring0[0]) and H.same(fused_x["comp"][0], case.comp0[0]), "the null ring block / page 0 were written"
+        written = int((~torch.isnan(fused_x["k_pool"].float())).all(-1).sum())
+        assert written == int(case.live.sum()) * case.geom.h_kv, f"pool rows written {written} != live slots x heads (a padding sequence's token owns no slot)"
+    elif row == "kv_lens_below_s_q":
+        for seq in (0, 2):  # rows at positions -2 / -1 / 0 / 1 (resp. -1 / 0 / 1 / 2): no visible block, no completing row
+            rows = slice(4 * seq, 4 * seq + 4)
+            assert bool((ids[rows] == -1).all()) and counts[rows].tolist() == [0] * 4 and bool((cslot[seq] == -1).all()), (seq, counts[rows].tolist())
+    elif row == "dead_page_under_a_visible_block":
+        assert bool((fused_x["logits"][0, 40:44] == 0.0).all()) and bool(
+            (fused_x["logits"][1, 12:16] == 0.0).all()
+        ), "a dead page under visible blocks did not read as zero keys"
+        assert bool((fused_x["logits"][0, :40] != H.LOGIT_SENTINEL).all()) and int(counts[0]) == 2048 and int(counts[1]) == 700
+    elif row == "dead_page_at_the_completing_block":
+        assert case.completing()[0] == (3, 599) and int(cslot[0, 3]) == -2, cslot.tolist()
+        assert float(fused_x["logits"][3, 599]) == 0.0 == float(ref_x["logits"][3, 599]), "the completing block on a dead page must score as a zero key"
+        assert H.same(fused_x["comp"], case.comp0), "a cache row was written under a dead page"
+    elif row == "completing_block_past_the_table_width":
+        assert case.completing()[0] == (3, 40) and int(cslot[0, 3]) == -2 and counts[:4].tolist() == [40] * 4, (cslot.tolist(), counts.tolist())
+        pages0 = case.block_table[0].long()
+        assert H.same(fused_x["comp"][pages0], case.comp0[pages0]), "a cache row was written for a block past the table's width"
+        j1, blk1 = case.completing()[1]  # sequence 1 completes block 19 inside the table: written in both forms
+        assert int(cslot[1, j1]) == blk1 and not H.same(case.kbar_row(fused_x, 1, blk1), case.kbar_row({"comp": case.comp0}, 1, blk1))
+    elif row.startswith("ring_at_its_minimum_cap"):
+        assert case.ring_n == case.S_q + 3 and all(hit is not None for hit in case.completing()), case.completing()
+        for seq, (j, blk) in enumerate(case.completing()):
+            assert int(cslot[seq, j]) == blk
+    elif row == "identity_region":
+        for t, n in enumerate(counts.tolist()):
+            if n <= case.geom.top_k:
+                assert torch.equal(ids[t], _ids_identity(n, case.geom.top_k, ids.device)), f"row {t}: not the identity list at {n} visible blocks"
+            else:
+                assert bool((ids[t] >= 0).all())
+        assert counts.tolist() == [500, 513, 520, 100]
+    else:
+        standalone = -(-case.n_blocks_max // SP.blocks_per_cta(1))
+        assert standalone % units and plan.table.n_chunks == -(-standalone // units), (standalone, units, plan.table)
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T5 -- the counter lifecycle
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+_PROCESSES = int(os.environ.get("QSA_FUSED_PROCESSES", "12"))
+_LAUNCHES = int(os.environ.get("QSA_FUSED_LAUNCHES", "100"))
+
+
+@needs_cuda
+def test_counters_are_zero_after_every_launch_in_fresh_processes():
+    """The fresh-process screen: 12 interpreters x 100 launches of one plan (half at units 2, half at units 8, ``check_arrivals`` armed in
+    every one): the counters read zero after every launch and every launch is bitwise the first and the three-launch reference."""
+    case = _case(4, 1, 2048, 16, seed=5)
+    _fused(case, units=2, check_arrivals=True)  # the stub / the decline, named here before any child is spawned
+    _skip_unless_reference()
+    for i in range(_PROCESSES):
+        units = 2 if i % 2 == 0 else 8
+        proc, res = _child(
+            "launches", dict(batch=4, s_q=1, n_blocks_max=2048, page=16, units=units, check_arrivals=True, launches=_LAUNCHES, seed=100 + i), timeout=1500
+        )
+        assert proc.returncode == 0 and res.get("ok"), f"process {i} (units {units}): {res}"
+
+
+@needs_cuda
+def test_a_captured_first_execute_replays_bitwise_with_zero_counters_after_every_replay():
+    """The serving stacks' default: the FIRST execute of a fresh plan captured on a NEW stream with no warm-up under
+    ``set_sync_debug_mode("error")`` (no host sync, no allocation in the path); the capture launches nothing; three replays are each
+    bitwise the eager three-launch reference and leave the counters at zero (the in-kernel reset is captured with the kernel: no memset
+    node)."""
+    H = _H()
+    case = _case(2, 4, 2048, 16, seed=11)
+    plan = _fused(case, units=1)
+    _skip_unless_reference()
+    _, ref_x = H.run_reference(case)
+    cnt = H.new_counters(case)
+    X = case.fresh()
+    torch.cuda.synchronize()
+    stream = torch.cuda.Stream()
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph, stream=stream):
+            prev = torch.cuda.get_sync_debug_mode()
+            torch.cuda.set_sync_debug_mode("error")
+            try:
+                plan.run(X, cnt, stream=stream.cuda_stream)  # the FIRST execute of this plan, captured
+            finally:
+                torch.cuda.set_sync_debug_mode(prev)
+        torch.cuda.synchronize()
+        assert bool((X["ids"] == H.IDS_SENTINEL).all()) and int(cnt.abs().sum()) == 0, "the capture launched work"
+        for i in range(3):
+            case.restore_slab(X)  # the step rewrites Q / K in place: a replay is the same step over the pristine slab
+            torch.cuda.synchronize()
+            graph.replay()
+            torch.cuda.synchronize()
+            H.assert_bitwise(case, ref_x, X, f"replay {i}")
+            H.assert_counters_zero(cnt, f"replay {i}")
+    finally:
+        graph.reset()
+
+
+@needs_cuda
+def test_two_steps_back_to_back_on_one_plan_follow_the_reference_step_by_step():
+    """Step 1 at ``kv_lens`` L, step 2 at L + S_q on the SAME ring / cache / pools through ONE plan (the second step derives its completing
+    row from ring rows the first step wrote): each step bitwise the three-launch form's own two steps, the counters zero after each."""
+    H = _H()
+    b, s_q, nbm = 3, 4, 2048
+    kv1 = [4 * 300 + 2, 4 * 17 + 1, 4 * 2040]
+    case1 = _case(b, s_q, nbm, 16, kv=kv1, seed=21)
+    plan = _fused(case1, units=1)
+    _skip_unless_reference()
+    case2 = _case(b, s_q, nbm, 16, kv=[x + s_q for x in kv1], seed=21, slab_seed=22)  # the same caches and tables, the next step's slab
+    assert torch.equal(case2.block_table, case1.block_table) and H.same(case2.comp0, case1.comp0) and H.same(case2.ring0, case1.ring0)
+    ref = H.ThreeLaunch(case1)
+    stream = H.current_stream_handle()
+    cnt = H.new_counters(case1)
+    rx, fx = case1.fresh(), case1.fresh()
+    ref.run(rx, stream=stream)
+    plan.run(fx, cnt, stream=stream)
+    H.assert_bitwise(case1, rx, fx, "step 1")
+    H.assert_counters_zero(cnt, "step 1")
+    rx2, fx2 = case2.fresh_from(rx), case2.fresh_from(fx)
+    ref2 = H.ThreeLaunch(case2)
+    ref2.run(rx2, stream=stream)
+    plan2 = _fused(case2, units=1)
+    assert plan2.plan is plan.plan or plan2.keys == plan.keys, "step 2 must reuse step 1's plan (the compile keys are the declaration's)"
+    plan2.run(fx2, cnt, stream=stream)
+    H.assert_bitwise(case2, rx2, fx2, "step 2")
+    H.assert_counters_zero(cnt, "step 2")
+    for seq, hit in enumerate(case2.completing()):
+        assert hit is not None and int(fx2["cslot"][seq, hit[0]]) == hit[1], (seq, hit, fx2["cslot"][seq].tolist())
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T6 -- the trap rendering: forward progress under an armed deadline, and the detector of the placement assumption
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+
+def _sm_count():
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
+@requires_rubin
+@needs_cuda
+@pytest.mark.parametrize("b,s_q,nbm,units,ctas", [(32, 1, 8192, 8, 317), (32, 1, 32768, 1, 8253)], ids=["B32_32K_u8_317ctas", "B32_128K_u1_forced_8253ctas"])
+def test_fused_indexer_grid_larger_than_the_resident_capacity_terminates(b, s_q, nbm, units, ctas):
+    """A grid of more CTAs than the device holds resident (several waves of spinning consumers) completes under the 2-s deadline trap --
+    every acquire returns because every producer of a consumer is dispatched before it -- bitwise the reference, the counters zero;
+    a trap or a hang here is the forward-progress assumption failing on this part + driver."""
+    tb = _table(b, s_q, nbm, units, 1024)
+    assert tb.n_ctas == ctas and tb.n_ctas > _sm_count(), (tb, _sm_count())
+    _, res = _child("trap", dict(batch=b, s_q=s_q, n_blocks_max=nbm, page=16, units=units, deadline_s=2.0, seed=31), timeout=1500)
+    assert res["completed"] and not res["trapped"], res
+    assert res["counters_zero"] and res["differs_from_reference"] == [], res
+
+
+def _stranding_order(b, s_q, nbm, units, sms):
+    """A served dispatch order that violates the placement pin AND puts at least ``sms`` top-k CTAs ahead of the first scorer CTA -- the
+    only placement that strands every resident slot on a consumer whose producers cannot be dispatched (a per-sequence interleave keeps
+    forward progress under in-order dispatch: at most one sequence's consumers ever wait on undispatched producers)."""
+    seen = {}
+    for order in F.DISPATCH_ORDERS:
+        tb = _table(b, s_q, nbm, units, 1024, order=order)
+        if tb.producers_before_consumers():
+            continue
+        first_producer = min(tb.linear_index(F.ROLE_SCORER, bb, k) for bb in range(b) for k in range(tb.n_chunks))
+        ahead = sum(1 for bb in range(b) for s in range(s_q) if tb.linear_index(F.ROLE_TOPK, bb, s) < first_producer)
+        seen[order] = ahead
+        if ahead >= sms:
+            return order
+    pytest.fail(
+        f"no dispatch order strands the machine: the trap test needs an order placing >= {sms} top-k CTAs (the SM count) ahead of the first "
+        f"scorer CTA, found {seen} -- a per-sequence consumers-first interleave keeps forward progress under in-order dispatch (every resident "
+        "consumer but the last sequence's has its producers dispatched), so the detector needs a GLOBAL mis-order (every sequence's top-k "
+        "CTAs before any scorer CTA) and a row count past the SM count"
+    )
+
+
+@needs_cuda
+def test_consumer_before_producer_order_traps():
+    """The detector of the forward-progress assumption, live: a plan whose dispatch table strands every resident slot on a consumer
+    (every top-k CTA of every sequence ahead of every scorer CTA, more rows than SMs) TRAPS under the 2-s deadline -- a launch failure
+    within seconds, never a hang (the child's budget is the hang detector, never raised)."""
+    sms = _sm_count()
+    b, s_q, nbm, units = sms + 8, 1, 520, 1
+    order = _stranding_order(b, s_q, nbm, units, sms)
+    _, res = _child("trap", dict(batch=b, s_q=s_q, n_blocks_max=nbm, page=16, units=units, order=order, deadline_s=2.0, compare=False, seed=37), timeout=900)
+    assert res["trapped"] and not res["completed"], res
+    assert res["elapsed_s"] < 60.0, f"the deadline must end the launch within seconds, not the outer budget: {res}"
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------
+# T8 -- the host PTX census of the fused rendering and the per-role local-memory pin (sm_107a trace-compiles, no GPU)
+# ---------------------------------------------------------------------------------------------------------------------------------------
+
+_RENDER_PROBE = textwrap.dedent("""
+    import glob, json, os, sys
+    dump, arch, harness_dir, kw = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+    os.environ["CUTE_DSL_DUMP_DIR"] = dump                      # read once, at the first cutlass import
+    os.environ["CUTE_DSL_KEEP"] = "cubin,ptx"                   # the one token list of the keep switch
+    os.environ["CUTE_DSL_ARCH"] = arch                          # unconditional: an inherited value would pin another target
+    os.environ["CUDNN_FRONTEND_DISABLE_COMPILED_CACHE"] = "1"   # a compiled-plan cache HIT skips ptxas and dumps nothing
+    for k in ("CUTE_DSL_LINEINFO", "CUTE_DSL_LOC_TRACEBACKS"):
+        os.environ.pop(k, None)
+    sys.path.insert(0, harness_dir)
+    import torch
+    import qsa_indexer_fused_step as H
+    from cudnn.frost.device import build_device
+    from cudnn.gated_attention_block.kernels import qsa_indexer_fused as F
+    keys = H.fused_compile_keys(H.FLASH_NEXT, s_q=kw["s_q"], page=kw["page"], n_blocks_max=kw["n_blocks_max"], units=kw["units"], threads=kw["threads"],
+                                use_pdl=kw.get("use_pdl", False), check_arrivals=kw.get("check_arrivals", False), deadline_ns=kw.get("deadline_ns"),
+                                roles=kw.get("roles"), device=0)
+    with build_device(0):  # the compile key's device index, pinned: the trace needs no CUDA device (CUTE_DSL_ARCH names the target)
+        try:
+            F.compile_qsa_indexer_fused(**keys)
+        except NotImplementedError as e:
+            if H.decline_reason(e) is not None:
+                print("DECLINED " + str(e).replace(chr(10), " ")); sys.exit(0)
+            raise
+    ptx = sorted(glob.glob(os.path.join(dump, "*.ptx")), key=os.path.getmtime)
+    cub = sorted(glob.glob(os.path.join(dump, "*.cubin")), key=os.path.getmtime)
+    print("PTX " + (ptx[-1] if ptx else "")); print("CUBIN " + (cub[-1] if cub else ""))
+    """)
+
+_PTX_KEYS = (
+    "red.release.gpu.global.add.u64",
+    "ld.acquire.gpu.global.u64",
+    "nanosleep",
+    "st.relaxed.gpu.global.u64",
+    "fence.acq_rel.gpu",
+    "griddepcontrol.wait",
+    "griddepcontrol.launch_dependents",
+    "bar.sync",
+    "barrier.cluster",
+    "mbarrier",
+    "cp.async.bulk",
+    ".cluster",
+    "mma.sync",
+    "cp.async.cg",
+    "st.shared",
+    "ld.shared",
+    ".local",
+    "%globaltimer",
+    "trap;",
+    "fence.sc.sys",
+)
+
+
+def _cuda_tool(name):
+    """A CUDA binary (``nvdisasm`` / ``cuobjdump`` / ``ptxas``) from ``CUDNN_TEST_CUDA_BIN``, the toolkit roots, then PATH; None when absent."""
+    dirs = [os.environ.get("CUDNN_TEST_CUDA_BIN")] + [
+        os.path.join(os.environ[v], "bin") for v in ("CUDA_HOME", "CUDAToolkit_ROOT", "CUDA_PATH") if os.environ.get(v)
+    ]
+    for d in [x for x in dirs if x] + ["/usr/local/cuda/bin"]:
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return shutil.which(name)
+
+
+def _render(tmp_path, tag, kw, timeout=1800):
+    """Trace-compile ONE fused rendering for sm_107a in a child (the compile is a STAGE with its own budget, never read as a hang) and
+    return ``(ptx text, cubin path)``; a Rule 7 decline of the host rendering skips naming it."""
+    _H()  # the DSL floor (the harness imports the kernel modules)
+    try:
+        from cutlass.base_dsl.enums import Arch
+
+        Arch.from_string("sm_107a")
+    except Exception:  # noqa: BLE001
+        pytest.skip("this CuTe DSL has no sm_107a target")
+    dump = tmp_path / f"render_{tag}"
+    dump.mkdir()
+    probe = tmp_path / f"render_{tag}.py"
+    probe.write_text(_RENDER_PROBE)
+    t0 = time.time()
+    proc = subprocess.run([sys.executable, str(probe), str(dump), "sm_107a", str(_HERE), json.dumps(kw)], capture_output=True, text=True, timeout=timeout)
+    print(f"\nSTAGE compile {tag} {time.time() - t0:.1f} s rc {proc.returncode}")
+    assert proc.returncode == 0, f"the sm_107a trace-compile of {tag} failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-4000:]}"
+    declined = next((ln for ln in proc.stdout.splitlines() if ln.startswith("DECLINED ")), None)
+    if declined:
+        pytest.skip(f"the host rendering {tag} declines by name: {declined[9:]}")
+    ptx = next((ln[4:] for ln in proc.stdout.splitlines() if ln.startswith("PTX ")), "")
+    cubin = next((ln[6:] for ln in proc.stdout.splitlines() if ln.startswith("CUBIN ")), "")
+    assert ptx and os.path.isfile(ptx), f"no PTX landed in {dump}: {sorted(os.listdir(dump))}\n{proc.stdout[-2000:]}"
+    return Path(ptx).read_text(), (cubin if cubin and os.path.isfile(cubin) else None)
+
+
+def _census(ptx: str):
+    return {k: ptx.count(k) for k in _PTX_KEYS}
+
+
+def _sass_counts(cubin):
+    """``(reg, stl, ldl)`` of a cubin through ``cuobjdump -res-usage`` + ``nvdisasm -c`` when a toolkit that decodes the target is found."""
+    nvdisasm, cuobjdump = _cuda_tool("nvdisasm"), _cuda_tool("cuobjdump")
+    if nvdisasm is None or cuobjdump is None:
+        pytest.skip("no nvdisasm / cuobjdump on this host (CUDNN_TEST_CUDA_BIN names a toolkit that decodes sm_107a)")
+    usage = subprocess.run([cuobjdump, "-res-usage", cubin], capture_output=True, text=True, timeout=300)
+    dis = subprocess.run([nvdisasm, "-c", cubin], capture_output=True, text=True, timeout=600)
+    if usage.returncode != 0 or dis.returncode != 0:
+        pytest.skip(f"this toolkit cannot decode the sm_107a cubin: {usage.stderr[-300:]} {dis.stderr[-300:]}")
+    reg = int(m.group(1)) if (m := re.search(r"REG:(\d+)", usage.stdout)) else -1
+    stl = len(re.findall(r"^\s*/\*[0-9a-f]+\*/\s+(?:@!?P[0-9T]\s+)?STL", dis.stdout, re.M))
+    ldl = len(re.findall(r"^\s*/\*[0-9a-f]+\*/\s+(?:@!?P[0-9T]\s+)?LDL", dis.stdout, re.M))
+    return reg, stl, ldl
+
+
+_CENSUS_CELLS = [
+    ("u1_t1024_s1_cap32768", dict(s_q=1, page=16, n_blocks_max=32768, units=1, threads=1024)),
+    ("u2_t1024_s4_cap8192_pdl", dict(s_q=4, page=16, n_blocks_max=8192, units=2, threads=1024, use_pdl=True)),
+    ("u8_t1024_s1_cap32768", dict(s_q=1, page=16, n_blocks_max=32768, units=8, threads=1024)),
+    ("u1_t512_s1_cap32768", dict(s_q=1, page=16, n_blocks_max=32768, units=1, threads=512)),
+    ("u2_t1024_s1_cap8192_check_arrivals", dict(s_q=1, page=16, n_blocks_max=8192, units=2, threads=1024, check_arrivals=True)),
+    ("u1_t1024_s1_cap8192_deadline", dict(s_q=1, page=16, n_blocks_max=8192, units=1, threads=1024, deadline_ns=2_000_000_000)),
+]
+
+
+@needs_body
+@pytest.mark.parametrize("tag,kw", _CENSUS_CELLS, ids=[c[0] for c in _CENSUS_CELLS])
+def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
+    """The counter sites of the tables in the sm_107a PTX: ``red.release.gpu.global.add.u64`` x S_q (the arrival count of the ledger, one
+    site per row of the sequence), ``ld.acquire.gpu.global.u64`` == 2 (+1 under ``check_arrivals``) with ``nanosleep`` beside it,
+    ``st.relaxed.gpu.global.u64`` == 1 (the reset), ``fence.acq_rel.gpu``; no ``.cluster``, no mbarrier, no bulk copy; no global atom and no
+    global red outside the gsync sites (the top-k's shared histogram atomics are counted separately); ``griddepcontrol`` 3 + 3 under the
+    PDL key and 0 + 0 without; the deadline's ``%globaltimer`` / ``trap`` / ``fence.sc.sys`` only when armed; a named barrier over
+    ``128 x units`` threads in the scorer role; no local memory at 8192 columns (the 32-key tile at 32768 x 1024 is allowed its few)."""
+    ptx, _ = _render(tmp_path, tag, kw)
+    c = _census(ptx)
+    print(f"\n[{tag}] {c}")
+    s_q, units = kw["s_q"], kw["units"]
+    assert c["red.release.gpu.global.add.u64"] == s_q, c
+    assert c["ld.acquire.gpu.global.u64"] == 2 + (1 if kw.get("check_arrivals") else 0), c
+    assert c["nanosleep"] >= 1 and c["st.relaxed.gpu.global.u64"] == 1 and c["fence.acq_rel.gpu"] >= 1, c
+    assert c["barrier.cluster"] == 0 and c[".cluster"] == 0 and c["mbarrier"] == 0 and c["cp.async.bulk"] == 0, c
+    global_atoms = re.findall(r"\b(?:atom|red)\.[\w.]*global[\w.]*", ptx)
+    assert sorted(set(global_atoms)) == ["red.release.gpu.global.add.u64"] and len(global_atoms) == s_q, global_atoms
+    pdl = 3 if kw.get("use_pdl") else 0
+    assert c["griddepcontrol.wait"] == pdl and c["griddepcontrol.launch_dependents"] == pdl, c
+    armed = kw.get("deadline_ns") is not None
+    assert (c["%globaltimer"] > 0) == armed and (c["fence.sc.sys"] > 0) == armed, c
+    assert (c["trap;"] > 0) == (armed or bool(kw.get("check_arrivals"))), c  # the deadline's trap, or the exact-count trap of check_arrivals
+    assert c["mma.sync"] > 0 and c["cp.async.cg"] > 0 and c["st.shared"] > 0 and c["bar.sync"] >= 8, c
+    if units in (1, 2, 4):
+        assert re.search(
+            rf"bar\.sync\s+[^;]*,\s*{128 * units}\s*;", ptx
+        ), f"no named barrier over 128 x {units} threads (the scorer role's publish / release barrier)"
+    if kw["n_blocks_max"] <= 8192:
+        assert c[".local"] == 0, c
+
+
+@needs_body
+@pytest.mark.parametrize("role,units", [("prepare", 1), ("scorer", 1), ("topk", 1), ("scorer", 8), ("scorer", 2)], ids=lambda v: str(v))
+def test_no_local_memory_spill_per_role_at_1024_threads(tmp_path, role, units):
+    """The register pin BEFORE any GPU time: a role-isolated sm_107a rendering (the ``roles`` compile key traces the other branches empty at
+    the SAME block size, SMEM and ABI) at 1024 threads = 64 registers flat holds no ``STL`` / ``LDL`` for the prepare and the scorer (at
+    every served units) and for the top-k at 8192 columns; ``REG`` reads at most 64.  A spill in the scorer is the recorded 512-thread
+    fallback, never a silent default."""
+    kw = dict(s_q=1, page=16, n_blocks_max=8192, units=units, threads=1024, roles=[role])
+    ptx, cubin = _render(tmp_path, f"only_{role}_u{units}", kw)
+    assert ptx.count(".local") == 0, f"{role}: local memory in the PTX"
+    assert cubin is not None, "no cubin was kept"
+    reg, stl, ldl = _sass_counts(cubin)
+    print(f"\n[{role} u{units}] REG {reg} STL {stl} LDL {ldl}")
+    assert 0 < reg <= 64, reg
+    assert stl == 0 and ldl == 0, f"{role} at units {units}: STL {stl} / LDL {ldl} at 1024 threads"
