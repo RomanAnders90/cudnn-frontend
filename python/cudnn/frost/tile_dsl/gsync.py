@@ -45,25 +45,42 @@ polling warp; a TMA-issuing warp other than the polling one fences itself after 
 :func:`fence_proxy_async_global`).  Generic-proxy consumers (the merge's ``ld.global`` of the partials, the reduce's
 loads of the planes) need neither arm.
 
-THE LANE LEDGER (write it in the kernel's barrier table, one row per counter class, exactly like an mbarrier's init
-count): ``issuing lanes = ONE lane per CTA (the elected lane of the one warp whose threads pass warp_gate) x the
-group's CTA count == the target`` -- e.g. ``cnt_unit[b, g]: 1 lane x S split CTAs == S``; ``cnt_p3[m]: 1 lane x
-SLICES == SLICES``; a grid-wide rendezvous ``1 x gridDim.x == gridDim.x``.  ``warp_gate`` is a REQUIRED keyword argument
-on every entry and must be a per-thread predicate that holds on the lanes of ONE warp (``warp_idx == 0``); the elect
-is internal.  A call without the gate does not issue (a ``TypeError`` at trace time), a Python constant for the gate is
-refused (a bare ``True`` across a multi-warp role is the P3 over-arrival of ``mbarrier-patterns.md``), so the
-over-arrival that ``if nvvm.elect_sync():`` alone writes on an ``init(1)`` mbarrier cannot be written here.  The
-named barrier (``bar_id`` 1-15, ``bar_threads`` a multiple of 32 = the role's thread count) is the caller's resource:
-list it in the barrier table beside the kernel's other named barriers, and call the entry from every thread it counts.
+THE LEDGER OF ISSUING LANES (write it in the kernel's barrier table, one row per counter class, exactly like an
+mbarrier's init count): ``issuing lanes = ONE lane per CTA (the elected lane of the one warp whose threads pass
+warp_gate) x the group's CTA count == the target`` -- e.g. ``cnt_unit[b, g]: 1 lane x S split CTAs == S``;
+``cnt_p3[m]: 1 lane x SLICES == SLICES``; a grid-wide rendezvous ``1 x gridDim.x == gridDim.x``.  ``warp_gate`` is a
+REQUIRED keyword argument on every entry and must be a WARP-UNIFORM per-thread predicate that holds on the lanes of
+ONE warp of the CTA, derived from the CTA-GLOBAL warp identity (``warp_idx == 0``); the elect is internal.  A role
+that runs several copies per CTA (a 4-warp scorer unit, ``units`` of them in one CTA) never gates on its per-copy warp
+index: ``warp_in_unit == 0`` holds on one warp of EVERY copy and issues ``units`` arrivals per CTA on a word whose target
+counts CTAs -- the gate there is ``(unit == 0) & (warp_in_unit == 0)``.  A call without the gate does not issue (a
+``TypeError`` at trace time), a Python constant for the gate is refused (a bare ``True`` across a multi-warp role is the
+P3 over-arrival of ``mbarrier-patterns.md``), so the over-arrival that ``if nvvm.elect_sync():`` alone writes on an
+``init(1)`` mbarrier cannot be written here; a TRACED predicate is beyond the guard's reach (a lane-level ``tidx == 0``
+elects under a divergent mask, a per-copy warp index over-arrives), so the kernel's PTX census counts the
+``red.release`` / ``atom`` sites against the ledger's expected arrivals.  The named barrier (``bar_id`` 1-15,
+``bar_threads`` a multiple of 32 = the role's thread count) is the caller's resource: list it in the barrier table
+beside the kernel's other named barriers, and call the entry from every thread it counts.
 
-LIFECYCLE.  The counter words live in the plan's workspace, one 128-byte line per counter class (a release atom must
-never share a line with a polled word of another class; :func:`counter_word_offset` lays them out), are written to zero
-on the launch stream by the plan's one-shot init at the first execute, and from then on the KERNEL leaves them at
-zero: the target form resets by the last arriver, a persistent kernel's last-alive CTA stores 0 to every class it
-owns at exit (:func:`counter_store_u64`).  A kernel that does not complete leaves a sticky context in which no later
-launch of the plan runs, so no launch ever reads a residue.  Capture is unaffected: a captured first execute captures
-the zero fill, every replay re-applies it, every complete launch leaves zeros.  Under PDL the first access to a counter
-sits behind the role's ``griddepcontrol.wait`` -- that is the caller's placement, not this module's.
+LIFECYCLE -- two supported forms, both leaving every word at ZERO after every complete launch.  (1) Workspace-owned:
+the counter words live in the plan's workspace, one 128-byte line per counter class (a release atom must never share
+a line with a polled word of another class; :func:`counter_word_offset` lays them out), are written to zero on the
+launch stream by the plan's one-shot init at the first execute, and from then on the KERNEL leaves them at zero: the
+target form resets by the last arriver, a persistent kernel's last-alive CTA stores 0 to every class it owns at exit
+(:func:`counter_store_u64`).  Capture is unaffected: a captured first execute captures the zero fill, every replay
+re-applies it.  (2) Plan-owned: the words are a small tensor the plan ALLOCATES at build time (never the per-execute
+workspace, which promises no persistence) and zero-fills ONCE, on the launch stream of its FIRST execute -- one async memset
+ordered ahead of that launch by construction; no fill on the ambient stream at build and no host synchronize there (the
+engine rules hold build to the execute standard) --, and the consumer that has observed the target resets them INSIDE the
+kernel (``acquire_geq`` then one lane's :func:`counter_store_u64`, or the target form's last arriver); after that first
+execute no path carries a memset / memcpy node, so a chain's launch census counts kernels only, and a fresh declaration's
+FIRST execute still captures with no warm-up: the captured graph carries the one-shot fill, which every replay re-applies to
+words the kernel left at zero (idempotent by the invariant).  Both forms serve ONE execute in flight per plan: two concurrent
+launches of one plan on two streams would share the words (an arrival of one counted by the other's acquire, a reset erasing
+the other's arrivals).  Under either form a kernel that does not complete leaves a sticky context in which no later launch of
+the plan runs, so no launch ever reads a residue.  Under
+PDL the first access to a counter sits behind the role's ``griddepcontrol.wait`` -- that is the caller's placement, not
+this module's.
 
 NO CO-RESIDENCY IS NEEDED by the last-arriver form and by any acquire whose producers never wait on the acquirer: an
 ordinary launch of more CTAs than fit on the device completes it wave by wave (every arriver leaves; the last one does
@@ -77,7 +94,7 @@ payload to its acquirer over the same 2 x 1000 launches; the test's device tier 
 capture + replay, the co-resident rendezvous and the deadline trap at 100 launches per cell (green on a cc 10.0 part).
 
 THE DEADLINE.  ``acquire_geq(..., deadline_ns=<Int64>, diag_addr=<Int64 or None>, code=<int>)`` arms a
-``%globaltimer`` deadline on the poll: past it the lane stores ``code`` and the last value seen to ``diag_addr`` (two
+``%globaltimer`` deadline on the poll: past it the polling lane stores ``code`` and the last value seen to ``diag_addr`` (two
 u64 words; mapped pinned host memory keeps them readable after the context dies), executes ``fence.sc.sys`` and
 ``trap`` -- a lost dependency becomes a launch failure that NAMES its seam within the deadline instead of a hang.
 ``deadline_ns=None`` (the default) renders no timer, no diagnostic and no trap: production kernels of the ordinary,
@@ -114,8 +131,8 @@ __all__ = [
     "release_add",
 ]
 
-# One 128-byte line per counter class (review A9 of the decode design: a release atom must never share a line with a polled
-# word of another class); 16 eight-byte words per line.
+# One 128-byte line per counter class (a release atom must never share a line with a polled word of another class: every
+# arrival would bounce the poller's line); 16 eight-byte words per line.
 COUNTER_LINE_BYTES: int = 128
 COUNTER_WORD_BYTES: int = 8
 COUNTER_WORDS_PER_LINE: int = COUNTER_LINE_BYTES // COUNTER_WORD_BYTES
@@ -139,11 +156,16 @@ def counter_word_offset(line: int, word: int = 0) -> int:
 
 def _require_gate(warp_gate, entry: str) -> None:
     """Trace-time guard: the warp gate must be a per-thread PREDICATE (a ``cutlass.Boolean`` value), never a Python
-    constant -- ``True`` across a multi-warp role is the over-arrival these entries exist to make unwritable."""
+    constant -- ``True`` across a multi-warp role is the over-arrival these entries exist to make unwritable.  The
+    convention the guard cannot check (a traced predicate is opaque here): the gate is WARP-UNIFORM and derived from the
+    CTA-GLOBAL warp identity, holding on exactly one warp of the CTA -- ``warp_idx == 0``, or ``(unit == 0) &
+    (warp_in_unit == 0)`` in a role that runs several copies per CTA; a lane-level ``tidx == 0`` elects under a divergent
+    mask and a per-copy warp index arrives once per copy.  The kernel's PTX census of the ``red.release`` / ``atom`` sites
+    against the ledger is the detector for those."""
     if warp_gate is None or isinstance(warp_gate, (bool, int)):
         raise TypeError(
             f"gsync.{entry}: warp_gate must be a per-thread predicate that holds on the lanes of ONE warp "
-            f"(e.g. ``warp_idx == 0``), got the Python constant {warp_gate!r}; the lane ledger is one elected lane of "
+            f"(e.g. ``warp_idx == 0``), got the Python constant {warp_gate!r}; the ledger is one elected lane of "
             "that warp per CTA -- a constant gate on a multi-warp role is the P3 over-arrival"
         )
 
@@ -273,7 +295,7 @@ def acquire_geq(
     ``nanosleep.u32 backoff_ns`` between tests); the named barrier publishes the acquire to the other warps.
     ``async_proxy=True`` adds the reader-side ``fence.proxy.async.global`` on the polling warp (for a payload this
     CTA then TMA-loads).  ``deadline_ns`` (an ``Int64``, nanoseconds of ``%globaltimer``) arms the bounded spin: past
-    it the lane writes ``code`` and the last counter value to ``diag_addr`` (two u64 words, when given), fences at
+    it the polling lane writes ``code`` and the last counter value to ``diag_addr`` (two u64 words, when given), fences at
     system scope and traps.  ``None`` renders no deadline (production: no timer reads in the poll)."""
     _require_gate(warp_gate, "acquire_geq")
     _require_barrier(bar_id, bar_threads, "acquire_geq")
