@@ -52,6 +52,10 @@ stage of the pipeline in ``api.py``::
                                 in registers, one 4096-bin histogram pass plus an exact rank of the k-th bin's candidates,
                                 the list written in canonical order (ids descending, -1 last); the DSL-free host entry is
                                 ``gated_attention_block/qsa_topk.py`` -- standalone until the decode indexer binds it
+    qsa_indexer_fused.py        the three decode-indexer launches above (prepare, paged scorer, decode top-k) as ONE kernel whose CTAs
+                                take a ROLE from ``blockIdx`` against a host dispatch table; the scorer role derives its own indexer rows
+                                (the prepare off the critical path), per-row GMEM counters release the top-k -- the pre-development
+                                tables (dispatch / counter / barrier / SMEM) and the host dispatch table (no kernel module imported) land first, the body later
 
 **The SDPA stage owns no file here.**  It drives the shipped forward adapter
 ``cudnn.sdpa.fwd.api_dsl.SdpaFwdDslSm100`` in EVERY configuration; the
