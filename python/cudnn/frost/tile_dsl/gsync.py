@@ -6,17 +6,17 @@
 An mbarrier orders work inside one CTA (or one cluster).  A hand-over between CTAs that share no cluster -- the split
 partials of one attention unit and the CTA that merges them, the split-K planes of one m-tile and the CTA that reduces
 them, the tiles of one phase and the items of the next inside a persistent kernel -- is ordered through a COUNTER in
-global memory, and every such site in a FROST kernel takes exactly one of the three forms below.  The forms are the
+global memory, and every such site in a FROST kernel takes exactly one of the four forms below.  The forms are the
 standard release / acquire pattern of the PTX memory model at ``.gpu`` scope (the same shape as CUTLASS's stream-K
-``Barrier``: all threads publish, one lane signals, one lane polls, a CTA barrier spreads the result), with the fence
-recipe of the FROST kernels baked in so no call site spells it by hand.
+``Barrier``: all threads publish, a CTA barrier collects them, one lane fences and signals, one lane polls, a CTA barrier
+spreads the result), with the fence recipe of the FROST kernels baked in so no call site spells it by hand.
 
-The three entries (every one is called by EVERY thread of the role -- all ``bar_threads`` of them):
+The four entries (every one is called by EVERY thread of the role -- all ``bar_threads`` of them):
 
 ``release_add(addr, n, *, warp_gate, bar_id, bar_threads, async_proxy=False)``
-    RELEASE: [``fence.proxy.async.global`` by every thread, ``async_proxy`` only] -> ``fence.acq_rel.gpu`` by every thread
-    (the writer's own generic stores become cumulative through the barrier below) -> ``bar.sync bar_id, bar_threads``
-    (the role's warps) -> ONE lane: ``red.release.gpu.global.add.u64 [addr], n``.
+    RELEASE: [``fence.proxy.async.global`` by every thread, ``async_proxy`` only] -> ``bar.sync bar_id, bar_threads``
+    (the role's warps: every thread's stores are collected at CTA scope) -> ONE lane: ``fence.acq_rel.gpu`` then
+    ``red.relaxed.gpu.global.add.u64 [addr], n`` (THE RELEASE FORM below: the fence is the elected lane's alone).
 ``acquire_geq(addr, target, *, warp_gate, bar_id, bar_threads, backoff_ns=128, async_proxy=False, deadline_ns=None, ...)``
     ACQUIRE: ONE lane polls ``ld.acquire.gpu.global.u64 [addr]`` until the value is ``>= target`` (one tight test, then a
     TIMER ``nanosleep.u32 backoff_ns`` between tests -- the ``wait_poll`` shape of ``barrier.py``: the polling lane's warp
@@ -25,14 +25,16 @@ The three entries (every one is called by EVERY thread of the role -- all ``bar_
     ``bar.sync bar_id, bar_threads`` publishes the acquire to the role's other warps.
 ``release_add_rows(addr, n_rows, n, *, warp_gate, bar_id, bar_threads, row_bytes=8, async_proxy=False)``
     the RELEASE of ``n_rows`` CONSECUTIVE words at once (a producer that feeds several consumers' words -- the scorer CTA
-    of a sequence releasing its ``S_q`` per-row words): the SAME prefix as ``release_add`` executed ONCE (one fence by every
-    thread, one named barrier), then the ONE elected lane issues ``n_rows`` ``red.release.gpu.global.add.u64`` at
-    ``addr + i x row_bytes``.  Every red is a release at gpu scope by the elected lane the fence + barrier made cumulative, so one
-    prefix orders the role's stores before all of them; ``n_rows`` separate ``release_add`` calls would repeat the fence
-    and the barrier ``n_rows`` times for the same ordering.  The ledger row per word is unchanged (``1 lane x <arriving
-    CTAs> == target``); the PTX census counts ``n_rows`` red sites per rendering.
+    of a sequence releasing its ``S_q`` per-row words): the SAME prefix as ``release_add`` executed ONCE (the proxy fence
+    when asked, the one named barrier), then the ONE elected lane executes ONE ``fence.acq_rel.gpu`` and ``n_rows``
+    ``red.relaxed.gpu.global.add.u64`` at ``addr + i x row_bytes``.  One fence followed by ``n_rows`` strong writes is
+    ``n_rows`` release patterns (one per word), so one prefix orders the role's stores before all of them; ``n_rows``
+    separate ``release_add`` calls would repeat the barrier and the fence ``n_rows`` times for the same ordering.  The
+    ledger row per word is unchanged (``1 lane x <arriving CTAs> == target``); the PTX census counts ``n_rows`` red sites
+    per rendering.
 ``last_arriver(addr, count, *, warp_gate, flag_smem, bar_id, bar_threads, reset=True, async_proxy=False) -> (is_last, old)``
-    LAST ARRIVER: the RELEASE prefix above, then ONE lane: ``atom.acq_rel.gpu.global.add.u64 old, [addr], 1``; the
+    LAST ARRIVER: the RELEASE prefix above (the proxy fence when asked, the barrier), then ONE lane:
+    ``atom.acq_rel.gpu.global.add.u64 old, [addr], 1`` -- itself a release operation at gpu scope, so no fence precedes it; the
     lane stores ``old`` into ``flag_smem`` (one 8-byte SMEM word the caller owns), ``bar.sync`` broadcasts it, every
     thread derives the CTA-UNIFORM ``is_last``; the last arriver's threads execute ``fence.acq_rel.gpu`` before
     returning, so they may read every other arriver's payload through generic loads right away.  ``reset=True`` is the
@@ -42,14 +44,27 @@ The three entries (every one is called by EVERY thread of the role -- all ``bar_
     ``reset=False`` is the MODULUS form: the counter is never reset and ``is_last = (old + 1) % count == 0``; it
     needs no zeroing between launches at all and ``old // count`` numbers the launch.
 
+THE RELEASE FORM (why the fence is the elected lane's alone).  Every thread's stores precede its ``bar.sync`` in program
+order; the barrier synchronizes with the elected lane's ``bar.sync`` (CTA scope: the same CTA); the elected lane's
+``fence.acq_rel.gpu`` followed by its strong write(s) is a release pattern at gpu scope (PTX memory model: a fence
+followed by a strong write, one pattern per word written after it); the consumer's ``ld.acquire.gpu`` that observes the
+write is the acquire pattern, and causality order is transitive across the chain -- so every thread's stores are visible
+to the consumer's later loads.  This is CUTLASS's ``Barrier::arrive_inc`` (``__syncthreads(); thread 0: fence.acq_rel.gpu;
+red.relaxed.gpu``) and cooperative groups' grid sync.  A ``fence.acq_rel.gpu`` by EVERY thread before the barrier (the
+recipe this module shipped first) orders nothing more and costs one ``MEMBAR.ALL.GPU`` per warp; a ``.release`` qualifier
+on each red lowers to its own membar on sm_107a (``MEMBAR.ALL.GPU + ERRBAR + CGAERRBAR + REDG...STRONG.GPU`` per site), so
+``n_rows`` release reds were ``n_rows`` serial membars on the signalling lane where one suffices: the role-isolated SASS of
+the fused indexer's scorer role went from 2 (S_q 1) / 5 (S_q 4) ``MEMBAR`` sites to 1 with the same bitwise outputs.  The
+acquire side is unchanged (``ld.acquire.gpu``; the last arriver's threads fence after the broadcast).
+
 SCOPES.  Every atom, load and fence is ``.gpu``; nothing here is ``.cluster`` scoped (a ``.release.cluster`` makes
 ptxas drain the whole kernel at every site -- ``barrier.py`` ``arrive_on_leader_release``) and nothing is ``.sys``
 except the ``fence.sc.sys`` that precedes a deadline trap (so a diagnostic written to mapped pinned host memory is
 readable after the context is gone).  The async-proxy arms are inline PTX because the DSL's ``nvvm.fence_proxy``
 wrapper carries the ``shared`` form only; they are needed exactly where the CONSUMER reads the payload through the
 async proxy (a TMA load of a slab, of O, of a page another CTA wrote with generic stores): writer side in
-``release_add`` / ``last_arriver`` (before the gpu fence), reader side in ``acquire_geq`` (after the acquire, on the
-polling warp; a TMA-issuing warp other than the polling one fences itself after the named barrier --
+``release_add`` / ``release_add_rows`` / ``last_arriver`` (by every thread, before the named barrier), reader side in ``acquire_geq``
+(after the acquire, on the polling warp; a TMA-issuing warp other than the polling one fences itself after the named barrier --
 :func:`fence_proxy_async_global`).  Generic-proxy consumers (the merge's ``ld.global`` of the partials, the reduce's
 loads of the planes) need neither arm.
 
@@ -66,7 +81,7 @@ counts CTAs -- the gate there is ``(unit == 0) & (warp_in_unit == 0)``.  A call 
 P3 over-arrival of ``mbarrier-patterns.md``), so the over-arrival that ``if nvvm.elect_sync():`` alone writes on an
 ``init(1)`` mbarrier cannot be written here; a TRACED predicate is beyond the guard's reach (a lane-level ``tidx == 0``
 elects under a divergent mask, a per-copy warp index over-arrives), so the kernel's PTX census counts the
-``red.release`` / ``atom`` sites against the ledger's expected arrivals.  The named barrier (``bar_id`` 1-15,
+``red`` / ``atom`` sites against the ledger's expected arrivals.  The named barrier (``bar_id`` 1-15,
 ``bar_threads`` a multiple of 32 = the role's thread count) is the caller's resource: list it in the barrier table
 beside the kernel's other named barriers, and call the entry from every thread it counts.
 
@@ -109,10 +124,11 @@ u64 words; mapped pinned host memory keeps them readable after the context dies)
 co-residency-free forms stay on the default; debug builds and every rendezvous form arm it.  The deadline bounds the
 spin, not the kernel: the outer run timeout keeps its own meaning (a kernel that does not return is still a hang).
 
-Pinned by ``test_tile_dsl_gsync.py``: the emitted PTX carries ``red.release.gpu.global.add.u64``,
-``ld.acquire.gpu.global.u64``, ``atom.acq_rel.gpu.global.add.u64``, ``fence.acq_rel.gpu``, the
+Pinned by ``test_tile_dsl_gsync.py``: the emitted PTX carries ``red.relaxed.gpu.global.add.u64`` (NO ``red.release``: every
+release is the fence form), ``ld.acquire.gpu.global.u64``, ``atom.acq_rel.gpu.global.add.u64``, ``fence.acq_rel.gpu``, the
 ``fence.proxy.async.global`` arm only when asked, ``%globaltimer`` / ``trap`` only with a deadline, NO ``.release.cluster``
-and NO ``.acquire.cluster``; the gate is keyword-only without a default; a constant gate is refused.
+and NO ``.acquire.cluster``; the gate is keyword-only without a default; a constant gate is refused; the device tier's
+``rows`` arm runs the multi-row release against one consumer per word.
 """
 
 import inspect
@@ -169,7 +185,7 @@ def _require_gate(warp_gate, entry: str) -> None:
     convention the guard cannot check (a traced predicate is opaque here): the gate is WARP-UNIFORM and derived from the
     CTA-GLOBAL warp identity, holding on exactly one warp of the CTA -- ``warp_idx == 0``, or ``(unit == 0) &
     (warp_in_unit == 0)`` in a role that runs several copies per CTA; a lane-level ``tidx == 0`` elects under a divergent
-    mask and a per-copy warp index arrives once per copy.  The kernel's PTX census of the ``red.release`` / ``atom`` sites
+    mask and a per-copy warp index arrives once per copy.  The kernel's PTX census of the ``red`` / ``atom`` sites
     against the ledger is the detector for those."""
     if warp_gate is None or isinstance(warp_gate, (bool, int)):
         raise TypeError(
@@ -227,8 +243,9 @@ def ld_acquire_gpu_u64(addr):
 
 
 @cute.jit
-def _red_release_gpu_add_u64(addr, n):
-    inline_ptx("red.release.gpu.global.add.u64 [{$r0}], {$r1};", write_only_types=[], read_only_args=[addr, n])
+def _red_relaxed_gpu_add_u64(addr, n):
+    """``red.relaxed.gpu.global.add.u64`` -- the strong write of the release pattern (the elected lane's ``fence.acq_rel.gpu`` precedes it)."""
+    inline_ptx("red.relaxed.gpu.global.add.u64 [{$r0}], {$r1};", write_only_types=[], read_only_args=[addr, n])
 
 
 @cute.jit
@@ -265,22 +282,23 @@ def release_add(
     bar_threads: cutlass.Constexpr[int],
     async_proxy: cutlass.Constexpr[bool] = False,
 ):
-    """RELEASE ``n`` arrivals on the counter word at ``addr`` (the module docstring's first form).
+    """RELEASE ``n`` arrivals on the counter word at ``addr`` (the module docstring's first form): the named barrier by every
+    thread, then the elected lane's ``fence.acq_rel.gpu`` and ``red.relaxed.gpu.global.add.u64`` (THE RELEASE FORM).
 
     Called by every thread of the role.  ``addr``: the word's generic address (``Int64``); ``n``: the increment (1 for
     one CTA's arrival).  ``warp_gate``: the per-thread predicate of the ONE warp that signals (required, keyword-only;
     the elect is internal).  ``bar_id`` / ``bar_threads``: the role's named barrier.  ``async_proxy=True`` adds the
-    writer-side ``fence.proxy.async.global`` for a payload the consumer TMA-loads.
+    writer-side ``fence.proxy.async.global`` (by every thread, before the barrier) for a payload the consumer TMA-loads.
     Ledger row: ``1 lane x <arriving CTAs> == target``."""
     _require_gate(warp_gate, "release_add")
     _require_barrier(bar_id, bar_threads, "release_add")
     if cutlass.const_expr(async_proxy):
         fence_proxy_async_global()
-    fence_acq_rel_gpu()
     named_barrier_fence(bar_id, bar_threads)
     if warp_gate:
         if nvvm.elect_sync():
-            _red_release_gpu_add_u64(addr, cutlass.Int64(n))
+            fence_acq_rel_gpu()
+            _red_relaxed_gpu_add_u64(addr, cutlass.Int64(n))
 
 
 @cute.jit
@@ -296,12 +314,13 @@ def release_add_rows(
     async_proxy: cutlass.Constexpr[bool] = False,
 ):
     """RELEASE ``n`` arrivals on each of the ``n_rows`` consecutive counter words at ``addr + i x row_bytes`` (the module
-    docstring's multi-row form): ONE ``fence.acq_rel.gpu`` by every thread and ONE named barrier, then the elected lane of
-    the ``warp_gate`` warp issues ``n_rows`` ``red.release.gpu.global.add.u64`` -- the same ordering ``n_rows`` calls of
-    :func:`release_add` would give, without repeating the prefix.  ``n_rows`` is a trace-time constant (the reds unroll
-    to ``n_rows`` textual sites: the PTX census's figure); ``row_bytes`` the word pitch (8: the words of one class laid out
-    by :func:`counter_word_offset`).  Called by every thread of the role; the same gate / barrier contract as
-    :func:`release_add`.  Ledger row per word: ``1 lane x <arriving CTAs> == target``."""
+    docstring's multi-row form): ONE named barrier by every thread, then the elected lane of the ``warp_gate`` warp executes
+    ONE ``fence.acq_rel.gpu`` and ``n_rows`` ``red.relaxed.gpu.global.add.u64`` -- a release pattern per word (the fence
+    followed by each strong write), the same ordering ``n_rows`` calls of :func:`release_add` would give, with one barrier
+    and one membar instead of ``n_rows``.  ``n_rows`` is a trace-time constant (the reds unroll to ``n_rows`` textual sites:
+    the PTX census's figure); ``row_bytes`` the word pitch (8: the words of one class laid out by :func:`counter_word_offset`).
+    Called by every thread of the role; the same gate / barrier contract as :func:`release_add`.  Ledger row per word:
+    ``1 lane x <arriving CTAs> == target``."""
     _require_gate(warp_gate, "release_add_rows")
     _require_barrier(bar_id, bar_threads, "release_add_rows")
     if cutlass.const_expr(not isinstance(n_rows, int) or isinstance(n_rows, bool) or int(n_rows) < 1):
@@ -312,13 +331,13 @@ def release_add_rows(
         raise TypeError(f"gsync.release_add_rows: row_bytes must be a positive multiple of {COUNTER_WORD_BYTES} (whole u64 words), got {row_bytes!r}")
     if cutlass.const_expr(async_proxy):
         fence_proxy_async_global()
-    fence_acq_rel_gpu()
     named_barrier_fence(bar_id, bar_threads)
     if warp_gate:
         if nvvm.elect_sync():
+            fence_acq_rel_gpu()
             n64 = cutlass.Int64(n)
             for i in cutlass.range_constexpr(n_rows):
-                _red_release_gpu_add_u64(addr + cutlass.Int64(i * row_bytes), n64)
+                _red_relaxed_gpu_add_u64(addr + cutlass.Int64(i * row_bytes), n64)
 
 
 @cute.jit
@@ -392,14 +411,15 @@ def last_arriver(
     it is written once per call by the electing lane and read by every thread after the named barrier).  ``reset=True``
     = the target form (``is_last = old == count - 1``, the counter stored back to 0 by the electing lane);
     ``reset=False`` = the modulus form (``is_last = (old + 1) % count == 0``, the counter never reset).  The last
-    arriver's threads return behind a ``fence.acq_rel.gpu`` and may read the other arrivers' payload at once.
+    arriver's threads return behind a ``fence.acq_rel.gpu`` and may read the other arrivers' payload at once.  The release
+    side is THE RELEASE FORM of the module docstring: the barrier collects every thread's stores, the elected lane's
+    ``atom.acq_rel.gpu`` is itself the release operation (no fence precedes it).
     Ledger row: ``1 lane x count == count``."""
     _require_gate(warp_gate, "last_arriver")
     _require_barrier(bar_id, bar_threads, "last_arriver")
     count64 = cutlass.Int64(count)
     if cutlass.const_expr(async_proxy):
         fence_proxy_async_global()
-    fence_acq_rel_gpu()
     named_barrier_fence(bar_id, bar_threads)
     if warp_gate:
         if nvvm.elect_sync():

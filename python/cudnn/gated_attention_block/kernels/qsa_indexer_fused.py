@@ -28,7 +28,8 @@ arm's position tables are the derive's).  No performance number is claimed here:
 every row of it is replaced by the gate's measurement.
 
 Dispatch table (sequence-major: every consumer right behind its producers; ``n_chunks = ceil(n_blocks_max / (128 x units))``;
-``THREADS`` = 1024 (the top-k's measured best form; 512 the fallback), ``W = THREADS / 32`` warps per CTA; ``T = B x S_q`` rows)::
+``THREADS`` = ``DEFAULT_THREADS`` = 512 by the register census (``W = THREADS / 32`` = 16 warps per CTA, ``units <= 4``) or the 1024-thread
+knob (the top-k's measured best form: ``W`` = 32, ``units <= 8``); ``T = B x S_q`` rows)::
 
     role  blockIdx.x range (linear)                                           CTAs                       body
     R0    [0, n_prep)                                                         ceil((attn + raw) / W)     prepare_role(wid = bidx x W + warp):
@@ -39,8 +40,8 @@ Dispatch table (sequence-major: every consumer right behind its producers; ``n_c
                                                                                                           unit, fused=True, derive=True, units)
     R2    [n_prep + b x (n_chunks + S_q) + n_chunks, + S_q) for b in [0, B)  B x S_q = T                topk_role(row = b x S_q + s, fused=True)
 
-    idle warps: the warps >= 4 x units of an R1 CTA (THREADS 1024 at units < 8; 512 at units < 4) take NO role -- they return at the
-    role branch, before any PDL site and before any barrier, so the ledgers of ids 1 and 2 + units below count 128 x units EXACTLY
+    idle warps: the warps >= 4 x units of an R1 CTA (at 512 threads: units < 4; at the 1024-thread knob: units < 8) take NO role -- they
+    return at the role branch, before any PDL site and before any barrier, so the ledgers of ids 1 and 2 + units below count 128 x units EXACTLY
     (an exited warp arrives on no counted named barrier; a warp that reached score_role with unit >= units would index ring slices
     past the SMEM carve).  R0 has no idle warps in the ledger sense: a warp unit past the last arm's warp count computes on clamped
     rows and stores nothing (the prepare role's own rule), and the prepare has no barrier.  R2 uses every warp of the CTA.
@@ -62,30 +63,37 @@ Dispatch table (sequence-major: every consumer right behind its producers; ``n_c
     b = r' / n_chunks) -- EVERY sequence's top-k CTAs ahead of EVERY scorer CTA: with more rows than resident slots every slot holds a
     consumer whose producers cannot be dispatched, the one table that strands the machine = the trap test's detector input.
 
-    cell (B x KV tokens x S_q; units)   R0   R1 per seq   R2 per seq   total   waves at 1 CTA / SM (212 SMs)
-    B 1 x 8K x 1 (1)                     1    16           1            18      1
-    B 1 x 32K x 1 (1)                    1    64           1            66      1
-    B 1 x 128K x 1 (2)                   1    128          1            130     1
-    B 4 x 8K / 32K / 128K x 1 (1/2/4)    4    16 / 32 / 64 1            72 / 136 / 264   1 / 1 / 2
-    B 1 x 8K x 4 (1) / B 4 x 8K x 4 (1)  4 / 15  16        4            24 / 95          1
-    B 32 x 8K / 32K / 128K x 1 (8)       29   2 / 8 / 32   1            125 / 317 / 1085 1 / 2 / 6
-    B 32 x 8K / 32K / 128K x 4 (8)       114  2 / 8 / 32   4            306 / 498 / 1266 2 / 3 / 6
+    cell (B x KV tokens x S_q; units)   threads  R0       R1 per seq    R2 per seq   total               waves at 1 CTA / SM (212 SMs)
+    B 1 x 8K / 32K x 1 (1)              512      2        16 / 64       1            19 / 67             1
+    B 1 x 128K x 1 (2)                  512      2        128           1            131                 1
+    B 4 x 8K / 32K / 128K x 1 (1/2/4)   512      8        16 / 32 / 64  1            76 / 140 / 268      1 / 1 / 2
+    B 1 x 8K x 4 (1) / B 4 x 8K x 4 (1) 512      8 / 29   16            4            28 / 109            1
+    B 32 x 8K / 32K / 128K x 1 (4)      512      57       4 / 16 / 64   1            217 / 601 / 2137    2 / 3 / 11
+    B 32 x 8K / 32K / 128K x 4 (4)      512      228      4 / 16 / 64   4            484 / 868 / 2404    3 / 5 / 12
+    the 1024-thread knob (W = 32: R0 halves; 8 units per R1 CTA at B 32 -- the form the register census measured at one STL / LDL pair):
+    B 1 x 8K / 32K x 1 (1)              1024     1        16 / 64       1            18 / 66             1
+    B 1 x 128K x 1 (2)                  1024     1        128           1            130                 1
+    B 4 x 8K / 32K / 128K x 1 (1/2/4)   1024     4        16 / 32 / 64  1            72 / 136 / 264      1 / 1 / 2
+    B 1 x 8K x 4 (1) / B 4 x 8K x 4 (1) 1024     4 / 15   16            4            24 / 95             1
+    B 32 x 8K / 32K / 128K x 1 (8)      1024     29       2 / 8 / 32    1            125 / 317 / 1085    1 / 2 / 6
+    B 32 x 8K / 32K / 128K x 4 (8)      1024     114      2 / 8 / 32    4            306 / 498 / 1266    2 / 3 / 6
 
 (:func:`dispatch_table` computes every row from the three kernels' own grid arithmetic; the test module's placement cell compares it
-against them.)
+against them, and its dispatch-rows cell pins every row above at its block size.)
 
-Counter table (``SUM(issuing lanes) == target`` per word; the lifecycle: PLAN-OWNED words, zero at build, consumer-reset)::
+Counter table (``SUM(issuing lanes) == target`` per word; the lifecycle: PLAN-OWNED words, allocated at build, zero-filled ONCE on the
+plan's first execute's launch stream, consumer-reset)::
 
     #   name / words                      producer (issuing lanes)                                   SUM == target          consumer / wait                                    reset                       start
-    C1  cnt_row[t], t in [0, T): T x u64  every R1 CTA of sequence b, AFTER its last logits /      1 lane x n_chunks      R2 CTA of row t: acquire_geq(cnt_row[t], n_chunks,  ONE lane of the R2 CTA      0 at plan build
-        on ceil(T / 16) 128-B lines       counts / block_lens store: release_add_rows(cnt_row[b S_q],  CTAs == n_chunks       warp_gate = warp == 0 (warp = the CTA-level warp   right after acquire_geq     (torch.zeros on
-        (counter_word_offset)             S_q, 1, warp_gate = (unit == 0) & (warp_in_unit == 0),     per cnt_row[t]         index of the top-k role), bar_id = 1, bar_threads   returns (the site below;    the ambient
-                                          bar_id = 1, bar_threads = 128 x units): ONE call per CTA                           = THREADS) BEFORE its first counts / logits load   every arrival observed;     stream, outside
-                                          -- one fence + one named barrier, then the S_q words'                              (the identity path included)                       no other reader in this     any capture;
-                                          red.release by ONE elected lane (S_q sites) -- the gate                                                                               launch)                     never a per-
-                                          names ONE warp of the whole CTA -- UNCONDITIONAL (a dead                                                                                                          execute fill)
-                                          sequence -- kv_lens 0, counts 0 -- arrives too: the
-                                          count is the protocol's, never the data's)
+    C1  cnt_row[t], t in [0, T): T x u64  every R1 CTA of sequence b, AFTER its last logits /      1 lane x n_chunks      R2 CTA of row t: acquire_geq(cnt_row[t], n_chunks,  ONE lane of the R2 CTA      0 before the
+        on ceil(T / 16) 128-B lines       counts / block_lens store: release_add_rows(cnt_row[b S_q],  CTAs == n_chunks       warp_gate = warp == 0 (warp = the CTA-level warp   right after acquire_geq     first launch
+        (counter_word_offset)             S_q, 1, warp_gate = (unit == 0) & (warp_in_unit == 0),     per cnt_row[t]         index of the top-k role), bar_id = COUNTER_BAR_ID,  returns (the site below;    (allocated at
+                                          bar_id = COUNTER_BAR_ID, bar_threads = 128 x units): ONE                           bar_threads = THREADS) BEFORE its first counts /   every arrival observed;     plan build; the
+                                          call per CTA -- one named barrier, then ONE elected                                logits load (the identity path included)           no other reader in this     plan's FIRST
+                                          lane's fence + the S_q words' red.relaxed (S_q sites) --                                                                              launch)                     execute zero-
+                                          the gate names ONE warp of the whole CTA -- UNCONDITIONAL                                                                                                         fills them on
+                                          (a dead sequence -- kv_lens 0, counts 0 -- arrives too:                                                                                                           its launch
+                                          the count is the protocol's, never the data's)                                                                                                                    stream, once)
 
     The gate, exactly: inside score_role ``warp`` is ``warp_in_unit`` (0..3 inside the unit), so ``warp_in_unit == 0`` alone holds on one
     warp of EVERY unit -- ``units`` elected lanes per CTA, units x n_chunks arrivals per word, the ledger violated at every units > 1 plan
@@ -98,13 +106,16 @@ Counter table (``SUM(issuing lanes) == target`` per word; the lifecycle: PLAN-OW
     compile key ``check_arrivals`` that same lane re-reads the word (``ld.acquire.gpu.global.u64``) before the reset and TRAPS unless it equals
     n_chunks exactly -- the over-arrival detector the reset otherwise erases; the bitwise cells run it at units 2 and 8.
 
-    release = every storing thread's stores -> fence.acq_rel.gpu by every thread -> the named barrier (id 1) over the CTA's units ->
-    ONE elected lane's red.release.gpu.global.add.u64 per word of the sequence (``gsync.release_add_rows``: the fence and the barrier
-    ONCE, then S_q reds -- every red is a release by the elected lane the one fence + barrier made cumulative, so S_q separate ``release_add``
-    calls would order the same stores at S_q times the fence + barrier cost); acquire = one lane's ld.acquire.gpu.global.u64 poll (nanosleep.u32 128 between
+    release = every storing thread's stores -> the named barrier (id 1) over the CTA's units -> ONE elected lane: fence.acq_rel.gpu once,
+    then red.relaxed.gpu.global.add.u64 per word of the sequence (``gsync.release_add_rows``, the release form of its module docstring: the
+    barrier collects the CTA's stores at CTA scope, the elected lane's fence followed by each strong write is a release pattern per word --
+    CUTLASS's ``Barrier::arrive_inc``; a fence by every thread or a ``.release`` on each red would add a membar per warp / per word for the
+    same ordering: the scorer role's sm_107a SASS went from 2 (S_q 1) / 5 (S_q 4) MEMBAR sites to 1, the outputs bitwise either way);
+    acquire = one lane's ld.acquire.gpu.global.u64 poll (nanosleep.u32 128 between
     tests; the other lanes and warps park in the named barrier), then the barrier publishes it.  No async-proxy arm: R2 reads the logits /
     counts through generic loads (the fence.proxy.async.global arm is the TILE role's, not built here).  The PTX census of the fused
-    rendering pins the sites: red.release.gpu.global.add.u64 == S_q per R1 rendering, ld.acquire.gpu.global.u64 == 2 per R2 rendering
+    rendering pins the sites: red.relaxed.gpu.global.add.u64 == S_q per R1 rendering (no red.release anywhere: the fence form),
+    fence.acq_rel.gpu == 1 (the R1 elected lane's), ld.acquire.gpu.global.u64 == 2 per R2 rendering
     (the poll's first test and its loop; one more under ``check_arrivals``), st.relaxed.gpu.global.u64 == 1 per R2 rendering (the reset),
     no atom.*.global / red.*.global anywhere else (the top-k's red.shared / atom.shared histogram is counted separately), no .cluster.
     The words are never read above a PDL wait that a previous launch of this kernel could race: the slab GEMM sits between two launches
@@ -121,9 +132,9 @@ named-barrier ids are allocated disjointly across the roles so the audit reads o
     id          role  site                                             guard / issuing lanes                                 SUM(issuing lanes) == count
     0           R2    bar.sync 0 at the top-k's sites B0 / B1_1 / B2 /  every thread of the CTA, once per visit (the identity   THREADS == THREADS (the top-k's own table,
                       B3 / C1 / R1 / F2                                 path performs no barrier)                              at THREADS = 1024 or 512)
-    1           R1    gsync release_add_rows(..., S_q, 1, bar_id = 1,   every thread of the CTA's units (the fence by all; the  128 x units == 128 x units; ONE visit (the
-                      bar_threads = 128 x units), one call after the    S_q reds by ONE lane: warp_gate = (unit == 0) &        idle warps >= 4 x units returned before the
-                      last store                                        (warp_in_unit == 0) + elect = one warp of the CTA)     site and count nowhere; a dead unit visits)
+    1           R1    gsync release_add_rows(..., S_q, 1, bar_id = 1,   every thread of the CTA's units (the barrier by all;    128 x units == 128 x units; ONE visit (the
+                      bar_threads = 128 x units), one call after the    the fence + S_q reds by ONE lane: warp_gate = (unit    idle warps >= 4 x units returned before the
+                      last store                                        == 0) & (warp_in_unit == 0), elect: one CTA warp)      site and count nowhere; a dead unit visits)
     1           R2    gsync acquire_geq(..., bar_id = 1, bar_threads =  every thread of the R2 CTA (one lane polls, the rest   THREADS == THREADS; one visit
                       THREADS) before the first counts / logits load    park in the barrier)
     2 + unit    R1    the unit's query-tile barrier of the fused form   all 128 threads of unit ``unit`` (4 warps x 32), once,  128 == 128 per unit ('bar.sync 2 + unit,
@@ -172,21 +183,24 @@ the roles' buffers alias trivially; no descriptor reads any buffer here, so the 
                                                                                                                                                            one 256-B row, conflict-free
     s_hist / s_pool /     113.4 KiB (116,144 B) at 1024 threads     the top-k's own                                   the top-k's own                      the top-k's own table
     s_rank_* / small (R2) (the 2 x 4096-bin histogram 32 KiB + the
-                          staging pool 80 KiB + the rank list 1 KiB)
+                          staging pool 80 KiB + the rank list 1 KiB);
+                          73.4 KiB (75,184 B) at 512 threads
     R0                    0                                         --                                                --                                   --
-    union                 max(R2, R1, 0) = 113.4 KiB at 1-2 units (B <= 4 plans: the standard carveout) / 260.3 KiB at 8 units (B 32 plans:
-                          8 x 32 KiB + 4 KiB + 272 B -> the OVERSIZED carveout, L1 -> 8 kB: the scorer's cp.async.cg bypasses L1, the
-                          prepare's and the top-k's loads are streamed once, nothing relies on L1 hits) / 196 KiB at 8 units x ring_depth
-                          2 (the standard carveout; a knob the gate sets).  CTAs per SM = 1 everywhere (registers: 1024 x 64 = the file).
+    union                 max(R2, R1, 0): at the DEFAULT 512 threads 73.4 KiB at 1-2 units (the top-k's 512-thread tables; B <= 4 plans) /
+                          132.3 KiB at 4 units (B 32 plans: 4 x 32 KiB + 4 KiB + 272 B; both the standard carveout); at the 1024-thread
+                          knob 113.4 KiB at 1-2 units / 260.3 KiB at 8 units (8 x 32 KiB + 4 KiB + 272 B -> the OVERSIZED carveout, L1 ->
+                          8 kB: the scorer's cp.async.cg bypasses L1, the prepare's and the top-k's loads are streamed once, nothing relies
+                          on L1 hits) / 196 KiB at 8 units x ring_depth 2 (the standard carveout; a knob the gate sets).  CTAs per SM = 1
+                          everywhere (registers: 512 x 128 = the file at the default, 1024 x 64 at the knob).
 
 Forward progress (the assumption, stated exactly).  This kernel relies on ONE property: the hardware dispatches the CTAs of a grid in
 non-decreasing linear ``blockIdx`` order (a CTA with a lower linear index is never dispatched after one with a higher index).  Under
 it, placing every PRODUCER of a counter at a lower index than every CONSUMER of that counter makes every wait terminate: when an R2
 CTA is resident, every R1 CTA of its sequence has been dispatched -- each is finished or resident, and no R1 CTA waits on anything of
 this grid (R0 and R1 wait on nothing of this grid -- under ``use_pdl`` every role waits on the PREVIOUS grid, once, at its top; the
-roles are acyclic) -- so they complete and the acquire returns, even when the grid exceeds the resident capacity (B 32 x 32K: 317 CTAs
-over 212 SMs) and even when every resident slot holds a spinning consumer.  What the property is NOT: a CUDA programming-model
-guarantee (thread blocks must be executable in any order); it is an observed property of this part + driver pinned by test (the gsync
+roles are acyclic) -- so they complete and the acquire returns, even when the grid exceeds the resident capacity (B 32 x 32K: 601 CTAs
+at the default form, 317 at the 1024-thread knob, over 212 SMs) and even when every resident slot holds a spinning consumer.  What the
+property is NOT: a CUDA programming-model guarantee (thread blocks must be executable in any order); it is an observed property of this part + driver pinned by test (the gsync
 ``chain`` arm, 424 CTAs = two waves, 1000 / 1000 on cc 10.7 and 10.0).  A driver that broke it would surface as a HANG (exit 124 under
 the kernel timeout, or the deadline trap in tests: ``deadline_ns``, a test-only compile key -- ``trap`` + a diagnostic word, never a
 bigger timeout), never as a wrong answer.  Other kernels on the GPU (another stream, MPS) only shrink the resident capacity: a slower
@@ -283,6 +297,8 @@ __all__ = [
     "FUSED_THREAD_COUNTS",
     "SCORER_UNIT_CHOICES",
     "SCORER_UNIT_THREADS",
+    "COUNTER_BAR_ID",
+    "SCORER_BAR_ID_BASE",
     "TOPK_MAX_EPT",
     "TOPK_MAX_ROWS",
     "DispatchTable",
@@ -323,13 +339,25 @@ the standalone rule (4 at ``units_per_warp`` 1)."""
 
 
 def scorer_mma_batch_for(threads: int, units_per_warp: int = 1) -> int:
-    """The scorer's MMA batch at the fused block size: the standalone rule at 512 threads (128 registers: the role keeps its form), the
-    64-register figure at 1024."""
-    return SCORER_MMA_BATCH_AT_64_REGS if int(threads) == 1024 and int(units_per_warp) == 1 else 0
+    """The scorer's MMA batch at the fused block size: the standalone rule (0) at 512 threads (128 registers: the role keeps its form), the
+    64-register figure at 1024 -- at EVERY ``units_per_warp`` (the batch is the register budget's, not the stream width's; the 1024 form
+    serves ``units_per_warp`` 1 alone: :func:`compile_qsa_indexer_fused` refuses 2 / 4 / 8 there by the register census -- 78 / 101 STL / LDL
+    at the standalone batch, 8 / 26 at batch 1, no batch fits 64 registers -- while 512 threads serve them spill-free at 99 registers)."""
+    return SCORER_MMA_BATCH_AT_64_REGS if int(threads) == 1024 else 0
 
 
 FUSED_THREAD_COUNTS = (1024, 512)  # the top-k's THREAD_COUNTS, largest first: the served block sizes of the fused kernel
 SCORER_UNIT_CHOICES = (1, 2, 4, 8)  # 4-warp scorer units per R1 CTA (1-2 at B <= 4, 8 at B 32; a typed per-plan constant)
+COUNTER_BAR_ID = 1
+"""The named-barrier id of the per-row counter seam in BOTH roles -- ``gsync.release_add_rows`` in the scorer role, ``gsync.acquire_geq`` in the
+top-k role (gsync's first legal id: 0 is the CTA barrier, the top-k's own ``bar.sync 0`` sites).  The fused CTA's named-barrier id space is
+allocated HERE, disjointly across the roles (the barrier table of the module docstring reads one ledger): 0 the CTA barrier, 1 the counters,
+``SCORER_BAR_ID_BASE`` .. the scorer role's; the two role modules import these two names."""
+SCORER_BAR_ID_BASE = 2
+"""The scorer role's named-barrier ids: ``SCORER_BAR_ID_BASE + units`` is the CTA-wide publish barrier under ``derive`` (``128 x units``
+threads), ``SCORER_BAR_ID_BASE + unit`` the per-unit barrier of the fused form without derive (128 threads).  The hardware has 16 ids
+(0 .. 15): ``SCORER_BAR_ID_BASE + units <= _BAR_ID_MAX`` is a :func:`dispatch_table` rule (10 at the widest served ``units``, 8)."""
+_BAR_ID_MAX = 15  # the hardware's last named-barrier id (gsync's _BAR_ID_MAX; pinned equal in the test module)
 TOPK_MAX_EPT = 64  # the top-k's register tile per thread (its MAX_EPT; pinned equal in the test module)
 TOPK_MAX_ROWS = 65535  # the top-k's grid.y bound (its MAX_ROWS; pinned equal in the test module)
 _WARP = 32
@@ -554,10 +582,20 @@ def dispatch_table(
         raise ValueError(
             f"s_q x next_pow2(index_heads) = {s_q} x {query_row_map(s_q, max(index_heads, 1)).padded} exceeds the scorer's {MAX_QUERY_ROWS}-row query envelope"
         )
+    if s_q > BLOCK_SIZE:
+        raise ValueError(
+            f"s_q = {s_q} rows per sequence exceed the fused step's block size {BLOCK_SIZE}: the scorer role derives the ONE compressed-key row a step of at "
+            f"most {BLOCK_SIZE} rows completes (a wider step completes several) -- the three-launch chain serves it"
+        )
     if n_blocks_max < 1 or n_blocks_max % _SCORE_ROW_ALIGN:
         raise ValueError(f"n_blocks_max must be a positive multiple of {_SCORE_ROW_ALIGN} (the scorer's fp32 row alignment), got {n_blocks_max}")
     if units not in SCORER_UNIT_CHOICES:
         raise ValueError(f"units must be one of {SCORER_UNIT_CHOICES} (4-warp scorer units per CTA), got {units}")
+    if SCORER_BAR_ID_BASE + units > _BAR_ID_MAX:
+        raise ValueError(
+            f"units = {units}: the scorer role's publish barrier id SCORER_BAR_ID_BASE + units = {SCORER_BAR_ID_BASE + units} is past the hardware's "
+            f"last named-barrier id {_BAR_ID_MAX}"
+        )
     if units_per_warp not in UNITS_PER_WARP_CHOICES:
         raise ValueError(f"units_per_warp must be one of {UNITS_PER_WARP_CHOICES}, got {units_per_warp}")
     if threads not in FUSED_THREAD_COUNTS:
@@ -663,7 +701,9 @@ def compile_qsa_indexer_fused(
     ``ring_slots`` / ``rope_table`` / ``n_commit`` as the plan has them) + ``d, rope_dim, page, index_head_dim, pool``, ``dtype`` /
     ``slot_dtype`` / ``apply_norm`` / ``eps``; the scorer's ``(h_i, s_q, page, units_per_warp, ring_depth, has_block_lens x 2)``; the top-k's
     ``(cols_cap, top_k)`` with ``cols_cap = topk_cols_cap(n_blocks_max, threads)`` (one artifact serves every ``n_blocks_max`` up to it);
-    ``units``, ``threads`` (1024 / 512), ``use_pdl``, the device; the test-only ``deadline_ns`` (the trap rendering: a ``%globaltimer`` deadline
+    ``units``, ``threads`` (512 = ``DEFAULT_THREADS`` / 1024, the knob: ``units_per_warp`` 1 alone there, by the register census), ``use_pdl``, the device;
+    ``index.pool`` must be the scorer's ``BLOCK_SIZE`` (4: its visibility, its rows per page and the derive's completing block are built on it);
+    the test-only ``deadline_ns`` (the trap rendering: a ``%globaltimer`` deadline
     on the top-k's acquire, the launch then takes the deadline and a diagnostic buffer), ``check_arrivals`` (the top-k role's exact-count
     trap before its counter reset), ``roles`` (a role-isolated rendering for the per-role register census) and ``order``
     (``"consumers-first"`` / ``"consumers-first-global"``: the mis-ordered dispatch tables, served only with the deadline).  The dynamic SMEM = :func:`dynamic_smem_bytes`
@@ -698,10 +738,21 @@ def compile_qsa_indexer_fused(
         raise NotImplementedError(
             "qsa_indexer_fused: rope_dim must be > 0 (the derive rotates the indexer rows at their positions from the compress arm's tables)"
         )
+    if int(index.pool) != BLOCK_SIZE:
+        raise NotImplementedError(
+            f"qsa_indexer_fused: the paged scorer scores {BLOCK_SIZE}-token compressed blocks (its visibility nv = kv_len / {BLOCK_SIZE}, its rows per page "
+            f"= page_size / {BLOCK_SIZE}) and the derive completes one such block; index.pool must be {BLOCK_SIZE}, got {index.pool}"
+        )
     if s_q > int(index.pool):
         raise NotImplementedError(
             f"qsa_indexer_fused: S_q = {s_q} rows per sequence exceed the compress ratio pool = {index.pool}: the derive publishes the ONE compressed-key row "
             "a step of at most `pool` rows can complete (a wider step completes several); the three-launch chain serves it"
+        )
+    if threads == 1024 and int(units_per_warp) != 1:
+        raise NotImplementedError(
+            f"qsa_indexer_fused: the 1024-thread form (64 registers per thread) spills the scorer role at units_per_warp = {units_per_warp} in every measured "
+            "MMA batch (the register census: 78 / 101 STL / LDL at the standalone batch, 8 / 26 at batch 1); units_per_warp > 1 is served at 512 threads "
+            "(spill-free at 99 registers)"
         )
     if not isinstance(roles, (tuple, list)) or not roles or any(r not in ROLES for r in roles):
         raise ValueError(f"roles must be a non-empty subset of {ROLES}, got {roles!r}")

@@ -430,8 +430,8 @@ def test_served_renderings_are_byte_identical_to_the_record(tmp_path_factory, ke
 
 
 # The role's fused / derive seams: a 2-unit wrapper kernel hands score_role the ids, the flags and (under derive) the derive operands.
-# fused=True traces THROUGH the unit's named barrier, the per-unit ring base, the counts guard and the per-row counter release (S_q
-# red.release sites after ONE fence + ONE named barrier); derive=True renders the derive prologue (the query rows and the completing row
+# fused=True traces THROUGH the unit's named barrier, the per-unit ring base, the counts guard and the per-row counter release (ONE named
+# barrier, then the elected lane's fence.acq_rel.gpu and S_q red.relaxed sites -- gsync's release form); derive=True renders the derive prologue (the query rows and the completing row
 # into SMEM), the CTA-wide publish barrier 'bar.sync 2 + units, 128 x units' AT the query-tile site in place of the per-unit one, and the
 # owning warp's slot overwrite; fused=False / derive=False through the same wrapper is the standalone kernel's path.  The probe keeps the
 # PTX and prints a census of the sites (it runs from a file: the DSL needs the wrapper's source, which a ``-c`` program has not).
@@ -500,7 +500,7 @@ try:
     txt = open(ptx[-1]).read()
     # the sites by regex (ptxas' spelling separates the opcode and its operands by a tab): the CTA barrier, the per-unit NAMED barrier (a register
     # id, 128 threads), the CTA-wide publish barrier (id 2 + units = 4, 128 x units = 256 threads), the counter release and its fence
-    for k, rx in (("red.release", r"red\.release\.gpu\.global\.add\.u64"), ("fence.acq_rel.gpu", r"fence\.acq_rel\.gpu"), ("bar.sync 4, 256", r"bar\.sync\s+4, 256;"),
+    for k, rx in (("red.release", r"red\.release"), ("red.relaxed", r"red\.relaxed\.gpu\.global\.add\.u64"), ("fence.acq_rel.gpu", r"fence\.acq_rel\.gpu"), ("bar.sync 4, 256", r"bar\.sync\s+4, 256;"),
                   ("bar.sync %r, 128", r"bar\.sync\s+%r\d+, 128;"), ("bar.sync 0", r"bar\.sync\s+0;"), ("cp.async.cg", r"cp\.async\.cg"),
                   ("st.shared.v4", r"st\.shared\.v4"), ("ld.shared.v4", r"ld\.shared\.v4"), (".local", r"\.local")):
         print("COUNT", k, len(re.findall(rx, txt)))
@@ -516,7 +516,8 @@ def test_score_role_traces_the_standalone_shape_and_renders_the_fused_and_derive
     """``score_role`` called from a 2-unit wrapper kernel for sm_107a (no GPU).  ``fused=False, derive=False``: the standalone kernel's path --
     no counter site, the CTA barrier ``bar.sync 0``, the query tile copied by ``cp.async``.  ``fused=True, derive=False``: the unit's NAMED
     barrier (a register id: ``bar.sync %r, 128``) in place of ``bar.sync 0``, the query tile still copied, and the release seam -- ONE
-    ``fence.acq_rel.gpu`` and ``S_q`` (= 1 here) ``red.release.gpu.global.add.u64`` sites.  ``fused=True, derive=True``: no ``cp.async`` of a
+    ``fence.acq_rel.gpu`` (the elected lane's) and ``S_q`` (= 1 here) ``red.relaxed.gpu.global.add.u64`` sites, no ``red.release`` (gsync's
+    release form).  ``fused=True, derive=True``: no ``cp.async`` of a
     query tile (the derive's ``st.shared.v4`` write it), the CTA-wide publish barrier ``bar.sync 4, 256`` (``2 + units`` over ``128 x units``)
     rendered AT the query-tile site in place of the per-unit one, the same release seam; no local memory in any arm.  (The probe runs from
     a file: the DSL needs the wrapper's source, which a ``-c`` program has not.)"""
@@ -536,15 +537,17 @@ def test_score_role_traces_the_standalone_shape_and_renders_the_fused_and_derive
     counts = {m.group(1): int(m.group(2)) for m in re.finditer(r"COUNT (\S.*?) (\d+)$", proc.stdout, re.M)}
     assert counts[".local"] == 0, counts
     if arm == "standalone":
-        assert counts["red.release"] == 0 and counts["fence.acq_rel.gpu"] == 0, counts
+        assert counts["red.release"] == 0 and counts["red.relaxed"] == 0 and counts["fence.acq_rel.gpu"] == 0, counts
         assert counts["bar.sync 0"] == 1 and counts["bar.sync 4, 256"] == 0 and counts["bar.sync %r, 128"] == 0, counts
         assert counts["cp.async.cg"] >= 1, counts
     elif arm == "fused":
-        assert counts["red.release"] == 1 and counts["fence.acq_rel.gpu"] == 1, counts  # S_q = 1: one red site, one fence
+        assert (
+            counts["red.relaxed"] == 1 and counts["red.release"] == 0 and counts["fence.acq_rel.gpu"] == 1
+        ), counts  # S_q = 1: one relaxed red site behind one fence
         assert counts["bar.sync %r, 128"] == 1 and counts["bar.sync 0"] == 0 and counts["bar.sync 4, 256"] == 0, counts
         assert counts["cp.async.cg"] >= 1, counts
     else:
-        assert counts["red.release"] == 1 and counts["fence.acq_rel.gpu"] == 1, counts
+        assert counts["red.relaxed"] == 1 and counts["red.release"] == 0 and counts["fence.acq_rel.gpu"] == 1, counts
         assert (
             counts["bar.sync 4, 256"] == 1 and counts["bar.sync 0"] == 0 and counts["bar.sync %r, 128"] == 0
         ), counts  # the publish barrier at the query-tile site

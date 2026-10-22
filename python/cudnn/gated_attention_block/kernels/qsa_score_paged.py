@@ -172,9 +172,9 @@ the kernel it was before the body moved (the test module's ``sm_107a`` cubin pin
 ``renderings/md5_qsa_score_paged_sm_107a.txt``).  A fused indexer kernel runs ``units`` of them per wider CTA from one SMEM union sized
 by :func:`score_smem_elems` (the unit's rings at ``unit x ring_elems_per_unit``, one shared query tile) and takes the ``fused`` /
 ``derive`` seams: the named barriers above (the unit's under ``fused``, the CTA-wide one under ``derive``), the ``counts`` write by the
-unit that scores chunk 0 alone, the per-row counter release after the CTA's last store (``gsync.release_add_rows``: one fence and one
-named barrier, then the ``S_q`` words' ``red.release`` by ONE elected lane) -- every thread of the CTA's units joins it and ONE warp of
-the CTA signals it, ``warp_gate = (unit == 0) & (warp_in_unit == 0)`` (``warp_in_unit == 0`` alone holds on one warp of EVERY unit and
+unit that scores chunk 0 alone, the per-row counter release after the CTA's last store (``gsync.release_add_rows``: one named barrier,
+then ONE elected lane's ``fence.acq_rel.gpu`` and the ``S_q`` words' ``red.relaxed`` -- gsync's release form) -- every thread of the
+CTA's units joins it and ONE warp of the CTA signals it, ``warp_gate = (unit == 0) & (warp_in_unit == 0)`` (``warp_in_unit == 0`` alone holds on one warp of EVERY unit and
 would arrive ``units`` times per CTA) --, the query tile and the completing compressed-key row derived in SMEM by unit 0's warps 0-2
 (:func:`_derive_indexer_rows`: the prepare's own helpers in the prepare's lane geometry) instead of copied from ``mQ``, the owning warp's
 lane-matched overwrite of the slot row holding that column.  The standalone kernel traces neither flag; the fused indexer kernel
@@ -244,6 +244,7 @@ from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 # geometry (the bitwise claim of the fused form rests on this); the standalone scorer folds the arm out and never traces them
 from .qk_norm_rope import ACCESS_BYTES, ELEMS_PER_ACCESS, lanes_per_row, vec_chunks
 from .qsa_compress import paged_block_row, ring_entry, ring_row_address, step_position
+from .qsa_indexer_fused import COUNTER_BAR_ID, SCORER_BAR_ID_BASE  # the fused CTA's named-barrier id space (the DSL-free front door allocates it)
 from .qsa_prepare import _rope_row_addrs, _step_row_position
 
 # the kernel's host-side facts live in the DSL-free front door (Rule 7: a declaration reads them without importing this module)
@@ -863,9 +864,10 @@ def score_role(
     """The scorer's body as a ROLE: one 4-warp unit scores chunk ``chunk_id`` of sequence ``b`` (module docstring).  The standalone kernel
     :func:`frost_qsa_score_paged` calls it once per CTA with ``unit = unit_smem_base = 0``, ``fused = derive = False`` and renders byte for
     byte what it rendered before the body moved here (the test module's cubin pin); a fused indexer kernel calls it per unit of a wider CTA
-    with the ids it decoded from its dispatch table.  The seams of the fused form sit behind the two ``Constexpr`` flags and are NOT
-    exercised by any served rendering yet (a ``fused`` or ``derive`` rendering raises ``NotImplementedError`` at trace time, by name);
-    ``l2_hint`` is the key copies' form (the module docstring's arm: the hinted copy where the DSL's compiler serves it, else the plain one):
+    with the ids it decoded from its dispatch table.  The seams of the fused form sit behind the two ``Constexpr`` flags: the fused indexer
+    kernel (``qsa_indexer_fused.py``) renders ``fused=True, derive=True`` in every served rendering, the standalone kernel folds both out
+    (the cubin pins), and the test module's seam cells trace each arm through a wrapper kernel; ``l2_hint`` is the key copies' form (the
+    module docstring's arm: the hinted copy where the DSL's compiler serves it, else the plain one):
 
     * ``fused``: the one intra-unit barrier is the unit's NAMED barrier ``bar.sync 2 + unit, 128`` (ids 0 = the CTA barrier and 1 = the
       counters' barrier of the fused kernel's table stay free; every thread of the unit issues it once, SUM = 128 == the count) instead of
@@ -874,12 +876,12 @@ def score_role(
       ``cnt_row_ptr`` are released -- every thread of the CTA's units joins each release and ONE warp of the CTA signals it: the gate is
       ``(unit == 0) & (warp_in_unit == 0)``, never ``warp_in_unit == 0`` alone (inside this role ``warp`` is the warp INSIDE the unit, so that
       predicate holds on one warp of EVERY unit: ``units`` elected lanes per CTA, the ledger's ``1 lane x n_chunks`` violated as
-      ``units x n_chunks``) -- UNCONDITIONAL (a dead sequence arrives too); the release site is the stub below until the fused kernel lands
-      with its counter module;
+      ``units x n_chunks``) -- UNCONDITIONAL (a dead sequence arrives too); the release is ``gsync.release_add_rows`` at the end of the
+      role (one named barrier, then the elected lane's one ``fence.acq_rel.gpu`` and ``S_q`` ``red.relaxed`` sites);
     * ``derive``: the (s, h) query tile is derived in SMEM by the unit's warps from the step's slab band (no ``cp.async`` from ``mQ``, which
       is None), and the barrier at the site above is the CTA-wide ``bar.sync 2 + units, 128 x units`` in place of the per-unit one (the
       publish barrier of the derive's ``st.shared``: one barrier at that site serves every unit; the per-unit one would order nothing
-      there) -- the derivation is the stub below until the fused kernel lands.
+      there) -- the derivation is :func:`_derive_indexer_rows` (unit 0's warps 0-2, in the prologue below).
 
     SMEM is the CALLER's: ``sK`` holds the CTA's rings and this unit's four start at ``unit_smem_base`` (a base offset, not an allocation of
     its own), ``sA`` the CTA's one query tile."""
@@ -1032,14 +1034,15 @@ def score_role(
     else:
         cute.arch.cp_async_wait_group(0)  # a dead warp has only the query-tile group in flight
     if cutlass.const_expr(fused and derive):
-        # the fused form under derive: the CTA-wide PUBLISH barrier (bar.sync 2 + units, 128 x units) at the one intra-CTA site -- the derive
-        # warps' st.shared of the query tile (and the completing row) become visible to every unit's fragment reads; the per-unit barrier
-        # below would order nothing here (no query-tile cp.async under derive, the key rings are per-warp), so one barrier serves both jobs
-        cute.arch.barrier(barrier_id=2 + units, number_of_threads=THREADS * units)
+        # the fused form under derive: the CTA-wide PUBLISH barrier (bar.sync SCORER_BAR_ID_BASE + units, 128 x units) at the one intra-CTA
+        # site -- the derive warps' st.shared of the query tile (and the completing row) become visible to every unit's fragment reads; the
+        # per-unit barrier below would order nothing here (no query-tile cp.async under derive, the key rings are per-warp), so one barrier
+        # serves both jobs (the id space is the fused front door's: 0 the CTA barrier, COUNTER_BAR_ID the counters, SCORER_BAR_ID_BASE .. ours)
+        cute.arch.barrier(barrier_id=SCORER_BAR_ID_BASE + units, number_of_threads=THREADS * units)
     elif cutlass.const_expr(fused):
-        # the fused form without derive: the unit's NAMED barrier (bar.sync 2 + unit, 128), every thread of the unit once -- the unit's own
-        # query-tile copies visible to its fragment reads
-        cute.arch.barrier(barrier_id=cutlass.Int32(2) + unit, number_of_threads=THREADS)
+        # the fused form without derive: the unit's NAMED barrier (bar.sync SCORER_BAR_ID_BASE + unit, 128), every thread of the unit once --
+        # the unit's own query-tile copies visible to its fragment reads
+        cute.arch.barrier(barrier_id=cutlass.Int32(SCORER_BAR_ID_BASE) + unit, number_of_threads=THREADS)
     else:
         cute.arch.barrier()  # the ONE CTA barrier: every thread's query-tile copies visible to every thread's fragment reads below
     # the A fragments from the staged tile: frag_a[t][half] = the 16 words of rows g / g + 8 of m-tile t
@@ -1105,7 +1108,7 @@ def score_role(
                     # publishes the slot to the reader lanes -- the owning warp's 16 copying lanes of row r_new overwrite their own granule
                     # with the completing row from sNew (no second warp sync, never a CTA barrier)
                     if owns_new & (i_new == cutlass.Int32(i)):
-                        if lane_row == new_half:  # bf16: lane_row = the lane's row parity in its 2-row copy (the derive arm is the bf16 form)
+                        if lane_row == new_half:  # bf16: lane_row = the copying lane's row parity in its 2-row copy (the derive arm is the bf16 form)
                             v_new = sNew.load(c_lane * cutlass.Int32(_WORDS_PER_CHUNK), vector_size=4, alignment=16)
                             sK.store(v_new, ring_elems + cutlass.Int32((i % ring_slots) * slot_elems) + new_row_elems, vector_size=4, alignment=16)
                 cute.arch.sync_warp()  # the copies of the OTHER lanes visible; last step's fragment reads ordered before the slot's reuse below
@@ -1220,10 +1223,10 @@ def score_role(
     if cutlass.const_expr(fused):
         # the fused form's release site: after the CTA's last logits / counts store (the live and the dead warps alike -- the arrival count
         # is the protocol's, never the data's), every thread of the CTA's units joins ONE release of the S_q consecutive counter words at
-        # cnt_row_ptr (one fence.acq_rel.gpu by every thread, one named barrier id 1 over 128 x units threads, then S_q
-        # red.release.gpu.global.add.u64 by ONE elected lane); the gate names ONE warp of the whole CTA -- warp_in_unit == 0 alone would
+        # cnt_row_ptr (one named barrier, COUNTER_BAR_ID = 1, over 128 x units threads, then ONE elected lane's fence.acq_rel.gpu and S_q
+        # red.relaxed.gpu.global.add.u64 -- gsync's release form); the gate names ONE warp of the whole CTA -- warp_in_unit == 0 alone would
         # signal once per unit: units x n_chunks arrivals on a word whose target is n_chunks
-        release_add_rows(cnt_row_ptr, s_q, 1, warp_gate=(unit == zero_i) & (warp == zero_i), bar_id=1, bar_threads=THREADS * units)
+        release_add_rows(cnt_row_ptr, s_q, 1, warp_gate=(unit == zero_i) & (warp == zero_i), bar_id=COUNTER_BAR_ID, bar_threads=THREADS * units)
 
 
 @cute.kernel

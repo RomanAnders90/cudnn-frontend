@@ -220,6 +220,8 @@ from cudnn.frost.tile_dsl.tma import ld_global, st_global
 from cutlass.cute.arch.nvvm_wrappers import inline_ptx
 from cutlass.experimental import primitives as nvvm
 
+from .qsa_indexer_fused import COUNTER_BAR_ID  # the fused CTA's named-barrier id space (the DSL-free front door allocates it)
+
 __all__ = [
     "FROST_SOURCE_DIGEST",
     "QSA_TOPK_DECODE_MAX_K",
@@ -504,7 +506,7 @@ def _fused_counter_seam(
         cnt_row_ptr,
         cnt_target,
         warp_gate=warp == zero,
-        bar_id=1,
+        bar_id=COUNTER_BAR_ID,
         bar_threads=threads_per_cta,
         deadline_ns=deadline_ns,
         diag_addr=diag_addr,

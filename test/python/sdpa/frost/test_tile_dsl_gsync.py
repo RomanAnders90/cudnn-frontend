@@ -1,24 +1,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""``tile_dsl.gsync`` -- the grid-scope counter primitives (``release_add`` / ``acquire_geq`` / ``last_arriver``).
+"""``tile_dsl.gsync`` -- the grid-scope counter primitives (``release_add`` / ``release_add_rows`` / ``acquire_geq`` / ``last_arriver``).
 
 Tiers, one probe kernel (``_PROBE_SRC``, written to ``tmp_path`` and run in a subprocess so a trap or a sticky context
 cannot poison the pytest session; the same source is the device smoke of the development runner):
 
-* tier 0 (pure host): the three entries take ``warp_gate`` keyword-only without a default; a Python-constant gate and a
+* tier 0 (pure host): the four entries take ``warp_gate`` keyword-only without a default; a Python-constant gate and a
   missing gate are refused at trace time; the counter-line helper.
 * tier 1 (any box whose cutlass-dsl knows the arch): the sm_107a and sm_100a trace-compiles of the RENDEZVOUS probe
-  (every entry in one kernel) carry ``red.release.gpu.global.add.u64`` / ``ld.acquire.gpu.global.u64`` /
-  ``atom.acq_rel.gpu.global.add.u64`` / ``fence.acq_rel.gpu``, the ``fence.proxy.async.global`` arm only when asked,
-  ``%globaltimer`` + ``trap`` only with a deadline, ``nanosleep.u32`` in the poll, the named barriers, NO
-  ``.release.cluster`` and NO ``.acquire.cluster``; the modulus form carries no reset store.
+  (every single-word entry in one kernel) carry ``red.relaxed.gpu.global.add.u64`` behind ``fence.acq_rel.gpu`` (the
+  release form: NO ``red.release`` anywhere) / ``ld.acquire.gpu.global.u64`` / ``atom.acq_rel.gpu.global.add.u64``, the
+  ``fence.proxy.async.global`` arm only when asked, ``%globaltimer`` + ``trap`` only with a deadline, ``nanosleep.u32`` in
+  the poll, the named barriers, NO ``.release.cluster`` and NO ``.acquire.cluster``; the modulus form carries no reset
+  store; the ROWS probe carries exactly 4 relaxed red sites for one ``release_add_rows(..., 4, ...)`` call.
 * tier 2 (an SM100-line GPU): ORDINARY launches of 212 and 424 CTAs with a 209 KiB dynamic-SMEM footprint (one CTA per
   SM, so 424 CTAs are two or more waves on every part of the line): the last arriver (target and modulus forms) and the
   chained release / acquire complete N back-to-back launches on ONE buffer with every CTA's rank a permutation of
   ``0 .. grid - 1`` per launch (the self-reset holds), the last arriver reading every peer's payload; a CUDA-graph
-  capture + replay of both; a co-resident rendezvous at the SM count; and the deadline that traps (exit 4 with the
-  seam code in the pinned diagnostic) instead of hanging.
+  capture + replay of both; a co-resident rendezvous at the SM count; the deadline that traps (exit 4 with the
+  seam code in the pinned diagnostic) instead of hanging; and the ROWS arm -- ``grid / 5`` producer CTAs each releasing
+  4 consecutive words with ONE ``release_add_rows``, ``4 x grid / 5`` consumer CTAs each acquiring one word and resetting
+  it (more CTAs than SMs: the consumers past the resident capacity terminate too), ordinary launches and a graph replay.
 """
 
 import importlib.util
@@ -36,7 +39,7 @@ from frost_test_utils import arch_known_to_the_dsl, requires_blackwell, requires
 pytestmark = [pytest.mark.L0, requires_dsl]
 
 _PROBE_SRC = textwrap.dedent('''
-    """gsync probe: one kernel, five device arms + two trace-time refusal arms + the PTX pins (module docstring of the test).
+    """gsync probe: one kernel, six device arms + two trace-time refusal arms + the PTX pins (module docstring of the test).
 
     Barrier table of the probe (named barrier 1 = the whole 128-thread CTA = the role; every entry is called by all 128 threads):
       bar.sync 1, 128  inside release_add / acquire_geq / last_arriver, CTA-uniform call sites only.
@@ -44,7 +47,9 @@ _PROBE_SRC = textwrap.dedent('''
       cnt      (line 0): LA arms 1 lane x grid == grid (target form resets; modulus form monotonic); CHAIN: 1 lane x (grid - 1)
                releases, the provably-last CTA stores 0; RENDEZVOUS: 1 lane x grid == grid, stored 0 by the last finisher.
       epoch    (line 1): written by exactly one thread per launch after every CTA has read it (the last arriver / the chain's last CTA).
-      cnt_done (line 2): RENDEZVOUS only, 1 lane x grid == grid (target form, self-reset).
+      cnt_done (line 2): RENDEZVOUS / ROWS, 1 lane x <arriving CTAs> == the count (target form, self-reset).
+      rows     (lines 3..): ROWS only, 4 x P words (P = grid / 5 producers): 1 lane x 1 producer == 1 per word (one release_add_rows
+               of 4 words per producer), reset by the word's one consumer right after its acquire.
     """
     import cuda.bindings.driver as cuda
     import cutlass
@@ -53,18 +58,20 @@ _PROBE_SRC = textwrap.dedent('''
     from cutlass.cute.arch.nvvm_wrappers import inline_ptx
     from cutlass.experimental import primitives as nvvm
 
-    from cudnn.frost.tile_dsl.gsync import COUNTER_WORDS_PER_LINE, acquire_geq, counter_store_u64, counter_word_offset, last_arriver, release_add
+    from cudnn.frost.tile_dsl.gsync import COUNTER_WORDS_PER_LINE, acquire_geq, counter_store_u64, counter_word_offset, last_arriver, release_add, release_add_rows
 
     I32, I64 = cutlass.Int32, cutlass.Int64
     THREADS = 128
     BAR_ROLE = 1
-    MODE_LA_TARGET, MODE_LA_MODULUS, MODE_CHAIN, MODE_RENDEZVOUS, MODE_TRAP, MODE_BAD_GATE, MODE_MISSING_GATE = range(7)
+    MODE_LA_TARGET, MODE_LA_MODULUS, MODE_CHAIN, MODE_RENDEZVOUS, MODE_TRAP, MODE_BAD_GATE, MODE_MISSING_GATE, MODE_ROWS = range(8)
     MODES = {"la_target": MODE_LA_TARGET, "la_modulus": MODE_LA_MODULUS, "chain": MODE_CHAIN, "rendezvous": MODE_RENDEZVOUS, "trap": MODE_TRAP,
-             "bad_gate": MODE_BAD_GATE, "missing_gate": MODE_MISSING_GATE}
-    OFF_CNT, OFF_EPOCH, OFF_DONE = counter_word_offset(0), counter_word_offset(1), counter_word_offset(2)
+             "bad_gate": MODE_BAD_GATE, "missing_gate": MODE_MISSING_GATE, "rows": MODE_ROWS}
+    OFF_CNT, OFF_EPOCH, OFF_DONE, OFF_ROWS = counter_word_offset(0), counter_word_offset(1), counter_word_offset(2), counter_word_offset(3)
     COUNTER_WORDS = 3 * COUNTER_WORDS_PER_LINE
+    ROWS_PER_PRODUCER = 4  # the words one producer releases with ONE release_add_rows; one consumer CTA per word
+    ROWS_CTAS_PER_PRODUCER = 1 + ROWS_PER_PRODUCER  # grid = 5 x P: P producers first, then 4 P consumers
     PAT_MUL = 1000003
-    TRAP_CODE, CHAIN_CODE, RDV_CODE = 7, 2, 3
+    TRAP_CODE, CHAIN_CODE, RDV_CODE, ROWS_CODE = 7, 2, 3, 4
 
 
     @cute.jit
@@ -158,6 +165,37 @@ _PROBE_SRC = textwrap.dedent('''
                 if tidx == I32(0):
                     counter_store_u64(cnt, I64(0))
                     st_u64(epoch_addr, epoch + I64(1))
+        elif cutlass.const_expr(mode == MODE_ROWS):
+            # P = grid / 5 producers first (in-order dispatch: every consumer's producer is dispatched before it), then 4 P consumers.
+            # Producer p writes payload words 4 p .. 4 p + 3 and releases its 4 CONSECUTIVE counter words with ONE release_add_rows;
+            # consumer q = bid - P acquires word q (target 1), reads payload q, resets the word (its only reader this launch), and the
+            # consumers' last arriver on cnt_done bumps the epoch
+            n_prod = grid // I32(ROWS_CTAS_PER_PRODUCER)
+            rows_base = cnt_base + I64(OFF_ROWS)
+            if bid < n_prod:
+                if tidx < I32(ROWS_PER_PRODUCER):
+                    w = I64(bid) * I64(ROWS_PER_PRODUCER) + I64(tidx)
+                    st_u64(payload + w * I64(8), epoch * I64(PAT_MUL) + w * I64(7) + I64(1))
+                if tidx == I32(0):
+                    st_u64(olds + (epoch * grid64 + I64(bid)) * I64(8), I64(bid))
+                release_add_rows(rows_base + I64(bid) * I64(ROWS_PER_PRODUCER * 8), ROWS_PER_PRODUCER, 1, warp_gate=gate, bar_id=BAR_ROLE, bar_threads=THREADS,
+                                 async_proxy=async_proxy)
+            else:
+                q = (bid - n_prod).to(I64)
+                word = rows_base + q * I64(8)
+                if cutlass.const_expr(with_deadline):
+                    acquire_geq(word, 1, warp_gate=gate, bar_id=BAR_ROLE, bar_threads=THREADS, async_proxy=async_proxy,
+                                deadline_ns=deadline_ns, diag_addr=diag, code=ROWS_CODE)
+                else:
+                    acquire_geq(word, 1, warp_gate=gate, bar_id=BAR_ROLE, bar_threads=THREADS, async_proxy=async_proxy)
+                if tidx == I32(0):
+                    st_u64(chk + (epoch * grid64 + I64(bid)) * I64(8), ld_u64(payload + q * I64(8)))
+                    counter_store_u64(word, I64(0))
+                    st_u64(olds + (epoch * grid64 + I64(bid)) * I64(8), I64(bid))
+                is_last, old = last_arriver(cnt_done, grid - n_prod, warp_gate=gate, flag_smem=flag, bar_id=BAR_ROLE, bar_threads=THREADS)
+                if is_last:
+                    if tidx == I32(0):
+                        st_u64(epoch_addr, epoch + I64(1))
         elif cutlass.const_expr(mode == MODE_TRAP):
             # a target no release ever reaches: the deadline must end the launch with TRAP_CODE in the pinned diag
             acquire_geq(cnt, I64(1) << 40, warp_gate=gate, bar_id=BAR_ROLE, bar_threads=THREADS, deadline_ns=deadline_ns, diag_addr=diag, code=TRAP_CODE)
@@ -179,7 +217,7 @@ _PROBE_SRC = textwrap.dedent('''
 
 
     # ------------------------------------------------------------------ host side ------------------------------------------------------------------
-    PTX_PINS = (("RED_RELEASE_GPU", "red.release.gpu.global.add.u64"), ("LD_ACQUIRE_GPU", "ld.acquire.gpu.global.u64"),
+    PTX_PINS = (("RED_RELAXED_GPU", "red.relaxed.gpu.global.add.u64"), ("RED_RELEASE_GPU", "red.release"), ("LD_ACQUIRE_GPU", "ld.acquire.gpu.global.u64"),
                 ("ATOM_ACQ_REL_GPU", "atom.acq_rel.gpu.global.add.u64"), ("FENCE_ACQ_REL_GPU", "fence.acq_rel.gpu"),
                 ("FENCE_PROXY_ASYNC_GLOBAL", "fence.proxy.async.global"), ("FENCE_SC_SYS", "fence.sc.sys"), ("RELEASE_CLUSTER", ".release.cluster"),
                 ("ACQUIRE_CLUSTER", ".acquire.cluster"), ("NANOSLEEP", "nanosleep.u32"), ("GLOBALTIMER", "%globaltimer"), ("TRAP", "trap;"),
@@ -229,7 +267,12 @@ _PROBE_SRC = textwrap.dedent('''
         props = torch.cuda.get_device_properties(dev)
         with_deadline = deadline_s is not None
         smem_bytes = int(smem_kib) * 1024
-        counters = torch.zeros(COUNTER_WORDS, dtype=torch.int64, device=dev)  # the plan-side zero (once, before the first launch)
+        if mode == MODE_ROWS and (grid < ROWS_CTAS_PER_PRODUCER or grid % ROWS_CTAS_PER_PRODUCER):
+            raise SystemExit(f"the rows arm needs grid = {ROWS_CTAS_PER_PRODUCER} x P (P producers, {ROWS_PER_PRODUCER} P consumers), got {grid}")
+        n_prod = grid // ROWS_CTAS_PER_PRODUCER if mode == MODE_ROWS else 0
+        n_rows_words = ROWS_PER_PRODUCER * n_prod
+        n_words = COUNTER_WORDS + -(-n_rows_words // COUNTER_WORDS_PER_LINE) * COUNTER_WORDS_PER_LINE  # whole lines behind the three classes
+        counters = torch.zeros(n_words, dtype=torch.int64, device=dev)  # the plan-side zero (once, before the first launch)
         payload = torch.zeros(max(grid, 1), dtype=torch.int64, device=dev)
         olds = torch.full((launches, max(grid, 1)), -1, dtype=torch.int64, device=dev)
         # the LA arms record 128 per-thread partials per launch (row stride THREADS); the chain / rendezvous arms one word per CTA (row stride grid)
@@ -307,6 +350,19 @@ _PROBE_SRC = textwrap.dedent('''
             res.update({"cnt_after": int(c[OFF_CNT // 8]), "cnt_done_after": int(c[OFF_DONE // 8]), "epoch_after": int(c[OFF_EPOCH // 8])})
             if int(c[OFF_CNT // 8]) != 0 or int(c[OFF_DONE // 8]) != 0 or int(c[OFF_EPOCH // 8]) != launches:
                 bad.append(f"counters after: cnt {int(c[OFF_CNT // 8])} cnt_done {int(c[OFF_DONE // 8])} epoch {int(c[OFF_EPOCH // 8])}")
+        elif mode == MODE_ROWS:
+            q = torch.arange(n_rows_words, dtype=torch.int64)
+            for e in range(launches):
+                if not torch.equal(o[e], ar):
+                    bad.append(f"launch {e}: not every CTA recorded itself: {o[e][:8].tolist()}...")
+                want = e * PAT_MUL + 7 * q + 1  # consumer q read the payload word q its producer wrote before the multi-row release
+                if not torch.equal(k[e, n_prod:grid], want):
+                    bad.append(f"launch {e}: acquired payload mismatch at {(k[e, n_prod:grid] != want).nonzero().flatten()[:8].tolist()}")
+            rows_after = c[OFF_ROWS // 8 : OFF_ROWS // 8 + n_rows_words]
+            res.update({"rows_nonzero_after": int((rows_after != 0).sum()), "cnt_done_after": int(c[OFF_DONE // 8]), "epoch_after": int(c[OFF_EPOCH // 8]),
+                        "producers": n_prod, "words": n_rows_words})
+            if int((rows_after != 0).sum()) or int(c[OFF_DONE // 8]) != 0 or int(c[OFF_EPOCH // 8]) != launches:
+                bad.append(f"counters after: {int((rows_after != 0).sum())} row words non-zero, cnt_done {int(c[OFF_DONE // 8])}, epoch {int(c[OFF_EPOCH // 8])} (want 0 / 0 / {launches})")
         elif mode == MODE_TRAP:
             bad.append("the deadline did not trap: the launch completed")
         res.update({"ok": not bad, "bad": bad[:12], "n_bad": len(bad), "trapped": False})
@@ -437,17 +493,18 @@ def test_over_arrival_cannot_be_written(tmp_path, mode):
 @pytest.mark.parametrize("arch", ARCHES)
 @pytest.mark.parametrize("async_proxy,deadline", [(True, True), (False, False)], ids=["async+deadline", "production"])
 def test_ptx_forms_of_the_three_entries(tmp_path, arch, async_proxy, deadline):
-    """The RENDEZVOUS probe holds every entry: release_add -> ``red.release.gpu``; acquire_geq -> ``ld.acquire.gpu`` +
-    ``nanosleep``; last_arriver -> ``atom.acq_rel.gpu`` + the reset store; ``fence.acq_rel.gpu`` on both recipes; the
-    ``fence.proxy.async.global`` arm and the ``%globaltimer`` / ``trap`` / ``fence.sc.sys`` deadline only when asked; the
-    named barrier; NO ``.release.cluster`` / ``.acquire.cluster`` anywhere."""
+    """The RENDEZVOUS probe holds every single-word entry: release_add -> ``fence.acq_rel.gpu`` + ``red.relaxed.gpu`` (the release
+    form; NO ``red.release`` anywhere); acquire_geq -> ``ld.acquire.gpu`` + ``nanosleep``; last_arriver -> ``atom.acq_rel.gpu`` + the
+    reset store + the last arriver's ``fence.acq_rel.gpu``; the ``fence.proxy.async.global`` arm and the ``%globaltimer`` / ``trap`` /
+    ``fence.sc.sys`` deadline only when asked; the named barrier; NO ``.release.cluster`` / ``.acquire.cluster`` anywhere."""
     if not arch_known_to_the_dsl(arch):
         pytest.skip(f"this cutlass-dsl has no {arch}")
     proc, c = _ptx(tmp_path, arch, "rendezvous", async_proxy=async_proxy, deadline=deadline)
     assert proc.returncode == 0 and f"COMPILED {arch}" in proc.stdout, f"{arch} trace-compile failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}"
     print(f"\n[{arch} async={async_proxy} deadline={deadline}] {c}")
-    assert c["RED_RELEASE_GPU"] >= 1 and c["LD_ACQUIRE_GPU"] >= 1 and c["ATOM_ACQ_REL_GPU"] >= 1, c
-    assert c["FENCE_ACQ_REL_GPU"] >= 2, c
+    assert c["RED_RELAXED_GPU"] >= 1 and c["LD_ACQUIRE_GPU"] >= 1 and c["ATOM_ACQ_REL_GPU"] >= 1, c
+    assert c["RED_RELEASE_GPU"] == 0, f"a release-qualified red is a membar per site; the release form is the fence + a relaxed red: {c}"
+    assert c["FENCE_ACQ_REL_GPU"] >= 2, c  # the release_add site (the elected lane) and the last arriver's acquire-side fence
     assert c["RELEASE_CLUSTER"] == 0 and c["ACQUIRE_CLUSTER"] == 0, f"a cluster-scope release / acquire is a kernel-wide drain: {c}"
     assert c["NANOSLEEP"] >= 1 and c["ELECT_SYNC"] >= 1 and c["BAR_SYNC_ROLE"] >= 4, c
     assert c["RESET_STORE"] >= 1, f"the target-form last arriver must store the counter back to zero: {c}"
@@ -459,6 +516,19 @@ def test_ptx_forms_of_the_three_entries(tmp_path, arch, async_proxy, deadline):
         assert c["GLOBALTIMER"] >= 2 and c["TRAP"] >= 1 and c["FENCE_SC_SYS"] >= 1, c
     else:
         assert c["GLOBALTIMER"] == 0 and c["TRAP"] == 0 and c["FENCE_SC_SYS"] == 0, f"a production render carries no deadline: {c}"
+
+
+def test_ptx_form_of_the_multi_row_release(tmp_path):
+    """The ROWS probe: ONE ``release_add_rows(..., 4, ...)`` renders exactly 4 ``red.relaxed.gpu.global.add.u64`` sites (the census's
+    figure: one per word), no ``red.release``, ``fence.acq_rel.gpu`` on the elected lane (one site) plus the consumers' last
+    arriver's, the acquire + the reset store of the consumer, no cluster scope."""
+    if not arch_known_to_the_dsl("sm_107a"):
+        pytest.skip("this cutlass-dsl has no sm_107a (needs >= 4.8.0)")
+    proc, c = _ptx(tmp_path, "sm_107a", "rows")
+    assert proc.returncode == 0, proc.stderr[-3000:]
+    assert c["RED_RELAXED_GPU"] == 4 and c["RED_RELEASE_GPU"] == 0, c
+    assert c["FENCE_ACQ_REL_GPU"] >= 2 and c["LD_ACQUIRE_GPU"] >= 1 and c["RESET_STORE"] >= 1 and c["ATOM_ACQ_REL_GPU"] == 1, c
+    assert c["RELEASE_CLUSTER"] == 0 and c["ACQUIRE_CLUSTER"] == 0, c
 
 
 def test_ptx_modulus_form_never_resets(tmp_path):
@@ -512,6 +582,20 @@ def test_graph_capture_and_replay(tmp_path, mode):
     """One capture, ``DEVICE_LAUNCHES`` replays of the same node: every replay's records are correct and the counters self-reset."""
     proc, res = _device_run(tmp_path, mode, 212, DEVICE_LAUNCHES, "--graph")
     assert proc.returncode == 0 and res["ok"], f"{mode} graph replay: {res.get('bad') or res}"
+
+
+@requires_blackwell
+@pytest.mark.parametrize("grid,graph", [(320, False), (160, True)], ids=["ordinary_320", "graph_160"])
+def test_multi_row_release_feeds_one_consumer_per_word(tmp_path, grid, graph):
+    """``release_add_rows``: ``grid / 5`` producer CTAs each release 4 consecutive words with ONE call, ``4 x grid / 5`` consumer CTAs
+    each acquire one word, read the payload its producer wrote before the release and reset the word.  320 CTAs at 209 KiB (one per
+    SM) exceed the resident capacity of every SM100-line part, so consumers past the first wave terminate too; the graph cell
+    replays one capture.  ``DEVICE_LAUNCHES`` launches on ONE buffer: every payload read back bitwise, every row word zero after."""
+    proc, res = _device_run(tmp_path, "rows", grid, DEVICE_LAUNCHES, *(["--graph"] if graph else []))
+    assert proc.returncode == 0 and res["ok"], f"rows grid {grid} graph {graph}: {res.get('bad') or res}"
+    assert res["rows_nonzero_after"] == 0 and res["words"] == 4 * (grid // 5), res
+    if not graph:
+        assert res["sms"] < grid, f"the 320-CTA cell must be more than one wave to make the point (SMs {res['sms']})"
 
 
 @requires_blackwell

@@ -177,6 +177,13 @@ def test_mirrored_constants_equal_the_kernels_own():
     for d in (64, 128, 256, 512):
         assert F._lanes_per_row(d) == qk_norm_rope.lanes_per_row(d)
     assert F._SCORE_ROW_ALIGN == SP._SCORE_ROW_ALIGN
+    # the fused CTA's named-barrier id space is spelled ONCE (the front door) and read by both roles; the ceiling holds at the widest served units
+    from cudnn.frost.tile_dsl import gsync
+    from cudnn.gated_attention_block.kernels import qsa_score_paged
+
+    assert F.COUNTER_BAR_ID == gsync._BAR_ID_MIN == 1 and F.SCORER_BAR_ID_BASE == 2 and F._BAR_ID_MAX == gsync._BAR_ID_MAX == 15
+    assert qsa_score_paged.COUNTER_BAR_ID == qsa_topk_decode.COUNTER_BAR_ID == F.COUNTER_BAR_ID and qsa_score_paged.SCORER_BAR_ID_BASE == F.SCORER_BAR_ID_BASE
+    assert F.SCORER_BAR_ID_BASE + max(F.SCORER_UNIT_CHOICES) <= F._BAR_ID_MAX
     for n in (1, 8, 520, 1024, 2048, 8192, 32768, 65536):
         for thr in F.FUSED_THREAD_COUNTS:
             assert F.topk_cols_cap(n, thr) == qsa_topk_decode.cols_cap_for(n, 1, thr)
@@ -199,27 +206,46 @@ def test_scorer_smem_follows_the_standalone_per_unit_and_the_union():
 
 
 @pytest.mark.parametrize(
-    "b,s_q,kv_tokens,units,expect,waves",
+    "b,s_q,kv_tokens,units,threads,expect,waves",
     [
-        (1, 1, 8192, 1, (1, 16, 1, 18), 1),
-        (1, 1, 32768, 1, (1, 64, 1, 66), 1),
-        (1, 1, 131072, 2, (1, 128, 1, 130), 1),
-        (4, 1, 8192, 1, (4, 16, 1, 72), 1),
-        (4, 1, 32768, 2, (4, 32, 1, 136), 1),
-        (4, 1, 131072, 4, (4, 64, 1, 264), 2),
-        (1, 4, 8192, 1, (4, 16, 4, 24), 1),
-        (4, 4, 8192, 1, (15, 16, 4, 95), 1),
-        (32, 1, 8192, 8, (29, 2, 1, 125), 1),
-        (32, 1, 32768, 8, (29, 8, 1, 317), 2),
-        (32, 1, 131072, 8, (29, 32, 1, 1085), 6),
-        (32, 4, 8192, 8, (114, 2, 4, 306), 2),
-        (32, 4, 32768, 8, (114, 8, 4, 498), 3),
-        (32, 4, 131072, 8, (114, 32, 4, 1266), 6),
+        # the DEFAULT 512-thread form (W = 16 warps per CTA; units <= 4): the served routes
+        (1, 1, 8192, 1, 512, (2, 16, 1, 19), 1),
+        (1, 1, 32768, 1, 512, (2, 64, 1, 67), 1),
+        (1, 1, 131072, 2, 512, (2, 128, 1, 131), 1),
+        (4, 1, 8192, 1, 512, (8, 16, 1, 76), 1),
+        (4, 1, 32768, 2, 512, (8, 32, 1, 140), 1),
+        (4, 1, 131072, 4, 512, (8, 64, 1, 268), 2),
+        (1, 4, 8192, 1, 512, (8, 16, 4, 28), 1),
+        (4, 4, 8192, 1, 512, (29, 16, 4, 109), 1),
+        (32, 1, 8192, 4, 512, (57, 4, 1, 217), 2),
+        (32, 1, 32768, 4, 512, (57, 16, 1, 601), 3),
+        (32, 1, 131072, 4, 512, (57, 64, 1, 2137), 11),
+        (32, 4, 8192, 4, 512, (228, 4, 4, 484), 3),
+        (32, 4, 32768, 4, 512, (228, 16, 4, 868), 5),
+        (32, 4, 131072, 4, 512, (228, 64, 4, 2404), 12),
+        # the 1024-thread knob (W = 32: R0 halves; 8 units per R1 CTA at B 32)
+        (1, 1, 8192, 1, 1024, (1, 16, 1, 18), 1),
+        (1, 1, 32768, 1, 1024, (1, 64, 1, 66), 1),
+        (1, 1, 131072, 2, 1024, (1, 128, 1, 130), 1),
+        (4, 1, 8192, 1, 1024, (4, 16, 1, 72), 1),
+        (4, 1, 32768, 2, 1024, (4, 32, 1, 136), 1),
+        (4, 1, 131072, 4, 1024, (4, 64, 1, 264), 2),
+        (1, 4, 8192, 1, 1024, (4, 16, 4, 24), 1),
+        (4, 4, 8192, 1, 1024, (15, 16, 4, 95), 1),
+        (32, 1, 8192, 8, 1024, (29, 2, 1, 125), 1),
+        (32, 1, 32768, 8, 1024, (29, 8, 1, 317), 2),
+        (32, 1, 131072, 8, 1024, (29, 32, 1, 1085), 6),
+        (32, 4, 8192, 8, 1024, (114, 2, 4, 306), 2),
+        (32, 4, 32768, 8, 1024, (114, 8, 4, 498), 3),
+        (32, 4, 131072, 8, 1024, (114, 32, 4, 1266), 6),
     ],
+    ids=lambda v: str(v) if not isinstance(v, tuple) else "x".join(str(x) for x in v),
 )
-def test_dispatch_rows_come_out_of_the_function(b, s_q, kv_tokens, units, expect, waves):
-    """The docstring's dispatch rows: R0 CTAs, R1 per sequence, R2 per sequence, the total, the waves at 212 SMs."""
-    tb = _table(b, s_q, kv_tokens // SP.BLOCK_SIZE, units, 1024)
+def test_dispatch_rows_come_out_of_the_function(b, s_q, kv_tokens, units, threads, expect, waves):
+    """The docstring's dispatch rows at the DEFAULT 512 threads (W = 16) and at the 1024-thread knob (W = 32): R0 CTAs, R1 per sequence,
+    R2 per sequence, the total, the waves at 212 SMs -- the rows the C4 route author and the gate read."""
+    assert F.DEFAULT_THREADS == 512, "the table's default rows are the 512-thread form"
+    tb = _table(b, s_q, kv_tokens // SP.BLOCK_SIZE, units, threads)
     assert (tb.n_prep_ctas, tb.n_chunks, tb.s_q, tb.n_ctas) == expect, tb
     assert tb.waves(SM_COUNT) == waves
 
@@ -335,10 +361,15 @@ def test_module_docstring_carries_the_pre_development_tables_and_the_contract():
     assert "LANE-MATCHED" in doc and "no second warp sync" in doc
     assert "rendered AT THE SAME SITE in place of the" in doc and "'bar.sync 0' at this site (fused=False)" in doc
     # the PTX census of the counter sites and of the PDL pairs
-    assert "red.release.gpu.global.add.u64 == S_q per R1 rendering" in doc and "``griddepcontrol.wait`` == 3" in doc
+    assert "red.relaxed.gpu.global.add.u64 == S_q per R1 rendering" in doc and "no red.release anywhere" in doc and "``griddepcontrol.wait`` == 3" in doc
+    assert (
+        "fence.acq_rel.gpu == 1" in doc and "ONE elected lane: fence.acq_rel.gpu once" in doc
+    ), "the release form: the barrier, then the elected lane's fence + relaxed reds"
+    assert "``DEFAULT_THREADS`` = 512" in doc and "the 1024-thread knob" in doc, "the dispatch header names the default block size and the knob"
     assert "after ``prepare_role`` returns" in doc and "every node of the programmatic chain" in doc
     # the SMEM union and the two derive sites
     assert "sNew" in doc and "sA" in doc and "260.3 KiB" in doc and "113.4 KiB" in doc and "196 KiB" in doc and "OVERSIZED" in doc
+    assert "73.4 KiB" in doc and "132.3 KiB" in doc and "512 x 128 = the file" in doc, "the union row names the default form's figures"
     # the assumption, its detectors and its denial
     assert "non-decreasing linear ``blockIdx`` order" in doc and "NOT: a CUDA programming-model guarantee" in doc
     assert "deadline_ns" in doc and "consumers-first" in doc and "consumers-first-global" in doc
@@ -354,7 +385,8 @@ def test_module_docstring_carries_the_pre_development_tables_and_the_contract():
 
 def test_served_entries_gate_before_the_kernel_module(monkeypatch):
     """The two served entries keep Rule 7's order: the DSL floor is read FIRST (a modeled sub-floor DSL is a typed decline naming it), the
-    form refusals of the fused declaration (the query arm, a step wider than the compress ratio, the mis-ordered table without the trap's
+    form refusals of the fused declaration (the query arm, a step wider than the compress ratio, a compress ratio other than the scorer's
+    block size, ``units_per_warp`` > 1 at the 1024-thread knob, the mis-ordered table without the trap's
     deadline) are typed and raised before the kernel module is imported; the compile keys stay in the docstrings (``cols_cap, top_k``, the
     test-only ``deadline_ns`` / ``check_arrivals``), the counter contract in the run entry's; the counter-word checks are DSL-free."""
     import sys
@@ -386,6 +418,20 @@ def test_served_entries_gate_before_the_kernel_module(monkeypatch):
         F.compile_qsa_indexer_fused(**dict(base, index=arms._replace(paged=False)))
     with pytest.raises(NotImplementedError, match="exceed the compress ratio pool"):
         F.compile_qsa_indexer_fused(**dict(base, s_q=5))
+    # the same reach in the DSL-free dispatch table (what the block's route reads at declaration): a step wider than the block size is not
+    # routed, a step of block_size rows is
+    with pytest.raises(ValueError, match="rows per sequence exceed the fused step's block size 4"):
+        F.dispatch_table(5, 1, 5, H_Q, H_KV, INDEX_HEADS, 2048, 1, 512)
+    assert F.dispatch_table(4, 1, 4, H_Q, H_KV, INDEX_HEADS, 2048, 1, 512).n_topk_ctas == 4
+    # the pool is pinned to the scorer's block size: pool 8 at S_q 1 passes the ratio gate alone (the review's case), pool 2 fails both
+    with pytest.raises(NotImplementedError, match="index.pool must be 4, got 8"):
+        F.compile_qsa_indexer_fused(**dict(base, index=arms._replace(pool=8), s_q=1))
+    with pytest.raises(NotImplementedError, match="index.pool must be 4, got 2"):
+        F.compile_qsa_indexer_fused(**dict(base, index=arms._replace(pool=2), s_q=1))
+    # the 1024-thread knob serves units_per_warp 1 alone (the register census: the scorer spills at 64 registers in every measured batch)
+    with pytest.raises(NotImplementedError, match="units_per_warp > 1 is served at 512 threads"):
+        F.compile_qsa_indexer_fused(**dict(base, threads=1024, units_per_warp=2))
+    assert F.scorer_mma_batch_for(1024, 1) == F.scorer_mma_batch_for(1024, 2) == F.SCORER_MMA_BATCH_AT_64_REGS and F.scorer_mma_batch_for(512, 2) == 0
     with pytest.raises(NotImplementedError, match="bf16 activations"):
         F.compile_qsa_indexer_fused(**dict(base, dtype=torch.float16))
     with pytest.raises(ValueError, match="served only with deadline_ns"):
@@ -998,7 +1044,7 @@ _RENDER_PROBE = textwrap.dedent("""
     DEV.oversized_shared_memory_per_block = lambda d: 334848
     keys = H.fused_compile_keys(H.FLASH_NEXT, s_q=kw["s_q"], page=kw["page"], n_blocks_max=kw["n_blocks_max"], units=kw["units"], threads=kw["threads"],
                                 use_pdl=kw.get("use_pdl", False), check_arrivals=kw.get("check_arrivals", False), deadline_ns=kw.get("deadline_ns"),
-                                roles=kw.get("roles"), order=kw.get("order"), device=0)
+                                roles=kw.get("roles"), order=kw.get("order"), units_per_warp=kw.get("units_per_warp", 1), device=0)
     with build_device(0):  # the compile key's device index, pinned: the trace needs no CUDA device (CUTE_DSL_ARCH names the target)
         try:
             F.compile_qsa_indexer_fused(**keys)
@@ -1012,7 +1058,8 @@ _RENDER_PROBE = textwrap.dedent("""
     """)
 
 _PTX_KEYS = (
-    "red.release.gpu.global.add.u64",
+    "red.relaxed.gpu.global.add.u64",
+    "red.release",
     "ld.acquire.gpu.global.u64",
     "nanosleep",
     "st.relaxed.gpu.global.u64",
@@ -1110,9 +1157,10 @@ _CENSUS_CELLS = [
 
 @pytest.mark.parametrize("tag,kw", _CENSUS_CELLS, ids=[c[0] for c in _CENSUS_CELLS])
 def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
-    """The counter sites of the tables in the sm_107a PTX: ``red.release.gpu.global.add.u64`` x S_q (the arrival count of the ledger, one
-    site per row of the sequence), ``ld.acquire.gpu.global.u64`` == 2 (+1 under ``check_arrivals``) with ``nanosleep`` beside it,
-    ``st.relaxed.gpu.global.u64`` == 1 (the reset), ``fence.acq_rel.gpu``; no ``.cluster``, no mbarrier, no bulk copy; no global atom and no
+    """The counter sites of the tables in the sm_107a PTX: ``red.relaxed.gpu.global.add.u64`` x S_q (the arrival count of the ledger, one
+    site per row of the sequence) behind exactly ONE ``fence.acq_rel.gpu`` (the elected lane's: gsync's release form -- no ``red.release``
+    anywhere), ``ld.acquire.gpu.global.u64`` == 2 (+1 under ``check_arrivals``) with ``nanosleep`` beside it,
+    ``st.relaxed.gpu.global.u64`` == 1 (the reset); no ``.cluster``, no mbarrier, no bulk copy; no global atom and no
     global red outside the gsync sites (the top-k's shared histogram atomics are counted separately); ``griddepcontrol`` 3 + 3 under the
     PDL key and 0 + 0 without; the deadline's ``%globaltimer`` / ``trap`` / ``fence.sc.sys`` only when armed; a named barrier over
     ``128 x units`` threads in the scorer role; no local memory at 8192 columns (the 32-key tile at 32768 x 1024 is allowed its few)."""
@@ -1120,12 +1168,12 @@ def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
     c = _census(ptx)
     print(f"\n[{tag}] {c}")
     s_q, units = kw["s_q"], kw["units"]
-    assert c["red.release.gpu.global.add.u64"] == s_q, c
+    assert c["red.relaxed.gpu.global.add.u64"] == s_q and c["red.release"] == 0, c
     assert c["ld.acquire.gpu.global.u64"] == 2 + (1 if kw.get("check_arrivals") else 0), c
-    assert c["nanosleep"] >= 1 and c["st.relaxed.gpu.global.u64"] == 1 and c["fence.acq_rel.gpu"] >= 1, c
+    assert c["nanosleep"] >= 1 and c["st.relaxed.gpu.global.u64"] == 1 and c["fence.acq_rel.gpu"] == 1, c  # ONE fence: the R1 elected lane's
     assert c["barrier.cluster"] == 0 and c[".cluster"] == 0 and c["mbarrier"] == 0 and c["cp.async.bulk"] == 0, c
     global_atoms = re.findall(r"\b(?:atom|red)\.[\w.]*global[\w.]*", ptx)
-    assert sorted(set(global_atoms)) == ["red.release.gpu.global.add.u64"] and len(global_atoms) == s_q, global_atoms
+    assert sorted(set(global_atoms)) == ["red.relaxed.gpu.global.add.u64"] and len(global_atoms) == s_q, global_atoms
     pdl = 3 if kw.get("use_pdl") else 0
     assert c["griddepcontrol.wait"] == pdl and c["griddepcontrol.launch_dependents"] == pdl, c
     armed = kw.get("deadline_ns") is not None
@@ -1142,33 +1190,51 @@ def test_ptx_census_of_the_fused_rendering(tmp_path, tag, kw):
 
 _ROLE_PIN_DSL = ("nvidia-cutlass-dsl 4.8.0", "ptxas 13.4.59")  # the DSL build (the distribution string, the bundled assembler) the figures were taken under
 _ROLE_PINS = [
-    # (role, units, threads, (STL, LDL)) of the role-isolated sm_107a rendering at S_q 1 and 8192 columns: the register census's figures, EXACT
-    ("prepare", 1, 512, (0, 0)),
-    ("scorer", 1, 512, (0, 0)),
-    ("scorer", 2, 512, (0, 0)),
-    ("scorer", 4, 512, (0, 0)),
-    ("topk", 1, 512, (0, 0)),
-    ("prepare", 1, 1024, (0, 0)),
-    ("scorer", 1, 1024, (0, 0)),
-    ("scorer", 2, 1024, (0, 0)),
-    ("scorer", 8, 1024, (1, 1)),  # the knob's recorded pair at 64 registers (the scorer at MMA batch 1): the figure that made 512 the default
-    ("topk", 1, 1024, (0, 0)),
+    # (role, units, threads, key overrides, (STL, LDL)) of the role-isolated sm_107a rendering -- S_q 1 and 8192 columns unless the overrides
+    # say otherwise: the register census's figures, EXACT
+    ("prepare", 1, 512, {}, (0, 0)),
+    ("scorer", 1, 512, {}, (0, 0)),
+    ("scorer", 2, 512, {}, (0, 0)),
+    ("scorer", 4, 512, {}, (0, 0)),
+    ("topk", 1, 512, {}, (0, 0)),
+    ("prepare", 1, 1024, {}, (0, 0)),
+    ("scorer", 1, 1024, {}, (0, 0)),
+    ("scorer", 2, 1024, {}, (0, 0)),
+    ("scorer", 8, 1024, {}, (1, 1)),  # the knob's recorded pair at 64 registers (the scorer at MMA batch 1): the figure that made 512 the default
+    ("topk", 1, 1024, {}, (0, 0)),
+    # the review's wider scope: the S_q 4 scorer at the default route (B 32: 4 units) and at the knob, the served units_per_warp 2 point
+    # (512 threads: 99 registers, spill-free; the knob refuses it), the default route's 128K top-k (32768 columns = the 64-key tile at
+    # 512 threads: its standalone 512 form's own pair) and the knob's 32768-column top-k
+    ("scorer", 1, 512, dict(s_q=4), (0, 0)),
+    ("scorer", 4, 512, dict(s_q=4), (0, 0)),
+    ("scorer", 1, 1024, dict(s_q=4), (1, 1)),
+    ("scorer", 1, 512, dict(units_per_warp=2), (0, 0)),
+    ("topk", 1, 512, dict(n_blocks_max=32768), (27, 34)),
+    ("topk", 1, 1024, dict(n_blocks_max=32768), (14, 14)),
 ]
 
 
-@pytest.mark.parametrize("role,units,threads,expect", _ROLE_PINS, ids=[f"{r}_u{u}_t{t}" for r, u, t, _ in _ROLE_PINS])
-def test_per_role_local_memory_matches_the_register_census(tmp_path, role, units, threads, expect):
+@pytest.mark.parametrize(
+    "role,units,threads,over,expect",
+    _ROLE_PINS,
+    ids=[f"{r}_u{u}_t{t}" + "".join(f"_{k}{v}" for k, v in o.items()) for r, u, t, o, _ in _ROLE_PINS],
+)
+def test_per_role_local_memory_matches_the_register_census(tmp_path, role, units, threads, over, expect):
     """The register pin BEFORE any GPU time: a role-isolated sm_107a rendering (the ``roles`` compile key traces the other branches empty at
     the SAME block size, SMEM and ABI).  At the DEFAULT 512 threads (128 registers) every role is spill-free at every served units; at the
     1024-thread knob (64 registers flat) the prepare, the top-k at 8192 columns and the scorer at 1 / 2 units are spill-free and the scorer
-    at 8 units holds exactly the recorded ``STL`` / ``LDL`` pair -- the figure that made 512 the default, never a silent one.  EXACT pins (a
-    change in either direction is a change to record), valid for the DSL build they were taken under: another build skips naming both
-    sides, or fails under ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1`` (the cubin pins' contract); ``REG`` reads at most the file over the block."""
+    at 8 units (and at S_q 4) holds exactly the recorded ``STL`` / ``LDL`` pair -- the figure that made 512 the default, never a silent one;
+    the 32768-column top-k ships with its standalone form's own pair at either block size.  EXACT pins (a change in either direction is a
+    change to record), valid for the DSL build they were taken under: another build skips naming both sides, or fails under
+    ``CUDNN_FROST_REQUIRE_CUBIN_PINS=1`` (the cubin pins' contract); ``REG`` reads at most the file over the block."""
     cps.check_arch()
     cps.check_dsl(_ROLE_PIN_DSL[0])
-    kw = dict(s_q=1, page=16, n_blocks_max=8192, units=units, threads=threads, roles=[role])
-    ptx, cubin = _render(tmp_path, f"only_{role}_u{units}_t{threads}", kw)
-    assert ptx.count(".local") == 0, f"{role}: local memory in the PTX"
+    kw = {**dict(s_q=1, page=16, n_blocks_max=8192, units=units, threads=threads, roles=[role]), **over}
+    ptx, cubin = _render(tmp_path, f"only_{role}_u{units}_t{threads}" + "".join(f"_{k}{v}" for k, v in over.items()), kw)
+    if expect == (0, 0):
+        assert ptx.count(".local") == 0, f"{role}: local memory in the PTX of a rendering recorded spill-free"
+    # (a recorded pair is ptxas's: the PTX of the 8-unit scorer carries no .local and still spills one pair in SASS; the 32768-column top-k
+    # carries its register tile's .local -- the SASS STL / LDL count below is the figure of record either way)
     assert cubin is not None, "no cubin was kept"
     cps.check_compiler(_ROLE_PIN_DSL[1], cps.compiler_of_cubin(cubin))
     reg, stl, ldl = _sass_counts(cubin)
