@@ -3352,7 +3352,24 @@ write-through (no raw-key pool arm) -- four for the stage (11); `None` is the ME
 unfused / fused - 1 = +9.6 .. +14.5 % at B <= 4 and +4.4 .. +10.0 % at B 32 over the 19 decode cells, geomean +11.9 % over B <= 4, bitwise
 on out and the list; the control pairs -0.5 .. -1.3 %, a capture-order bias against the fused arm -- so cc 10.7 reads True on the in-place
 pipeline (False out of place, `inplace_qkv=False`: the AUTO reading is never True where an explicit True is declined) and every other
-part False until measured; `serving_envelope(...).decode.fuse_prepare_default`), the two readings bitwise.  The caller-list band form takes the knob too (`raw_pool=True`: the paged write-through + the raw key's write in
+part False until measured; `serving_envelope(...).decode.fuse_prepare_default`), the two readings bitwise.  Under the knob `indexer_megakernel=True`
+(2026-10-23) the prepare launch, the scorer and the top-k are ONE launch (`kernels/qsa_indexer_fused.py`: the prepare, the paged scorer and the
+decode top-k as role functions dispatched by `blockIdx` range from one grid; the scorer role derives its own indexer rows from the slab band, the
+ring and the tables, one per-row counter class -- a plan-owned int64 word per row, allocated at build and zero-filled once on the first execute's
+launch stream, released by the sequence's scorer CTAs and reset by the top-k CTA inside the launch, no memset after the first execute; ONE execute
+of a compiled block in flight at a time under the knob (the chain serves concurrent streams) -- orders every top-k row behind its producers under
+in-order dispatch):
+6 kernels on the whole step with a split (4 at T 128 without one), bitwise the chain on `out`, the LSE, the list, the counts, the pools' step
+rows, the ring and the cache; `None` is the chain until the fused form is measured against it on an exclusive 212-SM part (the measured-default
+rule: `SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS` EMPTY; the envelope's `indexer_megakernel_default`), `True` served where the route admits the
+declaration -- 512 threads (the register census' block size; the 1024-thread form a served rendering of the kernel), the scorer units per CTA
+by the batch (one per CTA at B <= 4 until the grid fills the part, the cap 4 past it), the single-CTA top-k's reach of 32768 compressed rows
+per sequence (the chain's cluster top-k past it), a compressed-row reach that is a multiple of 8 (the fused form's 256-bit logits rows; an odd
+page count at page 16 stays on the chain); the knob's typed declines (an explicit `fuse_prepare=False`, caller lists, the prefill form,
+the e4m3 indexer cache, the reach -- a table past the single-CTA top-k, a compressed-row reach not a multiple of 8, a step wider than the block
+size `S_q > 4` --, an RMSNorm-only geometry (`rope_dim` 0), a device outside cc 10.x -- the validated family; the counters' elect.sync needs
+cc 9.0+ in any case) name the knob; the explicit `use_pdl=True` is served under the knob (the fused launch
+carries the griddepcontrol pair per role), declined on the chain.  The caller-list band form takes the `fuse_prepare` knob too (`raw_pool=True`: the paged write-through + the raw key's write in
 the prepare launch; the `caller-list band + fuse_prepare` row).  `index_state_slot_mapping_present=True` takes the ring's write rows from
 `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` dead; `slot_mapping`'s dtype) -- bitwise the derived rows;
 `rope_position_tables_only=True` (fused only) refuses `cos` / `sin` and rotates from the position tables at the device-derived position --
@@ -3360,12 +3377,13 @@ bitwise the per-token form; `index_commit_present=True` is a follow-up (typed). 
 path (the first execute captures without a warm-up).  The carve: the caller-list band block's + five slots at the END (`ix_q`, the fp32
 logits `[T, max_pages x P / 4]`, the counts, the ids, the compressed-slot report).  The envelope publishes `index_sources`,
 `index_cache_dtypes`, `index_head_dims`, `index_kv_heads`, `index_block_sizes`, `index_top_k_range`, `index_query_rows_max` (64),
-`index_state_rows_extra` (3), `index_page_sizes` (16 / 32 / 64 / 128), `fuse_prepare_default`; `kv_cache_dtypes` narrows to `(bf16,)`
-under the indexer.  Typed declines by row name, the raised text EQUAL to the envelope's row: `indexer_query_rows` (`S_q x
+`index_state_rows_extra` (3), `index_page_sizes` (16 / 32 / 64 / 128), `fuse_prepare_default`, `indexer_megakernel_default`; `kv_cache_dtypes`
+narrows to `(bf16,)` under the indexer.  Typed declines by row name, the raised text EQUAL to the envelope's row: `indexer_query_rows` (`S_q x
 next_pow2(index_heads) > 64`), `indexer_page_size` (`P / 4` not a power of two), `indexer_e4m3_pool` (the sparse core's in-kernel dequant
 arm), `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`,
-`indexer_head_dim`, `indexer_thd`, `shared_list_rows`; `use_pdl=True` on the sparse chain keeps the existing decline (the stage threads
-the switch it is handed: `pdl_names` the kernels that would take it).  LIMITATION: no FROST writer of the paged compressed-key cache at
+`indexer_head_dim`, `indexer_thd`, `shared_list_rows`, the indexer megakernel's `indexer_megakernel_unfused_prepare` / `_caller` / `_prefill` /
+`_e4m3_cache` / `_rope_dim` / `_reach`; `use_pdl=True` on the indexer's CHAIN keeps the existing decline (the stage threads the switch it is handed: `pdl_names`
+the kernels that would take it), the explicit indexer megakernel takes it (`pdl_names` = the fused kernel).  LIMITATION: no FROST writer of the paged compressed-key cache at
 PREFILL -- the prefill form writes `index_k_compressed` densely; the serving stack scatters the rows into the pages and primes the ring
 (the multi-step row does exactly that).  Validated on a Rubin development node (cc 10.7, 204 SMs; functional cells, no perf claim;
 `test_block_qsa_decode.py`, `test_block_qsa_end_to_end.py`) against the two-stage oracle: the step's SET equals the fp64 top-k of the

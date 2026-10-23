@@ -76,6 +76,31 @@ the launch stream through events, overlapping the SDPA backward chain) -- see [B
   (RMSNorm only) is a `ValueError` at `check_support` naming the zero-width RoPE table operands the fused launch would bind.
   `use_pdl=True` launches the fused stage with the programmatic-dependent-launch attribute, as it does the two stages it replaces.
   See "Serving: write-through".
+- `indexer_megakernel=True` (serving; the in-block indexer's DECODE step over the pools: `QsaSpec(index_source="indexer")` with
+  `kv_source="paged"`) runs the prepare, the paged scorer and the decode top-k as ONE launch (`kernels/qsa_indexer_fused.py`: the scorer
+  role derives its own indexer rows from the slab band, the ring and the tables, and one per-row counter class orders every top-k row
+  behind its sequence's scorer CTAs) in place of the prepare launch + the scorer + the top-k -- six kernels on the whole step with a split
+  where the chain runs eight (four where it runs six); `out`, the LSE, the list, the counts, the pools' step rows, the ring and the cache
+  bitwise the chain.  The per-row counter words are the plan's (allocated at `compile()`, zero-filled once on the first execute's launch
+  stream, reset by the kernel inside every launch -- no memset after the first execute), so ONE execute of a compiled block is in flight at
+  a time under the knob: a stack that runs one declaration on concurrent streams declares the chain (or one block per stream).  `None` is
+  the MEASURED default: `SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS` is EMPTY until the fused form is measured
+  against the chain on an exclusive part (the bar: >= 1.0 us and >= 5 % per step at B 1 x 8K and B 1 x 32K, no cell beyond its control
+  band), so `None` reads the chain everywhere today; `True` is served wherever the route admits the declaration
+  (`serving_envelope(...).decode.indexer_megakernel_default` publishes the part's reading).  The route: the fused launch runs at 512 threads
+  (`SPARSE_INDEXER_MEGAKERNEL_THREADS`, the register census' block size; the 1024-thread form stays a served rendering of the kernel) with
+  the scorer units per CTA set by the batch -- one unit per CTA at `B <= 4` until the grid fills the part, the cap (4) past it -- and the
+  single-CTA top-k, whose reach is 32768 compressed rows per sequence (a 128K context at block size 4); a wider table is the chain's (the
+  cluster top-k), and so is a table whose compressed-row reach (`max_pages x P / 4`) is not a multiple of 8 (the fused form reads its fp32
+  logits rows in 256-bit vectors: an odd page count at page 16).  Typed declines, each naming the knob: an explicit `fuse_prepare=False` (the fused indexer carries the prepare;
+  `fuse_prepare=None` resolves to the fused form under the knob), `index_source="caller"`, the prefill form, the e4m3 indexer cache
+  (`index_cache_dtype=torch.float8_e4m3fn`: the chain serves it; a follow-up under the knob), a block table past the reach or a step wider
+  than the block size (`S_q > 4`: the scorer role derives one completing compressed-key row per CTA), an RMSNorm-only indexer geometry
+  (`rope_dim=0`), a device outside cc 10.x (the validated family; below cc 9.0 the counters' `elect.sync` is missing in any case); `thd=True`
+  and `index_commit_present=True` hear the form's own declines.  With the knob the explicit `use_pdl=True` is served
+  (the fused launch carries the griddepcontrol pair beside the sparse core and its combine; AUTO stays off until measured); the chain
+  under the indexer keeps its decline.  `blk.indexer_megakernel` is the resolved knob, `blk.indexer_megakernel_requested` the declaration,
+  `blk.indexer_megakernel_route` the `(units, threads)` of the launch.  See "The in-block indexer's DECODE step over the pools".
 
 With both on, the block is **three launches**: `proj(+norm+RoPE[+quant]) -> sdpa(+gate) -> out_proj`.
 
@@ -725,6 +750,7 @@ blk = GatedAttentionBlockFwd(
     index_state_slot_mapping_present=False,   # that step: execute(index_state_slot_mapping=) names the ring's write rows (block x cap + pos % cap, -1 dead; slot_mapping's dtype) instead of the rows the kernels derive from the ring table
     index_commit_present=False,  # that step: a per-sequence commit count at execute (a follow-up: True is a typed NotImplementedError)
     rope_position_tables_only=False,   # that step under fuse_prepare=True: cos / sin REFUSED at execute; the fused launch rotates Q / K and the indexer queries from cos_pos / sin_pos at the device-derived position (the unfused twin with it is a typed decline)
+    indexer_megakernel=None,     # that step: the prepare, the paged scorer and the decode top-k as ONE launch (six kernels on the step where the chain runs eight; bitwise the chain); None = the MEASURED default (the chain everywhere until the fused form is measured), True / False explicit -- "Fusion knobs"
 )
 workspace = torch.empty(blk.get_workspace_size(), dtype=torch.uint8, device=h.device)
 blk.execute(h, w_qkvg, w_q_norm, w_k_norm, cos, sin, w_o, out, workspace,
@@ -1323,7 +1349,13 @@ query compress, the step compress (`frost_qsa_compress_step`) and the K / V writ
 `None` is the MEASURED default (`serving_envelope(...).decode.fuse_prepare_default`: True on cc 10.7 -- the 2026-10-21 end-to-end
 gate on an exclusive 212-SM part measured the fused step +9.6 .. +14.5 % faster at B <= 4 and +4.4 .. +10.0 % at B 32 over 19 decode cells,
 bitwise --, `False` on every other part until measured, and `False` out of place -- `inplace_qkv=False` -- on every part: the AUTO reading is
-never True where an explicit True is declined); every output, the ring and the cache are BITWISE between the two readings.  `index_state_slot_mapping_present=True`
+never True where an explicit True is declined); every output, the ring and the cache are BITWISE between the two readings.  Under the knob
+`indexer_megakernel=True` ("Fusion knobs") the prepare launch, the scorer and the top-k are ONE launch (`qsa_indexer_fused`: the scorer
+role derives the indexer rows the prepare would hand it, the top-k row waits on its sequence's scorer CTAs through a per-row counter word
+the plan owns and the kernel resets -- one execute of a compiled block in flight at a time under the knob): six kernels on the whole step
+with a split (four where the chain runs six), bitwise the chain on
+`out`, the list, the counts and every side cache; `None` is the chain until the fused form is measured (`SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS`
+EMPTY; `decode.indexer_megakernel_default`).  `index_state_slot_mapping_present=True`
 takes the ring's write rows from `execute(index_state_slot_mapping=)` (`block x cap + pos % cap`, `-1` on a dead row; int32 or
 int64 = `slot_mapping`'s dtype) instead of deriving them from the ring table -- bitwise the derived form;
 `rope_position_tables_only=True` (fused only) refuses `cos` / `sin` and rotates Q / K and the indexer queries from
@@ -1336,13 +1368,16 @@ the counts, the ids, the compressed-slot report).  The envelope publishes the fa
 compressed-key cache served at decode since 2026-10-21, "At decode over the pools" above),
 `index_head_dims` (`(128,)`), `index_kv_heads` (`(1,)`), `index_block_sizes` (`(4,)`), `index_top_k_range` (`(4, 512, 4)`),
 `index_query_rows_max` (64: `S_q x next_pow2(index_heads)` rows per sequence), `index_state_rows_extra` (3: `cap >= S_q + 3`),
-`index_page_sizes` (`(16, 32, 64, 128)`: `P / 4` a power of two), `fuse_prepare_default`; `decode.kv_cache_dtypes` is `(bf16,)`
+`index_page_sizes` (`(16, 32, 64, 128)`: `P / 4` a power of two), `fuse_prepare_default`, `indexer_megakernel_default` (the knob's AUTO
+reading on the part: False everywhere until its gate); `decode.kv_cache_dtypes` is `(bf16,)`
 under the indexer (the e4m3 pools wait for the sparse core's in-kernel dequant arm: `indexer_e4m3_pool`).  Typed declines by
 row name (`decode.declines`, each the text the declaration raises): `indexer_query_rows`, `indexer_page_size`,
 `indexer_e4m3_pool`, `indexer_shared_list`, `fuse_prepare_rope_tables_unfused`, `indexer_f16`, `indexer_head_dim`, `indexer_thd`
-(the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served); `use_pdl=True` under the indexer keeps
-a typed decline by name (the caller-list sparse chain serves the switch; the indexer's step threads the switch it is handed and is
-handed `False` until its own switched chain is measured).  **Limitation:** there is no FROST writer
+(the `indexer_e4m3_cache` row retired 2026-10-21: the e4m3 cache is served), and the indexer megakernel's rows, each naming the knob:
+`indexer_megakernel_unfused_prepare`, `indexer_megakernel_caller`, `indexer_megakernel_prefill`, `indexer_megakernel_e4m3_cache`,
+`indexer_megakernel_rope_dim`, `indexer_megakernel_reach`; `use_pdl=True` under the indexer's CHAIN keeps a typed decline by name (the caller-list sparse chain and the
+explicit indexer megakernel serve the switch; the chain's step threads the switch it is handed and is handed `False` until its own
+switched chain is measured).  **Limitation:** there is no FROST writer
 of the paged compressed-key cache at PREFILL yet -- the prefill form writes `index_k_compressed` densely (`[B, >= floor(S / 4),
 128]`); a serving stack scatters those rows into the pages through its table and primes the ring with the prompt's last `cap`
 raw keys (the band's `index_k_raw` rows or the slab's band), exactly as the multi-step cell of the end-to-end module does -- under the
