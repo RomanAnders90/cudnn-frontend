@@ -2104,10 +2104,11 @@ def test_a_packed_qsa_block_with_write_through_is_bitwise_the_one_without():
 # ---------------------------------------------------------------------------- the in-block indexer's DECODE step over the pools (2026-10-21)
 
 
-def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16):
+def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache, ring, ring_table, fuse_prepare, dtype=BF16, indexer_megakernel=None):
     """One decode-indexer declaration (``QsaSpec(index_source="indexer")`` over the pools; the geometry's ``index_cache_dtype`` names the
     cache's dtype -- ``icache`` is in it) at ``[1, s_q]`` on EMPTY step inputs -- the prefill's weights, the K / V pools + the three side
-    caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace."""
+    caches as samples, the gate fused, the LSE out -- checked, compiled, with its sentinel-filled workspace.  ``indexer_megakernel`` (appended)
+    is the indexer megakernel knob (None = the chain today: the AUTO pin is empty)."""
     mk = lambda *shape, dt=dtype: torch.empty(*shape, dtype=dt, device="cuda")  # noqa: E731
     blk = GatedAttentionBlockFwd(
         mk(1, s_q, geom.d_model),
@@ -2130,8 +2131,10 @@ def _decode_indexer_block(geom, inp, s_q, *, ps, k_cache, v_cache, table, icache
         return_lse=True,
         fuse_gate=True,
         fuse_prepare=fuse_prepare,
+        **({} if indexer_megakernel is None else dict(indexer_megakernel=indexer_megakernel)),
     )
-    assert blk.indexer_decode and blk.fuse_prepare is fuse_prepare and blk.index_cache_dtype == icache.dtype and blk.check_support()
+    assert blk.indexer_decode and blk.index_cache_dtype == icache.dtype and blk.indexer_megakernel is bool(indexer_megakernel)
+    assert blk.fuse_prepare is (True if indexer_megakernel else fuse_prepare) and blk.check_support()
     blk.compile()
     ws = torch.full((blk.get_workspace_size(),), 0x7F, dtype=torch.uint8, device="cuda")
     return blk, ws
@@ -2358,6 +2361,132 @@ def test_decode_indexer_steps_after_a_prefill_carry_the_ring_and_the_paged_cache
         assert torch.isnan(ring[0].float()).all() and torch.isnan(icache[0].float()).all(), f"{label}: the null ring block / page 0 moved"
         print(f"\n{label} cache={cd}: counts {counts.tolist()} completed {[k for k in completed if k >= (pos0 // BS)]} O {d_o:.3e} LSE {d_lse:.3e} cos {c:.6f}")
     assert L == S0 + 17 and completed == [75, 76, 76, 77, 78], (L, completed)  # 303 | 307 (draft) | 307 (re-step) | 311 | 315
+
+
+@requires_rubin
+def test_decode_indexer_megakernel_steps_after_a_prefill_are_bitwise_the_chain_step_by_step():
+    """The multi-step decode of the chain's cell above, run TWICE over one token stream on identical inputs -- the chain (``fuse_prepare=True``:
+    the prepare launch, the scorer, the top-k) and the INDEXER MEGAKERNEL (``indexer_megakernel=True``: the three as one launch) -- each over
+    its own copy of the pools, the ring and the paged compressed-key cache primed from the same prefill: after EVERY one of the eight steps
+    (four at ``S_q`` 1, four at ``S_q`` 4 with a rejected / partial / full acceptance, re-stepped over the same positions) ``out``, the LSE, the
+    list, its counts, the ring, the cache and the pools are BITWISE between the two streams, the knob-ON step's counts / list obey the step's
+    rules on their own and its plan-owned counters are zero after every launch -- so a stream served by the fused launch is the chain's
+    stream byte for byte, step after step, with the caches it carries."""
+    geom_kw, S0, ps, cap, top_k = GEOM_SMALL, 301, 16, 8, 512
+    geom = GatedAttentionBlockGeometry(**geom_kw, causal_bottom_right=True, qsa=QsaSpec(top_k=top_k, index_source="indexer", index_band=True))
+    d_i, h_q, h_kv, d_model, D_ = geom.qsa.index_head_dim, geom.h_q, geom.h_kv, geom.d_model, geom.d_head
+    rpp = ps // BS
+    max_pages = 24
+    n_pos = max_pages * ps
+    gen = torch.Generator(device="cuda").manual_seed(63)
+    pages = (torch.randperm(max_pages, generator=gen, device="cuda") + 1).tolist()  # block 0 the NULL page
+    table = torch.tensor([pages], dtype=torch.int32, device="cuda")
+    n_pages = max_pages + 1
+    slot_of = lambda p: pages[p // ps] * ps + p % ps  # noqa: E731
+    k_cache, v_cache = _nan_pool(n_pages, h_kv, ps, D_), _nan_pool(n_pages, h_kv, ps, D_)
+    raw_pool = torch.full((n_pages, ps, d_i), float("nan"), device="cuda", dtype=BF16)
+    slots0 = torch.tensor([slot_of(p) for p in range(S0)], dtype=torch.int32, device="cuda")
+    pre = _run(
+        geom_kw,
+        1,
+        S0,
+        indexer=True,
+        indexer_outputs=True,
+        seed=61,
+        paged_kv_page_size=ps,
+        pools=dict(k_cache=k_cache, v_cache=v_cache, slot_mapping=slots0, index_k_raw=raw_pool),
+    )
+    _check(pre, "small8-2 S=301 prefill (the stream's prompt; the megakernel cell)")
+    inp = pre.inp
+    cos_all, sin_all = build_rope_tables(
+        n_pos, geom.rope_dim, base=RefGeometry(**geom_kw, causal_bottom_right=True).rope_base, batch=1, device="cuda", dtype=BF16
+    )
+    lay0 = pre.blk._layout()
+    k_raw0 = index_k_raw_view(_view(pre.ws, lay0.proj, (S0, pre.geom.n_qkvg), BF16), pre.geom, 1, S0)[0, :, 0]
+    icache = torch.full((n_pages, rpp, 1, d_i), float("nan"), device="cuda", dtype=BF16)
+    nb0 = S0 // BS
+    kbar0 = pre.ix["kbar_out"][0, :nb0]
+    for j in range(nb0):
+        icache[pages[j // rpp], j % rpp, 0] = kbar0[j]
+    ring = torch.full((2, cap, 1, d_i), float("nan"), device="cuda", dtype=BF16)
+    for p in range(S0 - cap, S0):
+        ring[1, p % cap, 0] = k_raw0[p]
+    ring_table = torch.tensor([[1]], dtype=torch.int32, device="cuda")
+    # the two streams: the chain's and the knob's, each over its OWN copy of every carried buffer (the same bytes at the start)
+    streams = {}
+    for name, knob in (("chain", None), ("megakernel", True)):
+        st = dict(k_cache=k_cache.clone(), v_cache=v_cache.clone(), icache=icache.clone(), ring=ring.clone())
+        common = dict(ps=ps, table=table, ring_table=ring_table, fuse_prepare=True, indexer_megakernel=knob, **st)
+        st["blk1"], st["ws1"] = _decode_indexer_block(geom, inp, 1, **common)
+        st["blk4"], st["ws4"] = _decode_indexer_block(geom, inp, 4, **common)
+        streams[name] = st
+    assert (
+        streams["megakernel"]["blk1"].indexer_megakernel
+        and streams["megakernel"]["blk4"].indexer_megakernel
+        and not streams["chain"]["blk1"].indexer_megakernel
+    )
+    assert [s.name for s in streams["megakernel"]["blk1"]._stages] == ["qkv_gate_proj", "qsa_indexer_fused", "sdpa_sparse", "out_proj"]
+    plan = [(1, 1), (1, 1), (1, 1), (1, 1), (4, 2), (4, 4), (4, 3), (4, 4)]
+    L = S0
+    for step, (s_q, n_acc) in enumerate(plan, 1):
+        pos0, Lf = L, L + s_q
+        pos = torch.arange(s_q, device="cuda") + pos0
+        h_step = torch.randn(1, s_q, d_model, generator=gen, device="cuda", dtype=torch.float32).to(BF16)
+        slots = torch.tensor([slot_of(p) for p in range(pos0, Lf)], dtype=torch.int32, device="cuda")
+        outs = {}
+        for name, st in streams.items():
+            blk, ws = (st["blk1"], st["ws1"]) if s_q == 1 else (st["blk4"], st["ws4"])
+            out = torch.full((1, s_q, d_model), float("nan"), device="cuda", dtype=BF16)
+            lse = torch.full((1, h_q, s_q), float("nan"), device="cuda", dtype=torch.float32)
+            ids_out = torch.full((1, s_q, top_k), -7, dtype=torch.int32, device="cuda")
+            lens_out = torch.full((1, s_q), -7, dtype=torch.int32, device="cuda")
+            blk.execute(
+                h_step,
+                inp["w_qkvg"],
+                inp["w_q_norm"],
+                inp["w_k_norm"],
+                cos_all[:, pos0:Lf].contiguous(),
+                sin_all[:, pos0:Lf].contiguous(),
+                inp["w_o"],
+                out,
+                ws,
+                lse=lse,
+                k_cache=st["k_cache"],
+                v_cache=st["v_cache"],
+                block_table=table,
+                kv_lens=torch.tensor([Lf], dtype=torch.int32, device="cuda"),
+                slot_mapping=slots,
+                w_iq_norm=inp["w_iq_norm"],
+                w_ik_norm=inp["w_ik_norm"],
+                block_ids_out=ids_out,
+                block_lens_out=lens_out,
+                index_kv_cache=st["icache"],
+                index_state_cache=st["ring"],
+                index_state_block_table=ring_table,
+                cos_pos=cos_all,
+                sin_pos=sin_all,
+            )
+            torch.cuda.synchronize()
+            counts = blk._indexer_decode.views(ws, blk._ws)["counts"].view(s_q).clone()
+            outs[name] = dict(out=out, lse=lse, ids=ids_out, lens=lens_out, counts=counts, cslot=blk._indexer_decode.views(ws, blk._ws)["cslot"].clone())
+        label = f"step {step} S_q={s_q} pos {pos0}..{Lf - 1} accept {n_acc}"
+        c, m = outs["chain"], outs["megakernel"]
+        assert torch.isfinite(c["out"].float()).all() and torch.isfinite(m["out"].float()).all(), f"{label}: non-finite"
+        assert torch.equal(_bits(m["out"]), _bits(c["out"])), f"{label}: out differs between the knob and the chain"
+        assert (
+            torch.equal(m["lse"], c["lse"]) and torch.equal(m["ids"], c["ids"]) and torch.equal(m["lens"], c["lens"])
+        ), f"{label}: the LSE / list / lens differ"
+        assert torch.equal(m["counts"], c["counts"]) and torch.equal(m["cslot"], c["cslot"]), f"{label}: the counts / slot report differ"
+        sm, sc = streams["megakernel"], streams["chain"]
+        assert torch.equal(_bits(sm["ring"]), _bits(sc["ring"])) and torch.equal(_bits(sm["icache"]), _bits(sc["icache"])), f"{label}: the ring / cache differ"
+        assert torch.equal(_bits(sm["k_cache"]), _bits(sc["k_cache"])) and torch.equal(_bits(sm["v_cache"]), _bits(sc["v_cache"])), f"{label}: the pools differ"
+        blk_m = sm["blk1"] if s_q == 1 else sm["blk4"]
+        assert blk_m.indexer_counters_are_zero(), f"{label}: a counter word is not zero after the fused launch"
+        want = ((pos + 1) // BS).clamp(max=blk_m._indexer_decode.n_blocks_max).to(torch.int32)
+        assert torch.equal(m["counts"], want), f"{label}: the knob's counts are not the visible counts"
+        print(f"\n{label}: bitwise (out, LSE, list, counts, ring, cache, pools); counts {m['counts'].tolist()}")
+        L = pos0 + n_acc
+    assert L == S0 + 17
 
 
 @requires_rubin

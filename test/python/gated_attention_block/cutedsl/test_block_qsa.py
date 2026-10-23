@@ -374,6 +374,13 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "indexer_e4m3_pool": "in-kernel dequant arm",
         "indexer_shared_list": "selects per row",
         "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+        # the indexer megakernel's rows (the knob `indexer_megakernel`): every text names the knob; these are the rows' own clauses
+        "indexer_megakernel_unfused_prepare": "indexer_megakernel=True with fuse_prepare=False",
+        "indexer_megakernel_caller": "indexer_megakernel=True under QsaSpec(index_source='caller')",
+        "indexer_megakernel_prefill": "indexer_megakernel=True off the block-sparse DECODE mode",
+        "indexer_megakernel_e4m3_cache": "indexer_megakernel=True with QsaSpec(index_cache_dtype=torch.float8_e4m3fn)",
+        "indexer_megakernel_reach": "indexer_megakernel=True on a block table the fused indexer's grid does not address",
+        "indexer_megakernel_rope_dim": "indexer_megakernel=True on a geometry with rope_dim=0",
     }
     geom = GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True, qsa=QsaSpec(index_source="indexer", index_band=True))
     for dtype in (torch.bfloat16, torch.float16):
@@ -392,13 +399,15 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
             (10, 7),
         )  # the measured part; f16: not served
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row"
+        assert d.indexer_megakernel_default is False  # the indexer megakernel's AUTO pin is EMPTY until its gate (the explicit knob is served)
     dense = GatedAttentionBlockFwd.serving_envelope(
         GatedAttentionBlockGeometry(**_SMALL_D256, causal_bottom_right=True), torch.bfloat16, _DEV, device_cc=(10, 7)
     ).decode
     assert dense.index_sources == () and dense.index_page_sizes == () and dense.index_query_rows_max == 0 and dense.fuse_prepare_default is False
     assert GatedAttentionBlockFwd.serving_envelope(geom, torch.bfloat16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
     assert not (set(tokens) & set(dense.declines))
-    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-10:] == [
+    assert dense.indexer_megakernel_default is False
+    assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-11:] == [
         "index_sources",
         "index_cache_dtypes",
         "index_head_dims",
@@ -409,6 +418,7 @@ def test_decode_indexer_declines_are_published_row_by_row_and_the_envelope_names
         "index_state_rows_extra",
         "index_page_sizes",
         "fuse_prepare_default",
+        "indexer_megakernel_default",
     ]
 
 

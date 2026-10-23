@@ -153,7 +153,7 @@ def test_auto_and_the_explicit_switch_answer_for_one_domain_on_the_measured_part
     reads False with no stage switched; the explicit True is served per stage on the two bf16 forms without a decode route (their
     prefill tiles carry no sites), SERVED on the block-sparse decode mode (the sparse core and its combine carry the sites; its own AUTO
     tuple is empty until measured) and is the typed decline on the QuantSpec pipeline, the e4m3 cache, the sparse core's packed form and the
-    in-block indexer (its kernels would take the switch unmeasured)."""
+    in-block indexer's CHAIN (its kernels would take the switch unmeasured; the explicit indexer megakernel serves the switch)."""
     import test_block_qsa_decode as _qsa
     import test_block_qsa_fp8_kv as _qkv
     import test_block_serving_extend as _ext

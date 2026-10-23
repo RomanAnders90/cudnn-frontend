@@ -83,7 +83,7 @@ from cudnn.gated_attention_block import (
     QsaSpec,
     index_k_raw_view,
 )
-from cudnn.gated_attention_block.api import _EXTEND_DECLINES, _cols, _IndexerDecode, _QsaPrepare, _SparseSdpa, _view, ProjBlock
+from cudnn.gated_attention_block.api import _EXTEND_DECLINES, _cols, _IndexerDecode, _IndexerFused, _QsaPrepare, _SparseSdpa, _view, ProjBlock
 
 requirement_error = cutedsl_requirement_error("the gated attention block's sparse decode tests")
 if requirement_error:
@@ -1494,6 +1494,13 @@ _INDEXER_DECLINE_TOKENS = {  # the `indexer_e4m3_cache` row RETIRED 2026-10-21: 
     "indexer_shared_list": "selects per row",
     "shared_list_rows": "tail covers at most two blocks",
     "fuse_prepare_rope_tables_unfused": "the unfused query norm reads the per-token",
+    # the indexer megakernel's rows: every text names the knob (`indexer_megakernel=True`), these are the rows' own clauses
+    "indexer_megakernel_unfused_prepare": "indexer_megakernel=True with fuse_prepare=False: the fused indexer carries the prepare",
+    "indexer_megakernel_caller": "indexer_megakernel=True under QsaSpec(index_source='caller')",
+    "indexer_megakernel_prefill": "indexer_megakernel=True off the block-sparse DECODE mode",
+    "indexer_megakernel_e4m3_cache": "indexer_megakernel=True with QsaSpec(index_cache_dtype=torch.float8_e4m3fn)",
+    "indexer_megakernel_reach": "indexer_megakernel=True on a block table the fused indexer's grid does not address",
+    "indexer_megakernel_rope_dim": "indexer_megakernel=True on a geometry with rope_dim=0",
 }
 
 
@@ -1636,8 +1643,8 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
         assert d.index_list_forms == ("per_row",) and d.index_list_form_default == "per_row" and d.pdl_stages == () and d.pdl_default is False
         assert set(_INDEXER_DECLINE_TOKENS) <= set(d.declines) and all(tok in d.declines[nm] for nm, tok in _INDEXER_DECLINE_TOKENS.items())
         assert "indexer_e4m3_cache" not in d.declines, "a served form has no decline row"
-        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `fuse_prepare_default`)
-        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-12:] == [
+        # the record's tail is append-only (a serving stack reads these by name; a new field goes after `indexer_megakernel_default`)
+        assert [f.name for f in dataclasses.fields(DecodeEnvelope)][-13:] == [
             "index_list_forms",
             "index_list_form_default",
             "index_sources",
@@ -1650,7 +1657,9 @@ def test_decode_indexer_declaration_facts_carve_and_the_envelope_rows(monkeypatc
             "index_state_rows_extra",
             "index_page_sizes",
             "fuse_prepare_default",
+            "indexer_megakernel_default",
         ]
+        assert d.indexer_megakernel_default is False  # the indexer megakernel's AUTO pin: EMPTY until its gate (the explicit knob is served)
         assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.fuse_prepare_default is False  # an unmeasured part
         f16 = GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode
         assert f16.index_sources == ("caller",) and f16.index_cache_dtypes == () and f16.fuse_prepare_default is False
@@ -1979,8 +1988,11 @@ class _IndexerCase(_CaseBase):
         outputs=True,
         lens_out=True,
         index_cache_dtype=None,
+        indexer_megakernel=None,
+        use_pdl=None,
     ):
         self.s_q, self.kv_lens, self.page, self.layout, self.dtype, self.top_k = int(s_q), [int(x) for x in kv_lens], page, layout, dtype, top_k
+        self.indexer_megakernel, self.use_pdl_requested = indexer_megakernel, use_pdl  # the indexer megakernel knob and the PDL switch, as declared
         self.block_lens_given, self.return_lse, self.fuse_gate, self.index_band = False, bool(return_lse), bool(fuse_gate), True
         self.index_list_form, self.shared, self.fuse_prepare = None, False, fuse_prepare
         self.slot_form, self.rope_tables_only, self.outputs, self.lens_out = bool(slot_form), bool(rope_tables_only), bool(outputs), bool(lens_out)
@@ -2109,6 +2121,10 @@ class _IndexerCase(_CaseBase):
             index_state_slot_mapping_present=self.slot_form,
             rope_position_tables_only=self.rope_tables_only,
         )
+        if indexer_megakernel is not None:
+            kw["indexer_megakernel"] = indexer_megakernel
+        if use_pdl is not None:
+            kw["use_pdl"] = use_pdl
         self.blk_kw = kw
         self.out = torch.empty(B, s_q, d_model, dtype=dtype, device=_DEV)
         self.lse = torch.empty(B, h_q, s_q, dtype=torch.float32, device=_DEV) if return_lse else None
@@ -2118,7 +2134,7 @@ class _IndexerCase(_CaseBase):
             isinstance(self.blk._sdpa, _SparseSdpa)
             and self.blk.indexer_decode
             and not self.blk.qsa_shared_list
-            and isinstance(self.blk._indexer_decode, _IndexerDecode)
+            and isinstance(self.blk._indexer_decode, _IndexerFused if self.blk.indexer_megakernel else _IndexerDecode)
         )
         assert self.blk.index_cache_dtype == self.cache_dtype and self.blk._indexer_decode.cache_dtype == self.cache_dtype
         self.ws = None
@@ -2292,7 +2308,13 @@ class _IndexerCase(_CaseBase):
         cos_q = self.cos.view(t, 1, ROPE).expand(t, h_i, ROPE)
         sin_q = self.sin.view(t, 1, ROPE).expand(t, h_i, ROPE)
         qi_ref = self.compress(q_raw.reshape(t, h_i, d_i), cos_q, sin_q, pool=1)
-        assert torch.equal(_bits(v["qi"]), _bits(qi_ref)), f"{what}: the indexer queries are not the pool-1 compress of the slab's band"
+        if self.blk.indexer_megakernel:
+            # the fused form derives the query rows INSIDE the scorer role (ix_q stays carved for the chain, unwritten): the fp64 set below
+            # reads the pool-1 compress of the slab's band in its place -- the rows the derive reproduces bitwise (the kernel-level tier's pin)
+            qi_rows = qi_ref
+        else:
+            assert torch.equal(_bits(v["qi"]), _bits(qi_ref)), f"{what}: the indexer queries are not the pool-1 compress of the slab's band"
+            qi_rows = v["qi"]
         raw = index_k_raw_view(proj, g, B, s_q)[:, :, 0]  # [B, S_q, d_i]: the step's raw keys (the FROST GEMM's band)
         flips = rows = 0
         gap = 0.0
@@ -2331,7 +2353,7 @@ class _IndexerCase(_CaseBase):
                 continue
             pages = self.block_table[b, : -(-n // self.rpp)].long()
             kbar = self.index_kv_cache[pages][:, :, 0].reshape(-1, d_i)[:n].double()  # [n, d_i] through the table
-            qi = v["qi"].view(B, s_q, h_i, d_i)[b].double()  # [S_q, h_i, d_i]
+            qi = qi_rows.view(B, s_q, h_i, d_i)[b].double()  # [S_q, h_i, d_i]
             sc = torch.relu(torch.einsum("shd,jd->shj", qi, kbar)).sum(1) / math.sqrt(d_i)  # [S_q, n]
             limit = torch.arange(n, device=_DEV)[None, :] < n_vis[b].to(_DEV)[:, None]
             sc = sc.masked_fill(~limit, float("-inf"))
@@ -2349,7 +2371,7 @@ class _IndexerCase(_CaseBase):
         return (
             f"[indexer {self.geom.h_q}/{self.geom.h_kv} S_q={self.s_q} p{self.page} {self.layout} split={self.blk.decode_split_kv} "
             f"gate={'fused' if self.fuse_gate else 'launch'} lse={self.return_lse} fuse_prepare={self.blk.fuse_prepare} cap={self.cap} "
-            f"cache={str(self.cache_dtype).replace('torch.', '')} lens={self.kv_lens}]"
+            f"cache={str(self.cache_dtype).replace('torch.', '')} megakernel={self.blk.indexer_megakernel} pdl={self.blk.use_pdl} lens={self.kv_lens}]"
         )
 
     def check_e4m3_twin(self, twin: "_IndexerCase", what: str = "e4m3 twin") -> dict:
@@ -2650,17 +2672,32 @@ def test_decode_indexer_list_fed_to_a_caller_list_block_is_bitwise():
 
 
 @requires_rubin
-@pytest.mark.parametrize("cache_dtype", [None, _E4M3], ids=["bf16", "e4m3"])
-@pytest.mark.parametrize("fuse_prepare", [True, False], ids=["fused", "unfused"])
-def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwise(fuse_prepare, cache_dtype):
+@pytest.mark.parametrize(
+    "fuse_prepare, cache_dtype, megakernel, kv",
+    [
+        pytest.param(True, None, False, (300, 0, 1000, 77), id="fused-bf16"),
+        pytest.param(True, _E4M3, False, (300, 0, 1000, 77), id="fused-e4m3"),
+        pytest.param(False, None, False, (300, 0, 1000, 77), id="unfused-bf16"),
+        pytest.param(False, _E4M3, False, (300, 0, 1000, 77), id="unfused-e4m3"),
+        # the knob's served form: the fused prepare and the bf16 cache; the longest 1024 -> 256 compressed rows (the fused form's reach is a
+        # multiple of 8: an even page count at page 16; the chain arms' 1000 -> 252 rows is the chain's alone)
+        pytest.param(True, None, True, (300, 0, 1024, 77), id="megakernel"),
+    ],
+)
+def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwise(fuse_prepare, cache_dtype, megakernel, kv):
     """The serving stack's defaults on the decode indexer: the FIRST execute of a fresh declaration captured on a NEW stream with no eager
     warm-up under ``set_sync_debug_mode("error")`` (no plan constant, no allocation, no host read on the path), the capture launches
     nothing, the replay is BITWISE a fresh eager run (``out``, the LSE, the list, the ring, the cache), and a new step through the captured
-    tensors (new lengths / tables / slots / ring state / cache / inputs) replays bitwise the eager run over them."""
+    tensors (new lengths / tables / slots / ring state / cache / inputs) replays bitwise the eager run over them.  Under
+    ``indexer_megakernel=True`` the same (the one-shot zero fill of the plan-owned counters is captured with the fused launch and re-applied
+    on every replay: idempotent on words the kernel leaves at zero), and three replays are bitwise the eager chain twin on ``out``, the LSE,
+    the list, the ring and the cache, the counters zero after every replay."""
     # the 24 / 2 band geometry: its slab (N 13952) rides the small-M route's 128-row tile at B x S_q <= 128 rows, capture-safe from the
     # first execute (the band capture cell above); the 8 / 2 band slab (N 5760) takes the GEMM graph route, whose handle is created eagerly
     kw = dict(page=16, split=4, fuse_gate=True, return_lse=True, fuse_prepare=fuse_prepare, index_cache_dtype=cache_dtype)
-    case = _IndexerCase(GEOM_FLASH_NEXT, 2, (300, 0, 1000, 77), seed=141, **kw)
+    knob = dict(indexer_megakernel=True) if megakernel else {}
+    case = _IndexerCase(GEOM_FLASH_NEXT, 2, kv, seed=141, **knob, **kw)
+    assert case.blk.indexer_megakernel is megakernel
     case.prime_prefix()
     case.blk.check_support()
     case.blk.compile()
@@ -2685,6 +2722,22 @@ def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwi
         ), "the capture launched work"
         graph.replay()
         torch.cuda.synchronize()
+        if megakernel:
+            assert case.blk.indexer_counters_are_zero(), "a counter word is not zero after the captured first execute's replay"
+            first = (case.out.clone(), case.lse.clone(), case.kernel_ids().clone())
+            for _ in range(2):  # two more replays: bitwise the first, the counters zero after each (the captured fill re-applied to zero words)
+                graph.replay()
+                torch.cuda.synchronize()
+                assert case.blk.indexer_counters_are_zero()
+                assert torch.equal(_bits(case.out), _bits(first[0])) and torch.equal(case.lse, first[1]) and torch.equal(case.kernel_ids(), first[2])
+            twin = _IndexerCase(GEOM_FLASH_NEXT, 2, kv, seed=141, **kw)  # the chain on the same inputs, eager
+            twin.compile()
+            twin.run()
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(case.out), _bits(twin.out)) and torch.equal(case.lse, twin.lse) and torch.equal(case.kernel_ids(), twin.kernel_ids())
+            assert torch.equal(_bits(case.index_kv_cache), _bits(twin.index_kv_cache)) and torch.equal(
+                _bits(case.index_state_cache), _bits(twin.index_state_cache)
+            ), "the knob's replays differ from the chain on the side caches"
         case.oracle_from_list()
         replayed, replayed_lse, replayed_ids = case.out.clone(), case.lse.clone(), case.kernel_ids().clone()
         cache_r, ring_r = _bits(case.index_kv_cache).clone(), _bits(case.index_state_cache).clone()
@@ -2698,7 +2751,7 @@ def test_decode_indexer_first_execute_captures_without_warm_up_and_replays_bitwi
         assert torch.equal(_bits(case.index_kv_cache), cache_r) and torch.equal(_bits(case.index_state_cache), ring_r), "the replay differs from the eager run"
         # a NEW step through the captured tensors: one length a token longer (its slot, its list, its ring position move), a re-laid-out
         # table, a new ring state and prefix cache, new inputs -- the oracle of the new step through a sibling case over the same shapes
-        sib = _IndexerCase(GEOM_FLASH_NEXT, 2, (301, 0, 1000, 77), seed=143, n_pages=case.n_pages, **kw)
+        sib = _IndexerCase(GEOM_FLASH_NEXT, 2, (301,) + tuple(kv[1:]), seed=143, n_pages=case.n_pages, **kw)
         sib.prime_prefix()
         assert (
             sib.block_table.shape == case.block_table.shape
@@ -3234,3 +3287,349 @@ def test_detector_turns_red_when_the_sparse_core_launches_with_the_attribute_but
         monkeypatch.undo()
         retrace(mod.compile)  # the memo held the no-wait object under the shipped key
         compiled_cache.clear_memo()
+
+
+# --------------------------------------------------------------------------------------------- the indexer megakernel (`indexer_megakernel`)
+# The knob: the prepare, the paged scorer and the decode top-k of the in-block indexer's DECODE step as ONE launch (kernels/qsa_indexer_fused.py),
+# in place of the chain's prepare launch + scorer + top-k.  A performance knob: `out`, the LSE, the gated O, the list, the counts, the pools' step
+# rows, the ring and the paged cache BITWISE the chain (the fused prepare form).  AUTO (None) is OFF everywhere until the measurement gate
+# (SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS is EMPTY: the gate commit flips it with its table); the explicit True is served where the route admits
+# the declaration.  Host cells: the route (a typed rule), the AUTO pin and the arm behind the tuple, the typed declines row by row (each equal to
+# its envelope row, each naming the knob).  Device cells: ON vs OFF bitwise with the census by kernel name (6 vs 8 kernels at S_q 1 with a
+# split), the plan-owned counters zero after every launch, the R9 census; the PDL switch under the knob bitwise the plain chains.
+
+_MK_ROUTE_CELLS = [  # (T, n_blocks_max, s_q) -> (units, threads) at 212 SMs: the fused module's dispatch rows at the default 512 threads
+    ((1, 2048, 1), (1, 512)),  # B 1 x 8K: 16 standalone chunks, one unit per CTA
+    ((1, 8192, 1), (1, 512)),  # B 1 x 32K
+    ((1, 32768, 1), (2, 512)),  # B 1 x 128K: 256 chunks over 212 SMs -> 2 units
+    ((4, 2048, 1), (1, 512)),  # B 4 x 8K
+    ((4, 8192, 1), (2, 512)),  # B 4 x 32K
+    ((4, 32768, 1), (4, 512)),  # B 4 x 128K: the cap at 512 threads (4 units of 128 threads)
+    ((32, 2048, 1), (4, 512)),  # B 32: concentrate (the resident-warp rule) = the cap
+    ((32, 32768, 1), (4, 512)),
+    ((128, 8192, 4), (4, 512)),  # T 128 (B 32 x S_q 4)
+    ((16, 8192, 4), (2, 512)),  # B 4 x S_q 4 x 32K
+    ((4, 2048, 4), (1, 512)),  # B 1 x S_q 4: a step of block_size rows, served
+    ((8, 2048, 8), None),  # B 1 x S_q 8: past the fused step's block size (the scorer role derives ONE completing row per CTA) -- the chain
+]
+
+
+def test_indexer_megakernel_route_is_the_typed_rule_and_its_constants_mirror_the_fused_module():
+    """The route ``_indexer_megakernel_route(T, n_blocks_max, sm_count, cc)`` -> ``(units, threads)``: the fused module's dispatch rows at the default
+    512 threads (spread at ``B <= 4``: one scorer unit per CTA until the grid fills the part; concentrate past it: the cap ``threads / 128``), the
+    1024-thread form behind the module constant (B 32 -> 8 units), the reach (64 keys per thread x the block size: 32768 rows at 512, 65536 at
+    1024; past it None = the chain), a step wider than the block size -> None, a part outside cc 10.x (cc 9.0 / 8.0) and no device -> None,
+    ``sm_count`` None = the spread reading, and a unit count the fused module serves (a power of two) whatever the SM count.  The constants
+    the block mirrors DSL-free equal the fused front door's."""
+    from cudnn.gated_attention_block import api as _api
+    from cudnn.gated_attention_block.kernels import qsa_indexer_fused as F  # the DSL-free front door
+
+    assert _api.SPARSE_INDEXER_MEGAKERNEL_THREADS == F.DEFAULT_THREADS == 512 and _api._FUSED_TOPK_MAX_EPT == F.TOPK_MAX_EPT == 64
+    for (t, nb, s_q), want in _MK_ROUTE_CELLS:
+        assert _api._indexer_megakernel_route(t, nb, 212, _SM107, s_q=s_q) == want, (t, nb, s_q, _api._indexer_megakernel_route(t, nb, 212, _SM107, s_q=s_q))
+    assert _api._indexer_megakernel_route(32, 2048, 212, _SM107, threads=1024) == (8, 1024)
+    assert _api._indexer_megakernel_route(1, 2048, 212, _SM107, threads=1024) == (1, 1024)
+    assert _api._indexer_megakernel_route(1, 32768, 212, _SM107) == (2, 512) and _api._indexer_megakernel_route(1, 32772, 212, _SM107) is None
+    # the compressed-row reach must be a multiple of 8 (the fused form's 256-bit logits rows): an odd page count at page 16 is the chain's
+    assert _api._indexer_megakernel_route(1, 1028, 212, _SM107) is None and _api._indexer_megakernel_route(1, 1032, 212, _SM107) == (1, 512)
+    assert _api._indexer_megakernel_route(4, 364, 212, _SM107) is None and _api._indexer_megakernel_route(4, 368, 212, _SM107) == (1, 512)
+    assert _api._indexer_megakernel_route(1, 65536, 212, _SM107, threads=1024) is not None
+    assert _api._indexer_megakernel_route(1, 65540, 212, _SM107, threads=1024) is None
+    assert _api._indexer_megakernel_route(1, 2048, 108, (8, 0)) is None and _api._indexer_megakernel_route(1, 2048, None, None) is None
+    # a part outside cc 10.x is not routed (the family check_support admits; cc 9.x has the primitives, not the validation), cc 10.0 is
+    assert _api._indexer_megakernel_route(1, 2048, 132, (9, 0)) is None and _api._indexer_megakernel_route(1, 2048, 148, (10, 0)) == (1, 512)
+    assert _api._indexer_megakernel_route(65536, 2048, 212, _SM107, s_q=1) is None  # past the top-k's row bound
+    # sm_count None = the spread reading (one unit per CTA at B <= 4; the cap past B 4 as everywhere)
+    assert _api._indexer_megakernel_route(1, 2048, None, _SM107) == (1, 512) and _api._indexer_megakernel_route(32, 2048, None, _SM107) == (4, 512)
+    assert _api._indexer_megakernel_route(1, 32768, None, _SM107) == (1, 512)  # 256 chunks: spread (2 units on a 212-SM part, the cell above)
+    for sms in (1, 100, 108, 204, 212, 1000):
+        for t in (1, 2, 3, 4, 8, 32):
+            r = _api._indexer_megakernel_route(t, 32768, sms, _SM107)
+            assert r is not None and r[0] in F.SCORER_UNIT_CHOICES and r[0] <= 4 and r[1] == 512, (sms, t, r)
+
+
+def test_indexer_megakernel_auto_stays_off_until_measured_and_the_arm_is_live_behind_the_tuple(monkeypatch):
+    """The AUTO pin: ``SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS`` is EMPTY (the gate commit flips it with its table), so ``indexer_megakernel=None``
+    declares the chain on every part; the explicit True declares the fused stage (``_IndexerFused`` in the indexer's slot, no prepare / norm +
+    RoPE / cache-write stage, ``fuse_prepare`` resolved to the fused form it carries, one launch, the fused kernel's PDL name); with the tuple
+    patched to the measured part AUTO resolves True (the arm is live), never where an explicit True is declined (the e4m3 cache, a table past
+    the reach, an explicit unfused prepare); the envelope's ``indexer_megakernel_default`` follows the tuple."""
+    from cudnn.gated_attention_block import api as _api
+
+    assert _api.SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS == (), "the AUTO pin: EMPTY until the gate measures the fused form"
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    monkeypatch.setattr(_api, "_device_sm_count_of", lambda device: 212)
+    with _no_host_sync():
+        auto = _declare_indexer()
+        assert auto.indexer_megakernel_requested is None and auto.indexer_megakernel is False and auto.indexer_megakernel_route == (1, 512)
+        assert isinstance(auto._indexer_decode, _IndexerDecode) and auto._prepare is not None and auto.fuse_prepare is True
+        on = _declare_indexer(indexer_megakernel=True)
+        assert on.indexer_megakernel is True and on.indexer_megakernel_requested is True and on.indexer_megakernel_route == (1, 512)
+        assert isinstance(on._indexer_decode, _IndexerFused) and on._prepare is None and on._norm_rope is None and on._cache_write is None
+        assert on.fuse_prepare is True and on.fuse_prepare_requested is None  # the knob resolves the AUTO prepare knob to the fused form it carries
+        names_auto, names_on = [st.name for st in auto._stages], [st.name for st in on._stages]
+        assert names_auto == ["qkv_gate_proj", "qsa_prepare", "qsa_indexer", "sdpa_sparse", "sigmoid_gate", "out_proj"], names_auto
+        assert names_on == ["qkv_gate_proj", "qsa_indexer_fused", "sdpa_sparse", "sigmoid_gate", "out_proj"], names_on
+        st = on._indexer_decode
+        assert st.launches_per_execute() == 1 and st.pdl_names == ("qsa_indexer_fused",) and (st.units, st.threads) == (1, 512) and st.fused
+        assert st.n_blocks_max == auto._indexer_decode.n_blocks_max and st.cache_dtype == BF16 and not st.fp8 and on.pdl_stages == ()
+        with pytest.raises(ValueError, match="only the fused indexer owns counters"):
+            auto.indexer_counters_are_zero()
+        with pytest.raises(RuntimeError, match="call compile\\(\\) before reading the counters"):
+            on.indexer_counters_are_zero()
+        monkeypatch.setattr(_api, "SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS", (_SM107,))
+        flipped = _declare_indexer()
+        assert flipped.indexer_megakernel is True and flipped.indexer_megakernel_requested is None and isinstance(flipped._indexer_decode, _IndexerFused)
+        off = _declare_indexer(indexer_megakernel=False)
+        assert off.indexer_megakernel is False and isinstance(off._indexer_decode, _IndexerDecode) and off._prepare is not None
+        # never True where an explicit True is declined: the e4m3 cache, a table past the reach, an explicit unfused prepare, an out-of-place layout
+        assert _declare_indexer(qsa_over=dict(index_cache_dtype=torch.float8_e4m3fn)).indexer_megakernel is False
+        assert _declare_indexer(n_pages=8193).indexer_megakernel is False
+        assert _declare_indexer(n_pages=257).indexer_megakernel is False  # 257 x 4 = 1028 compressed rows: not a multiple of 8 (the chain's)
+        assert _declare_indexer(fuse_prepare=False).indexer_megakernel is False
+        assert _declare_indexer(inplace_qkv=False).indexer_megakernel is False
+        assert _declare_indexer(s_q=8, cap=16).indexer_megakernel is False  # S_q 8: past the fused step's block size (the derive publishes ONE completing row)
+        assert _declare_indexer(geom_over=dict(rope_dim=0)).indexer_megakernel is False  # an RMSNorm-only indexer geometry (the knob's rope_dim row)
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: (10, 0))
+        assert _declare_indexer().indexer_megakernel is False  # an unmeasured part
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    geom = auto.geom
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.indexer_megakernel_default is True
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=(10, 0)).decode.indexer_megakernel_default is False
+    assert GatedAttentionBlockFwd.serving_envelope(geom, F16, _DEV, device_cc=_SM107).decode.indexer_megakernel_default is False
+    monkeypatch.setattr(_api, "SPARSE_INDEXER_MEGAKERNEL_DEFAULT_CCS", ())
+    assert GatedAttentionBlockFwd.serving_envelope(geom, BF16, _DEV, device_cc=_SM107).decode.indexer_megakernel_default is False
+
+
+def _declare_prefill_indexer(**blk_kw):
+    """A declared (not compiled) in-block indexer block on its PREFILL form (the block's own K / V, no pools): the knob's `prefill` row."""
+    geom = GatedAttentionBlockGeometry(**GEOM_SMALL, qsa=QsaSpec(index_source="indexer", index_band=True))
+    mk = lambda *shape: torch.empty(*shape, dtype=BF16, device=_DEV)  # noqa: E731
+    return GatedAttentionBlockFwd(
+        mk(1, 64, geom.d_model),
+        mk(geom.n_qkvg, geom.d_model),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        torch.ones(D, dtype=BF16, device=_DEV),
+        mk(1, 64, ROPE),
+        mk(1, 64, ROPE),
+        mk(geom.d_model, geom.h_q * D),
+        mk(1, 64, geom.d_model),
+        geom,
+        **blk_kw,
+    )
+
+
+def test_indexer_megakernel_typed_declines_equal_the_envelope_row_by_row(monkeypatch):
+    """One trip per row of the knob's declines, each on a REAL declaration with the part modeled as the measured one: the raised text EQUALS
+    the envelope's row and carries the knob's name -- an explicit ``fuse_prepare=False`` (the fused indexer carries the prepare), the caller-list
+    band block, the prefill form, the e4m3 indexer cache, a table past the single-CTA top-k's reach (32772 compressed rows at 512 threads; a
+    step of 8 rows past the block size by the same row), the RMSNorm-only geometry (``rope_dim`` 0) by its own row; then the rows with no
+    envelope entry: a declaration the fused prepare form cannot take (the prepare knob's own row, wrapped and naming the knob), a part outside
+    cc 10.x (cc 9.0 and 8.0) / no CUDA device, a non-bool; ``index_commit_present=True`` hears the form's OWN row (raised before the knob is
+    read; so does ``thd=True``, the sparse suites' ``indexer_thd`` pin); the PDL switch: declined on the chain by the chain's text (the knob named as the served route), served with the
+    explicit knob (the fused kernel among the switched stages), declined again where the explicit knob resolves off."""
+    import re
+
+    from cudnn.gated_attention_block import api as _api
+
+    monkeypatch.setattr(_api, "_device_cc_of", lambda device: _SM107)
+    monkeypatch.setattr(_api, "_device_sm_count_of", lambda device: 212)
+    rows = {
+        "indexer_megakernel_unfused_prepare": lambda: _declare_indexer(indexer_megakernel=True, fuse_prepare=False),
+        "indexer_megakernel_caller": lambda: _declare(GEOM_SMALL, 1, 1, n_pages=4, index_band=True, indexer_megakernel=True),
+        "indexer_megakernel_prefill": lambda: _declare_prefill_indexer(indexer_megakernel=True),
+        "indexer_megakernel_e4m3_cache": lambda: _declare_indexer(indexer_megakernel=True, qsa_over=dict(index_cache_dtype=torch.float8_e4m3fn)),
+        "indexer_megakernel_reach": lambda: _declare_indexer(indexer_megakernel=True, n_pages=8193),
+        "indexer_megakernel_rope_dim": lambda: _declare_indexer(indexer_megakernel=True, geom_over=dict(rope_dim=0)),
+    }
+    with _no_host_sync():
+        env = GatedAttentionBlockFwd.serving_envelope(_declare_indexer().geom, BF16, _DEV, device_cc=_SM107).decode
+        for name, trip in rows.items():
+            with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS[name])) as e:
+                trip()
+            assert str(e.value) == env.declines[name], (name, str(e.value))
+            assert "indexer_megakernel" in str(e.value)
+        assert _declare_indexer(indexer_megakernel=True, n_pages=8192).indexer_megakernel_route == (2, 512)  # 32768 rows: at the reach, served
+        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_megakernel_reach"])) as e:
+            _declare_indexer(indexer_megakernel=True, n_pages=257)  # 1028 compressed rows: the fused form's 256-bit logits rows need a multiple of 8
+        assert "multiple of 8" in str(e.value) and str(e.value) == env.declines["indexer_megakernel_reach"]
+        assert _declare_indexer(indexer_megakernel=True, n_pages=258).indexer_megakernel_route == (1, 512)  # 1032: served
+        # a step wider than the block size (S_q 8; cap 16 for the ring rule): the reach row names the step clause; a step of 4 rows is served
+        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_megakernel_reach"])) as e:
+            _declare_indexer(indexer_megakernel=True, s_q=8, cap=16)
+        assert "the step at most 4 rows per sequence" in str(e.value) and str(e.value) == env.declines["indexer_megakernel_reach"]
+        assert _declare_indexer(indexer_megakernel=True, s_q=4, cap=16).indexer_megakernel_route == (1, 512)
+        with pytest.raises(
+            NotImplementedError, match="indexer_megakernel=True: the fused indexer carries the prepare, and this declaration cannot take the fused prepare form"
+        ) as e:
+            _declare_indexer(indexer_megakernel=True, inplace_qkv=False)
+        assert "inplace_qkv=False" in str(e.value)
+        with pytest.raises(TypeError, match="indexer_megakernel must be a bool"):
+            _declare_indexer(indexer_megakernel=1)
+        # the form's own rows come first (the packed form's `indexer_thd` row is the sparse suites' pin): the commit flag
+        with pytest.raises(NotImplementedError, match="index_commit_present=True .* is a follow-up"):
+            _declare_indexer(indexer_megakernel=True, index_commit_present=True)
+        # PDL: the chain's decline names the knob as the served route; the explicit knob serves the switch; the knob resolving off declines again
+        with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only") as e:
+            _declare_indexer(use_pdl=True)
+        assert "indexer_megakernel=True" in str(e.value) and str(e.value) == _api._PDL_INDEXER_CHAIN_DECLINE
+        with pytest.raises(NotImplementedError, match="use_pdl=True is served for the bf16 / f16 block only"):
+            _declare_indexer(use_pdl=True, indexer_megakernel=False)
+        pdl = _declare_indexer(indexer_megakernel=True, use_pdl=True)
+        assert pdl.use_pdl is True and pdl.use_pdl_requested is True and pdl.indexer_megakernel is True and pdl.use_pdl_effective is True
+        assert pdl.pdl_stages == ("qsa_indexer_fused", "sdpa_sparse", "sigmoid_gate") and pdl._indexer_decode.use_pdl is True
+        assert (
+            _declare_indexer(indexer_megakernel=True).use_pdl is False
+        )  # AUTO stays off under the knob (SPARSE_DECODE_PDL_DEFAULT_CCS: the sparse chain's tuple)
+        # a part outside cc 10.x (cc 9.0: the primitives without the validation; cc 8.0) / no CUDA device: the device row (after the device-free rows)
+        for cc in ((9, 0), (8, 0)):
+            monkeypatch.setattr(_api, "_device_cc_of", lambda device, cc=cc: cc)
+            with pytest.raises(NotImplementedError, match=f"indexer_megakernel=True needs a cc 10.x CUDA device.*found cc {cc[0]}.{cc[1]}"):
+                _declare_indexer(indexer_megakernel=True)
+        monkeypatch.setattr(_api, "_device_cc_of", lambda device: None)
+        with pytest.raises(NotImplementedError, match="indexer_megakernel=True needs a cc 10.x CUDA device.*found no CUDA device"):
+            _declare_indexer(indexer_megakernel=True)
+        with pytest.raises(NotImplementedError, match=re.escape(_INDEXER_DECLINE_TOKENS["indexer_megakernel_reach"])):
+            _declare_indexer(indexer_megakernel=True, n_pages=8193)  # the device-free reach row still comes first
+
+
+def _assert_mk_bitwise(on: _IndexerCase, off: _IndexerCase, what: str) -> None:
+    """Every output and every side cache of the knob-ON step bitwise the knob-OFF (chain) step's on the same inputs."""
+    assert torch.equal(_bits(on.out), _bits(off.out)), f"{what}: out differs (max|d| {(on.out.float() - off.out.float()).abs().max().item():.3e})"
+    if on.lse is not None:
+        assert torch.equal(on.lse, off.lse), f"{what}: the LSE differs"
+    assert torch.equal(_bits(on.slab_views()[4]), _bits(off.slab_views()[4])), f"{what}: the gated O differs"
+    assert torch.equal(_bits(on.k_cache.contiguous()), _bits(off.k_cache.contiguous())) and torch.equal(
+        _bits(on.v_cache.contiguous()), _bits(off.v_cache.contiguous())
+    ), f"{what}: the pools differ"
+    assert torch.equal(_bits(on.index_state_cache), _bits(off.index_state_cache)), f"{what}: the ring differs"
+    assert torch.equal(_bits(on.index_kv_cache), _bits(off.index_kv_cache)), f"{what}: the paged compressed-key cache differs"
+    assert torch.equal(on.kernel_ids(), off.kernel_ids()) and torch.equal(on.kernel_counts(), off.kernel_counts()), f"{what}: the list / counts differ"
+    if on.block_lens_out is not None:
+        assert torch.equal(on.block_lens_out, off.block_lens_out), f"{what}: block_lens_out differs"
+    assert torch.equal(on.views()["cslot"], off.views()["cslot"]), f"{what}: the slot report differs"
+
+
+_MK_CENSUS_CELLS = [  # (geometry, S_q, kv_lens, split, the served-arm knobs both twins take)
+    pytest.param(GEOM_FLASH_NEXT, 1, (4096, 300, 0, 2051), 4, {}, id="Sq1-B4"),
+    pytest.param(GEOM_FLASH_NEXT, 4, (4095, 2, 0, 2052), 4, {}, id="Sq4-B4"),
+    pytest.param(
+        GEOM_SMALL, 4, tuple(256 + 32 * i for i in range(32)), None, {}, id="Sq4-B32-T128"
+    ),  # the longest 1248 -> 78 pages -> 312 rows (a multiple of 8)
+    # the two served arms the block binds into the fused launch (ring_slots= / rope_table= of _IndexerFused): the stack's own ring slots, the
+    # position tables -- each a twin of the chain under the same arm
+    pytest.param(GEOM_SMALL, 4, (8191, 0, 2052, 77), 2, dict(slot_form=True), id="Sq4-B4-slot-form"),
+    pytest.param(GEOM_SMALL, 4, (8191, 2, 0, 300), 4, dict(rope_tables_only=True), id="Sq4-B4-rope-tables"),
+]
+
+
+@requires_rubin
+@pytest.mark.parametrize("geom_kw, s_q, kv_lens, split, arms", _MK_CENSUS_CELLS)
+def test_indexer_megakernel_is_bitwise_the_chain_with_the_census_by_kernel_name(geom_kw, s_q, kv_lens, split, arms):
+    """``indexer_megakernel=True`` vs the chain (``fuse_prepare=True``) on the same inputs: ``out``, the LSE, the gated O, the pools, the ring,
+    the paged cache, the list, the counts and the slot report BITWISE; two launches of each bitwise; the knob-ON step's selection and attention
+    against the oracle on their own; the plan-owned counters zero after every launch; the CUPTI census by kernel NAME: the fused launch
+    ``qsa_indexer_fused`` replaces ``frost_qsa_prepare`` + the scorer + the top-k (TWO kernels fewer: 6 where the chain runs 8 at S_q 1 / 4 with a
+    split; the chain's own count otherwise), no memset / memcpy on either execute path (the counters are reset in-kernel), no cast kernel; the R9
+    census (no allocation, no host sync over three executes) on the knob-ON block; the stack's ring-slot arm and the position-table arm as
+    twins of the chain under the same arm (the block binds them into the fused launch)."""
+    from collections import Counter
+
+    kw = dict(page=16, seed=140 + s_q + len(kv_lens), split=split, fuse_gate=True, return_lse=True, **arms)
+    on = _IndexerCase(geom_kw, s_q, kv_lens, indexer_megakernel=True, **kw)
+    off = _IndexerCase(geom_kw, s_q, kv_lens, fuse_prepare=True, **kw)
+    assert on.blk.indexer_megakernel is True and off.blk.indexer_megakernel is False and on.blk.fuse_prepare is True and off.blk.fuse_prepare is True
+    assert on.blk._indexer_decode.ring_slots is bool(arms.get("slot_form", False)) and on.blk._indexer_decode.rope_table is bool(
+        arms.get("rope_tables_only", False)
+    )
+    assert on.blk._indexer_decode.launches_per_execute() == 1 and off.blk._indexer_decode.launches_per_execute() == 2
+    assert on.blk.indexer_megakernel_route == (4 if len(kv_lens) > 4 else 1, 512), on.blk.indexer_megakernel_route
+    for case in (on, off):
+        case.compile()
+        _two_launches_indexer(case, case.label())
+    assert on.blk.indexer_counters_are_zero(), "a counter word is not zero after the launch"
+    _assert_mk_bitwise(on, off, f"S_q {s_q} B {len(kv_lens)}")
+    k_on, m_on = _cupti_kernels(lambda: on.execute())
+    k_off, m_off = _cupti_kernels(lambda: off.execute())
+    torch.cuda.synchronize()
+    assert on.blk.indexer_counters_are_zero()
+    if k_on is None or k_off is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the bitwise cells stand")
+    print(f"\nknob ON: {len(k_on)} kernels + {len(m_on)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_on))
+    print(f"chain: {len(k_off)} kernels + {len(m_off)} memset/memcpy:\n  " + "\n  ".join(n[:140] for n in k_off))
+    assert not (m_on or m_off), "a memset / memcpy on the execute path (the counters are reset in-kernel, never by a memset node)"
+    has = lambda names, tok: sum(tok in n for n in names)  # noqa: E731
+    assert (
+        has(k_on, "qsa_indexer_fused") == 1 and has(k_on, "frost_qsa_prepare") == 0 and has(k_on, "qsa_score_paged") == 0 and has(k_on, "qsa_topk_decode") == 0
+    )
+    assert has(k_on, "frost_qk_norm_rope") == 0 and has(k_on, "frost_cache_write") == 0 and has(k_on, "frost_qsa_compress") == 0
+    assert (
+        has(k_off, "qsa_indexer_fused") == 0
+        and has(k_off, "frost_qsa_prepare") == 1
+        and has(k_off, "qsa_score_paged") == 1
+        and has(k_off, "qsa_topk_decode") == 1
+    )
+    for names in (k_on, k_off):
+        assert not any("quantize" in n.lower() or "cast" in n.lower() or "elementwise" in n.lower() for n in names), f"a cast kernel: {names}"
+        assert not any("nvjet" in n.lower() or "cublas" in n.lower() for n in names), "the slab left the FROST route"
+    assert len(k_off) - len(k_on) == 2, (len(k_on), len(k_off))
+    if (
+        len(k_off) == 8
+    ):  # the measured chain at S_q 1 / 4 with a split: slab, prepare, scorer, top-k, the sparse tile, the combine, the out projection, its reducer
+        assert len(k_on) == 6, k_on
+    gone, extra = Counter(k_off) - Counter(k_on), Counter(k_on) - Counter(k_off)
+    assert sum(gone.values()) == 3 and sum(extra.values()) == 1, (gone, extra)
+    # R9 on the knob-ON block: no allocation of the block's own on the execute path, no host sync, the counters zero after
+    torch.cuda.synchronize()
+    stat = lambda: torch.cuda.memory_stats()["allocation.all.allocated"]  # noqa: E731
+    n0 = stat()
+    prev = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        for _ in range(3):
+            on.execute()
+    finally:
+        torch.cuda.set_sync_debug_mode(prev)
+    torch.cuda.synchronize()
+    assert stat() == n0, f"the indexer megakernel block made {stat() - n0} CUDA allocation(s) over three executes"
+    assert on.blk.indexer_counters_are_zero()
+    assert torch.equal(_bits(on.out), _bits(off.out)) and torch.equal(on.kernel_ids(), off.kernel_ids()), "the re-executes differ"
+
+
+@requires_rubin
+def test_indexer_megakernel_with_pdl_is_bitwise_the_plain_chains_and_reads_back_the_switched_stages():
+    """``use_pdl=True`` with the knob (served; declined on the chain): the fused launch takes the programmatic-dependent-launch attribute (its
+    recipes record the switch; the kernel's PTX census pins both griddepcontrol sites per role) beside the sparse core and the combine (their
+    sites since 2026-10-21), so every node of the programmatic chain carries both sites and the counter words of launch n + 1 are ordered against
+    launch n's reset through the intermediate nodes' waits -- and ``out``, the LSE, the gated O, the list, the counts, the pools, the ring and the
+    cache are BITWISE the plain knob-ON step's and the plain chain's; the census names the same kernels in the same order as the plain knob-ON
+    step; a second switched step bitwise the first; the counters zero after every launch; the readback names the fused kernel among the
+    switched stages."""
+    kv = (2052, 300, 0, 4096)  # the longest 4096 -> 256 pages -> 1024 compressed rows (a multiple of 8: the fused form's reach)
+    kw = dict(page=16, seed=151, split=4, fuse_gate=True, return_lse=True)
+    plain = _IndexerCase(GEOM_SMALL, 2, kv, indexer_megakernel=True, use_pdl=False, **kw)
+    pdl = _IndexerCase(GEOM_SMALL, 2, kv, indexer_megakernel=True, use_pdl=True, **kw)
+    chain = _IndexerCase(GEOM_SMALL, 2, kv, fuse_prepare=True, **kw)
+    assert pdl.blk.use_pdl is True and pdl.blk.use_pdl_requested is True and pdl.blk.use_pdl_effective is True
+    assert pdl.blk.pdl_stages == ("qsa_indexer_fused", "sdpa_sparse") and plain.blk.pdl_stages == () and chain.blk.pdl_stages == ()
+    assert [st.name for st in pdl.blk._stages] == [st.name for st in plain.blk._stages]
+    for case in (plain, pdl, chain):
+        case.compile()
+    assert all(r.use_pdl for r in pdl.blk._indexer_decode._recipes.values()) and not any(r.use_pdl for r in plain.blk._indexer_decode._recipes.values())
+    _two_launches_indexer(plain, plain.label())
+    _two_launches_indexer(pdl, pdl.label())
+    chain.run()
+    torch.cuda.synchronize()
+    assert pdl.blk.indexer_counters_are_zero() and plain.blk.indexer_counters_are_zero()
+    _assert_mk_bitwise(pdl, plain, "pdl vs plain (knob ON)")
+    _assert_mk_bitwise(pdl, chain, "pdl (knob ON) vs the plain chain")
+    k_plain, m_plain = _cupti_kernels(lambda: plain.execute())
+    k_pdl, m_pdl = _cupti_kernels(lambda: pdl.execute())
+    if k_plain is None or k_pdl is None:
+        pytest.skip("torch.profiler recorded no CUDA events (CUPTI unavailable on this node); the bitwise cells stand")
+    assert k_pdl == k_plain and not (m_plain or m_pdl), (k_pdl, k_plain)
+    assert sum("qsa_indexer_fused" in n for n in k_pdl) == 1
+    print(f"\ncensus with use_pdl under the knob: {k_pdl}")
+    b = pdl.run().clone()
+    assert torch.equal(_bits(b), _bits(pdl.run())), "a second switched step is not bitwise the first"
+    assert pdl.blk.indexer_counters_are_zero()
